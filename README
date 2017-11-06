@@ -1,0 +1,6 @@
+Xwl is a minimal X window manager and nested Wayland compositor that uses
+Xwayland to allow unmodified X clients to run as Wayland clients.
+
+Usage:
+
+xwl-run [--scale=SCALE] PROGRAM [ARGS...]
