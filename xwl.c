@@ -168,7 +168,8 @@ enum {
     ATOM_WM_PROTOCOLS,
     ATOM_WM_DELETE_WINDOW,
     ATOM_WL_SURFACE_ID,
-    ATOM_LAST = ATOM_WL_SURFACE_ID,
+    ATOM_MOTIF_WM_HINTS,
+    ATOM_LAST = ATOM_MOTIF_WM_HINTS,
 };
 
 struct xwl {
@@ -201,6 +202,34 @@ struct xwl {
         xcb_atom_t value;
     } atoms[ATOM_LAST + 1];
 };
+
+enum {
+    PROPERTY_WM_NAME,
+    PROPERTY_WM_TRANSIENT_FOR,
+    PROPERTY_MOTIF_WM_HINTS,
+};
+
+struct xwl_mwm_hints {
+    uint32_t flags;
+    uint32_t functions;
+    uint32_t decorations;
+    int32_t input_mode;
+    uint32_t status;
+};
+
+#define MWM_HINTS_FUNCTIONS   (1L << 0)
+#define MWM_HINTS_DECORATIONS (1L << 1)
+#define MWM_HINTS_INPUT_MODE  (1L << 2)
+#define MWM_HINTS_STATUS      (1L << 3)
+
+#define MWM_DECOR_ALL         (1L << 0)
+#define MWM_DECOR_BORDER      (1L << 1)
+#define MWM_DECOR_RESIZEH     (1L << 2)
+#define MWM_DECOR_TITLE       (1L << 3)
+#define MWM_DECOR_MENU        (1L << 4)
+#define MWM_DECOR_MINIMIZE    (1L << 5)
+#define MWM_DECOR_MAXIMIZE    (1L << 6)
+
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
@@ -360,6 +389,8 @@ xwl_window_update(struct xwl_window *window)
     struct xwl *xwl = window->xwl;
     struct xwl_window *parent = NULL;
     xcb_window_t parent_window = 0;
+    uint32_t frame_type = ZAURA_SURFACE_FRAME_TYPE_NORMAL;
+    char* name = NULL;
 
     if (window->host_surface_id) {
         host_resource = wl_client_get_object(xwl->client,
@@ -405,19 +436,72 @@ xwl_window_update(struct xwl_window *window)
 
     if (window->override_redirect) {
         parent_window = xwl->focus_window;
+        frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
     } else {
-        xcb_get_property_reply_t *reply =
-            xcb_get_property_reply(xwl->connection,
-                                   xcb_get_property(xwl->connection,
-                                                    0,
-                                                    window->id,
-                                                    XCB_ATOM_WM_TRANSIENT_FOR,
-                                                    XCB_ATOM_WINDOW,
-                                                    0,
-                                                    1),
-                                   NULL);
-        if (reply)
-          parent_window = *((uint32_t *) xcb_get_property_value(reply));
+        struct {
+            int type;
+            xcb_atom_t atom;
+        } properties[] = {
+            { PROPERTY_WM_NAME, XCB_ATOM_WM_NAME },
+            { PROPERTY_WM_TRANSIENT_FOR, XCB_ATOM_WM_TRANSIENT_FOR },
+            { PROPERTY_MOTIF_WM_HINTS, xwl->atoms[ATOM_MOTIF_WM_HINTS].value },
+        };
+        xcb_get_property_cookie_t cookies[ARRAY_SIZE(properties)];
+        struct xwl_mwm_hints mwm_hints;
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(properties); ++i) {
+            cookies[i] = xcb_get_property(xwl->connection,
+                                          0,
+                                          window->id,
+                                          properties[i].atom,
+                                          XCB_ATOM_ANY,
+                                          0,
+                                          2048);
+        }
+
+        for (i = 0; i < ARRAY_SIZE(properties); ++i)  {
+            xcb_get_property_reply_t *reply =
+                xcb_get_property_reply(xwl->connection, cookies[i], NULL);
+
+            if (!reply)
+                continue;
+
+            if (reply->type == XCB_ATOM_NONE) {
+                free(reply);
+                continue;
+            }
+
+            switch (properties[i].type) {
+                case PROPERTY_WM_NAME:
+                    name = strndup(xcb_get_property_value(reply),
+                                   xcb_get_property_value_length(reply));
+                    break;
+                case PROPERTY_WM_TRANSIENT_FOR:
+                    parent_window =
+                        *((uint32_t *) xcb_get_property_value(reply));
+                    break;
+                case PROPERTY_MOTIF_WM_HINTS:
+                    memcpy(&mwm_hints,
+                           xcb_get_property_value(reply),
+                           sizeof(mwm_hints));
+                    if (mwm_hints.flags & MWM_HINTS_DECORATIONS) {
+                        int decorate;
+
+                        if (mwm_hints.decorations & MWM_DECOR_ALL)
+                            decorate = ~mwm_hints.decorations & MWM_DECOR_TITLE;
+                        else
+                            decorate = mwm_hints.decorations & MWM_DECOR_TITLE;
+
+                        if (!decorate)
+                            frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
+                    }
+                    break;
+                default:
+                    break;
+            }
+            free(reply);
+        }
     }
 
     if (parent_window) {
@@ -440,16 +524,14 @@ xwl_window_update(struct xwl_window *window)
                                  window);
 
     if (xwl->aura_shell) {
-      window->aura_surface =
-          zaura_shell_get_aura_surface(xwl->aura_shell->internal,
-                                       host_surface->proxy);
+        window->aura_surface =
+            zaura_shell_get_aura_surface(xwl->aura_shell->internal,
+                                         host_surface->proxy);
+        zaura_surface_set_frame(window->aura_surface, frame_type);
     }
 
     if (window->override_redirect) {
         struct zxdg_positioner_v6 *positioner;
-
-        zaura_surface_set_frame(window->aura_surface,
-                                ZAURA_SURFACE_FRAME_TYPE_SHADOW);
 
         positioner = zxdg_shell_v6_create_positioner(xwl->xdg_shell->internal);
         assert(positioner);
@@ -475,9 +557,6 @@ xwl_window_update(struct xwl_window *window)
 
         zxdg_positioner_v6_destroy(positioner);
     } else {
-        zaura_surface_set_frame(window->aura_surface,
-                                ZAURA_SURFACE_FRAME_TYPE_NORMAL);
-
         window->xdg_toplevel =
             zxdg_surface_v6_get_toplevel(window->xdg_surface);
         zxdg_toplevel_v6_set_user_data(window->xdg_toplevel, window);
@@ -489,7 +568,13 @@ xwl_window_update(struct xwl_window *window)
             zxdg_toplevel_v6_set_parent(window->xdg_toplevel,
                                         parent->xdg_toplevel);
         }
+
+        if (name)
+            zxdg_toplevel_v6_set_title(window->xdg_toplevel, name);
     }
+
+    if (name)
+        free(name);
 
     if (host_surface->has_contents)
         wl_surface_commit(host_surface->proxy);
@@ -1960,7 +2045,8 @@ xwl_handle_create_notify(struct xwl *xwl,
     if (!event->override_redirect) {
         uint32_t values[1];
 
-        values[0] = XCB_EVENT_MASK_FOCUS_CHANGE;
+        values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE |
+                    XCB_EVENT_MASK_FOCUS_CHANGE;
         xcb_change_window_attributes(xwl->connection,
                                      window->id,
                                      XCB_CW_EVENT_MASK,
@@ -2098,6 +2184,46 @@ xwl_handle_focus_out(struct xwl *xwl, xcb_focus_out_event_t *event)
 {
 }
 
+static void
+xwl_handle_property_notify(struct xwl *xwl, xcb_property_notify_event_t *event)
+{
+    struct xwl_window *window = xwl_lookup_window(xwl, event->window);
+    if (!window)
+        return;
+
+    if (event->atom == XCB_ATOM_WM_NAME) {
+        char *name = NULL;
+
+        if (!window->xdg_toplevel)
+            return;
+
+        if (event->state != XCB_PROPERTY_DELETE) {
+            xcb_get_property_reply_t *reply =
+                xcb_get_property_reply(xwl->connection,
+                                       xcb_get_property(xwl->connection,
+                                                        0,
+                                                        window->id,
+                                                        XCB_ATOM_WM_NAME,
+                                                        XCB_ATOM_ANY,
+                                                        0,
+                                                        2048),
+                                       NULL);
+            if (reply) {
+                name = strndup(xcb_get_property_value(reply),
+                               xcb_get_property_value_length(reply));
+                free(reply);
+            }
+        }
+
+        if (name) {
+            zxdg_toplevel_v6_set_title(window->xdg_toplevel, name);
+            free(name);
+        } else {
+            zxdg_toplevel_v6_set_title(window->xdg_toplevel, "");
+        }
+    }
+}
+
 static int
 xwl_handle_x_connection_event(int fd,
                               uint32_t mask,
@@ -2149,6 +2275,10 @@ xwl_handle_x_connection_event(int fd,
                 break;
             case XCB_FOCUS_OUT:
                 xwl_handle_focus_out(xwl, (xcb_focus_out_event_t *) event);
+                break;
+            case XCB_PROPERTY_NOTIFY:
+                xwl_handle_property_notify(
+                    xwl, (xcb_property_notify_event_t *) event);
                 break;
             default:
                 break;
@@ -2365,6 +2495,7 @@ main(int argc, char **argv)
             [ATOM_WM_PROTOCOLS] = {"WM_PROTOCOLS"},
             [ATOM_WM_DELETE_WINDOW] = {"WM_DELETE_WINDOW"},
             [ATOM_WL_SURFACE_ID] = {"WL_SURFACE_ID"},
+            [ATOM_MOTIF_WM_HINTS] = {"_MOTIF_WM_HINTS"},
         }
     };
     struct wl_event_loop *event_loop;
