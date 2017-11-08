@@ -36,7 +36,8 @@ struct xwl_host_surface {
     struct xwl *xwl;
     struct wl_resource *resource;
     struct wl_surface *proxy;
-    int has_contents;
+    uint32_t contents_width;
+    uint32_t contents_height;
 };
 
 struct xwl_host_compositor {
@@ -48,6 +49,8 @@ struct xwl_host_compositor {
 struct xwl_host_buffer {
     struct wl_resource *resource;
     struct wl_buffer *proxy;
+    uint32_t width;
+    uint32_t height;
 };
 
 struct xwl_host_shm_pool {
@@ -247,37 +250,9 @@ static const struct zxdg_shell_v6_listener xwl_xdg_shell_listener = {
 };
 
 static void
-xwl_ack_window_configure(struct xwl_window *window)
-{
-    assert(window->xdg_surface);
-    assert(window->pending_config.serial);
-
-    zxdg_surface_v6_ack_configure(window->xdg_surface,
-                                  window->pending_config.serial);
-    window->pending_config.serial = 0;
-
-    // TODO(reveman): Use _XWAYLAND_ALLOW_COMMITS if available.
-    if (window->host_surface_id) {
-        struct wl_resource *host_resource =
-            wl_client_get_object(window->xwl->client,
-                                 window->host_surface_id);
-        if (host_resource) {
-          struct xwl_host_surface *host_surface =
-              wl_resource_get_user_data(host_resource);
-          if (host_surface->has_contents)
-              wl_surface_commit(host_surface->proxy);
-        }
-    }
-}
-
-static void
 xwl_configure_window(struct xwl_window *window)
 {
-    int width = window->width;
-    int height = window->height;
-
-    if (window->pending_config.serial)
-      return;
+    assert(!window->pending_config.serial);
 
     if (window->next_config.mask) {
         xcb_configure_window(window->xwl->connection,
@@ -285,18 +260,40 @@ xwl_configure_window(struct xwl_window *window)
                              window->next_config.mask,
                              window->next_config.values);
         if (window->next_config.mask & XCB_CONFIG_WINDOW_WIDTH)
-          width = window->next_config.values[0];
+            window->width = window->next_config.values[0];
         if (window->next_config.mask & XCB_CONFIG_WINDOW_HEIGHT)
-          height = window->next_config.values[1];
+            window->height = window->next_config.values[1];
     }
 
     window->pending_config = window->next_config;
     window->next_config.serial = 0;
     window->next_config.mask = 0;
+}
 
-    // Ack right away if configure notify event is not guaranteed.
-    if (width == window->width && height == window->height)
-        xwl_ack_window_configure(window);
+static int
+xwl_process_pending_configure_acks(struct xwl_window *window,
+                                   struct xwl_host_surface *host_surface)
+{
+    if (!window->pending_config.serial)
+        return 0;
+
+    if (host_surface) {
+        if (window->width != host_surface->contents_width ||
+            window->height != host_surface->contents_height) {
+          return 0;
+        }
+    }
+
+    assert(window->xdg_surface);
+
+    zxdg_surface_v6_ack_configure(window->xdg_surface,
+                                  window->pending_config.serial);
+    window->pending_config.serial = 0;
+
+    if (window->next_config.serial)
+        xwl_configure_window(window);
+
+    return 1;
 }
 
 static void
@@ -307,7 +304,22 @@ xwl_xdg_surface_configure(void *data,
     struct xwl_window *window = zxdg_surface_v6_get_user_data(xdg_surface);
 
     window->next_config.serial = serial;
-    xwl_configure_window(window);
+    if (!window->pending_config.serial) {
+        struct wl_resource *host_resource;
+        struct xwl_host_surface *host_surface = NULL;
+
+        host_resource = wl_client_get_object(window->xwl->client,
+                                             window->host_surface_id);
+        if (host_resource)
+            host_surface = wl_resource_get_user_data(host_resource);
+
+        xwl_configure_window(window);
+
+        if (xwl_process_pending_configure_acks(window, host_surface)) {
+            if (host_surface)
+                wl_surface_commit(host_surface->proxy);
+        }
+    }
 }
 
 static const struct zxdg_surface_v6_listener xwl_xdg_surface_listener = {
@@ -324,12 +336,14 @@ xwl_xdg_toplevel_configure(void *data,
     struct xwl_window *window = zxdg_toplevel_v6_get_user_data(xdg_toplevel);
     int32_t scale = window->xwl->scale;
 
-    window->next_config.mask = XCB_CONFIG_WINDOW_WIDTH |
-                               XCB_CONFIG_WINDOW_HEIGHT |
-                               XCB_CONFIG_WINDOW_BORDER_WIDTH;
-    window->next_config.values[0] = width * scale;
-    window->next_config.values[1] = height * scale;
-    window->next_config.values[2] = 0;
+    if (width && height) {
+        window->next_config.mask = XCB_CONFIG_WINDOW_WIDTH |
+                                   XCB_CONFIG_WINDOW_HEIGHT |
+                                   XCB_CONFIG_WINDOW_BORDER_WIDTH;
+        window->next_config.values[0] = width * scale;
+        window->next_config.values[1] = height * scale;
+        window->next_config.values[2] = 0;
+    }
 }
 
 static void
@@ -575,9 +589,6 @@ xwl_window_update(struct xwl_window *window)
 
     if (name)
         free(name);
-
-    if (host_surface->has_contents)
-        wl_surface_commit(host_surface->proxy);
 }
 
 static void
@@ -597,10 +608,27 @@ xwl_host_surface_attach(struct wl_client *client,
     struct xwl_host_surface *host = wl_resource_get_user_data(resource);
     struct xwl_host_buffer *host_buffer = wl_resource_get_user_data(
         buffer_resource);
+    struct wl_buffer *buffer_proxy = NULL;
+    struct xwl_window *window;
     int32_t scale = host->xwl->scale;
 
-    wl_surface_attach(host->proxy, host_buffer->proxy, x / scale, y / scale);
+    if (host_buffer) {
+        host->contents_width = host_buffer->width;
+        host->contents_height = host_buffer->height;
+        buffer_proxy = host_buffer->proxy;
+    }
+
+    wl_surface_attach(host->proxy, buffer_proxy, x / scale, y / scale);
     wl_surface_set_buffer_scale(host->proxy, scale);
+
+    wl_list_for_each(window, &host->xwl->windows, link) {
+        if (window->host_surface_id == wl_resource_get_id(resource)) {
+            while (xwl_process_pending_configure_acks(window, host))
+                continue;
+
+            break;
+        }
+    }
 }
 
 static void
@@ -699,7 +727,6 @@ xwl_host_surface_commit(struct wl_client *client,
     struct xwl_host_surface *host = wl_resource_get_user_data(resource);
 
     wl_surface_commit(host->proxy);
-    host->has_contents = 1;
 }
 
 static void
@@ -785,7 +812,8 @@ xwl_compositor_create_host_surface(struct wl_client *client,
     assert(host_surface);
 
     host_surface->xwl = host->compositor->xwl;
-    host_surface->has_contents = 0;
+    host_surface->contents_width = 0;
+    host_surface->contents_height = 0;
     host_surface->resource = wl_resource_create(
         client,
         &wl_surface_interface,
@@ -911,6 +939,8 @@ xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
     host_buffer = malloc(sizeof(*host_buffer));
     assert(host_buffer);
 
+    host_buffer->width = width;
+    host_buffer->height = height;
     host_buffer->resource = wl_resource_create(client,
                                                &wl_buffer_interface,
                                                1,
@@ -2109,25 +2139,33 @@ static void
 xwl_handle_configure_request(struct xwl *xwl,
                              xcb_configure_request_event_t *event)
 {
+    struct xwl_window *window = xwl_lookup_window(xwl, event->window);
     uint32_t mask = 0, values[16];
+    int width = event->width;
+    int height = event->height;
     int i = 0;
+
+    if (window && window->xdg_toplevel) {
+        width = window->width;
+        height = window->height;
+    }
 
     // Keep all managed windows centered horizontally.
     if (event->value_mask & (XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_WIDTH)) {
-        values[i++] = xwl->screen->width_in_pixels / 2 - event->width / 2;
+        values[i++] = xwl->screen->width_in_pixels / 2 - width / 2;
         mask |= XCB_CONFIG_WINDOW_X;
     }
     // Keep all managed windows centered vertically.
     if (event->value_mask & (XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_HEIGHT)) {
-        values[i++] = xwl->screen->height_in_pixels / 2 - event->height / 2;
+        values[i++] = xwl->screen->height_in_pixels / 2 - height / 2;
         mask |= XCB_CONFIG_WINDOW_Y;
     }
     if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH) {
-        values[i++] = event->width;
+        values[i++] = width;
         mask |= XCB_CONFIG_WINDOW_WIDTH;
     }
     if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT) {
-        values[i++] = event->height;
+        values[i++] = height;
         mask |= XCB_CONFIG_WINDOW_HEIGHT;
     }
 
@@ -2139,15 +2177,15 @@ xwl_handle_configure_notify(struct xwl *xwl,
                             xcb_configure_notify_event_t *event)
 {
     struct xwl_window *window = xwl_lookup_window(xwl, event->window);
-    if (window) {
-        window->x = event->x;
-        window->y = event->y;
+    if (!window)
+        return;
+
+    window->x = event->x;
+    window->y = event->y;
+
+    if (!window->xdg_toplevel) {
         window->width = event->width;
         window->height = event->height;
-        if (window->pending_config.serial)
-            xwl_ack_window_configure(window);
-        if (window->next_config.serial)
-            xwl_configure_window(window);
     }
 }
 
