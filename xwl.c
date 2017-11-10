@@ -2174,37 +2174,51 @@ xwl_handle_configure_request(struct xwl *xwl,
 {
     struct xwl_window *window = xwl_lookup_window(xwl, event->window);
     uint32_t mask = 0, values[16];
-    int width = event->width;
-    int height = event->height;
-    int bw = event->border_width;
     int i = 0;
 
+    // Ack configure events as satisfying request removes the guarantee
+    // that matching contents will arrive.
     if (window && window->xdg_toplevel) {
-        width = window->width;
-        height = window->height;
-        bw = window->border_width;
+        if (window->pending_config.serial) {
+            zxdg_surface_v6_ack_configure(window->xdg_surface,
+                                          window->pending_config.serial);
+            window->pending_config.serial = 0;
+            window->pending_config.mask = 0;
+        }
+        if (window->next_config.serial) {
+            zxdg_surface_v6_ack_configure(window->xdg_surface,
+                                          window->next_config.serial);
+            window->next_config.serial = 0;
+            window->next_config.mask = 0;
+        }
     }
+
+    if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH)
+        window->width = event->width;
+    if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
+        window->height = event->height;
 
     // Keep all managed windows centered horizontally.
     if (event->value_mask & (XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_WIDTH)) {
-        values[i++] = xwl->screen->width_in_pixels / 2 - width / 2 - bw;
+        values[i++] = xwl->screen->width_in_pixels / 2 - window->width / 2;
         mask |= XCB_CONFIG_WINDOW_X;
     }
     // Keep all managed windows centered vertically.
     if (event->value_mask & (XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_HEIGHT)) {
-        values[i++] = xwl->screen->height_in_pixels / 2 - height / 2 - bw;
+        values[i++] = xwl->screen->height_in_pixels / 2 - window->height / 2;
         mask |= XCB_CONFIG_WINDOW_Y;
     }
     if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH) {
-        values[i++] = width;
+        values[i++] = event->width;
         mask |= XCB_CONFIG_WINDOW_WIDTH;
     }
     if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT) {
-        values[i++] = height;
+        values[i++] = event->height;
         mask |= XCB_CONFIG_WINDOW_HEIGHT;
     }
-    if (event->value_mask & XCB_CONFIG_WINDOW_BORDER_WIDTH) {
-        values[i++] = bw;
+    if (window->border_width) {
+        window->border_width = 0;
+        values[i++] = 0;
         mask |= XCB_CONFIG_WINDOW_BORDER_WIDTH;
     }
 
