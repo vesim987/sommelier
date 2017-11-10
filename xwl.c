@@ -2555,7 +2555,7 @@ xwl_handle_display_event(int fd,
 
 static void
 xwl_usage() {
-    fprintf(stderr, "xwl-run [--scale=SCALE] PROGRAM [ARGS...]\n");
+    printf("xwl-run [--scale=SCALE] PROGRAM [ARGS...]\n");
 }
 
 int
@@ -2601,8 +2601,11 @@ main(int argc, char **argv)
         if (strcmp(arg, "--help") == 0 ||
             strcmp(arg, "-h") == 0 ||
             strcmp(arg, "-?") == 0) {
-          xwl_usage();
-          return 0;
+            xwl_usage();
+            return 0;
+        } else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
+            printf("Version: %s\n", VERSION);
+            return 0;
         } else if (strstr(arg, "--scale=") == arg) {
             const char *s = strchr(arg, '=');
             ++s;
