@@ -146,6 +146,8 @@ struct xwl_config {
     uint32_t serial;
     uint32_t mask;
     uint32_t values[3];
+    uint32_t states_length;
+    uint32_t states[3];
 };
 
 struct xwl_window {
@@ -179,7 +181,11 @@ enum {
     ATOM_NET_SUPPORTING_WM_CHECK,
     ATOM_NET_WM_NAME,
     ATOM_NET_WM_MOVERESIZE,
-    ATOM_LAST = ATOM_NET_WM_MOVERESIZE,
+    ATOM_NET_WM_STATE,
+    ATOM_NET_WM_STATE_FULLSCREEN,
+    ATOM_NET_WM_STATE_MAXIMIZED_VERT,
+    ATOM_NET_WM_STATE_MAXIMIZED_HORZ,
+    ATOM_LAST = ATOM_NET_WM_STATE_MAXIMIZED_HORZ,
 };
 
 struct xwl {
@@ -251,6 +257,10 @@ struct xwl_mwm_hints {
 #define NET_WM_MOVERESIZE_SIZE_LEFT        7
 #define NET_WM_MOVERESIZE_MOVE             8
 
+#define NET_WM_STATE_REMOVE 0
+#define NET_WM_STATE_ADD    1
+#define NET_WM_STATE_TOGGLE 2
+
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 
@@ -286,9 +296,19 @@ xwl_configure_window(struct xwl_window *window)
             window->border_width = window->next_config.values[i++];
     }
 
+    xcb_change_property(window->xwl->connection,
+                        XCB_PROP_MODE_REPLACE,
+                        window->id,
+                        window->xwl->atoms[ATOM_NET_WM_STATE].value,
+                        XCB_ATOM_ATOM,
+                        32,
+                        window->next_config.states_length,
+                        window->next_config.states);
+
     window->pending_config = window->next_config;
     window->next_config.serial = 0;
     window->next_config.mask = 0;
+    window->next_config.states_length = 0;
 }
 
 static int
@@ -358,6 +378,8 @@ xwl_xdg_toplevel_configure(void *data,
 {
     struct xwl_window *window = zxdg_toplevel_v6_get_user_data(xdg_toplevel);
     int32_t scale = window->xwl->scale;
+    uint32_t *state;
+    int i = 0;
 
     if (width && height) {
         window->next_config.mask = XCB_CONFIG_WINDOW_WIDTH |
@@ -367,6 +389,20 @@ xwl_xdg_toplevel_configure(void *data,
         window->next_config.values[1] = height * scale;
         window->next_config.values[2] = 0;
     }
+
+    wl_array_for_each(state, states) {
+        if (*state == ZXDG_TOPLEVEL_V6_STATE_FULLSCREEN) {
+            window->next_config.states[i++] =
+                window->xwl->atoms[ATOM_NET_WM_STATE_FULLSCREEN].value;
+        }
+        if (*state == ZXDG_TOPLEVEL_V6_STATE_MAXIMIZED) {
+            window->next_config.states[i++] =
+                window->xwl->atoms[ATOM_NET_WM_STATE_MAXIMIZED_VERT].value;
+            window->next_config.states[i++] =
+                window->xwl->atoms[ATOM_NET_WM_STATE_MAXIMIZED_HORZ].value;
+        }
+    }
+    window->next_config.states_length = i;
 }
 
 static void
@@ -2126,8 +2162,10 @@ xwl_handle_create_notify(struct xwl *xwl,
     window->aura_surface = NULL;
     window->next_config.serial = 0;
     window->next_config.mask = 0;
+    window->next_config.states_length = 0;
     window->pending_config.serial = 0;
     window->pending_config.mask = 0;
+    window->pending_config.states_length = 0;
     wl_list_insert(&xwl->unpaired_windows, &window->link);
     if (!event->override_redirect) {
         uint32_t values[1];
@@ -2208,12 +2246,14 @@ xwl_handle_configure_request(struct xwl *xwl,
                                           window->pending_config.serial);
             window->pending_config.serial = 0;
             window->pending_config.mask = 0;
+            window->pending_config.states_length = 0;
         }
         if (window->next_config.serial) {
             zxdg_surface_v6_ack_configure(window->xdg_surface,
                                           window->next_config.serial);
             window->next_config.serial = 0;
             window->next_config.mask = 0;
+            window->next_config.states_length = 0;
         }
     }
 
@@ -2333,6 +2373,34 @@ xwl_handle_client_message(struct xwl *xwl,
                                         seat->proxy,
                                         seat->seat->net_wm_moveresize_serial,
                                         edge);
+            }
+        }
+    } else if (event->type == xwl->atoms[ATOM_NET_WM_STATE].value) {
+        struct xwl_window *window = xwl_lookup_window(xwl, event->window);
+
+        if (window && window->xdg_toplevel) {
+            int changed[ATOM_LAST + 1];
+            uint32_t action = event->data.data32[0];
+            int i;
+
+            for (i = 0; i < ARRAY_SIZE(xwl->atoms); ++i) {
+                changed[i] = event->data.data32[1] == xwl->atoms[i].value ||
+                             event->data.data32[2] == xwl->atoms[i].value;
+            }
+
+            if (changed[ATOM_NET_WM_STATE_FULLSCREEN]) {
+                if (action == NET_WM_STATE_ADD)
+                    zxdg_toplevel_v6_set_fullscreen(window->xdg_toplevel, NULL);
+                else if (action == NET_WM_STATE_REMOVE)
+                    zxdg_toplevel_v6_unset_fullscreen(window->xdg_toplevel);
+            }
+
+            if (changed[ATOM_NET_WM_STATE_MAXIMIZED_VERT] &&
+                changed[ATOM_NET_WM_STATE_MAXIMIZED_HORZ]) {
+                if (action == NET_WM_STATE_ADD)
+                    zxdg_toplevel_v6_set_maximized(window->xdg_toplevel);
+                else if (action == NET_WM_STATE_REMOVE)
+                    zxdg_toplevel_v6_unset_maximized(window->xdg_toplevel);
             }
         }
     }
@@ -2694,6 +2762,12 @@ main(int argc, char **argv)
             [ATOM_NET_SUPPORTING_WM_CHECK] = {"_NET_SUPPORTING_WM_CHECK"},
             [ATOM_NET_WM_NAME] = {"_NET_WM_NAME"},
             [ATOM_NET_WM_MOVERESIZE] = {"_NET_WM_MOVERESIZE"},
+            [ATOM_NET_WM_STATE] = {"_NET_WM_STATE"},
+            [ATOM_NET_WM_STATE_FULLSCREEN] = {"_NET_WM_STATE_FULLSCREEN"},
+            [ATOM_NET_WM_STATE_MAXIMIZED_VERT] =
+            {"_NET_WM_STATE_MAXIMIZED_VERT"},
+            [ATOM_NET_WM_STATE_MAXIMIZED_HORZ] =
+            {"_NET_WM_STATE_MAXIMIZED_HORZ"},
         }
     };
     struct wl_event_loop *event_loop;
