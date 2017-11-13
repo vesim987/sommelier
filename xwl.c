@@ -102,6 +102,7 @@ struct xwl_seat {
     uint32_t id;
     uint32_t version;
     struct wl_global *host_global;
+    uint32_t net_wm_moveresize_serial;
     struct wl_list link;
 };
 
@@ -173,8 +174,12 @@ enum {
     ATOM_WM_PROTOCOLS,
     ATOM_WM_DELETE_WINDOW,
     ATOM_WL_SURFACE_ID,
+    ATOM_UTF8_STRING,
     ATOM_MOTIF_WM_HINTS,
-    ATOM_LAST = ATOM_MOTIF_WM_HINTS,
+    ATOM_NET_SUPPORTING_WM_CHECK,
+    ATOM_NET_WM_NAME,
+    ATOM_NET_WM_MOVERESIZE,
+    ATOM_LAST = ATOM_NET_WM_MOVERESIZE,
 };
 
 struct xwl {
@@ -201,6 +206,7 @@ struct xwl {
     struct xwl_window *host_focus_window;
     xcb_window_t focus_window;
     int32_t scale;
+    struct xwl_host_seat *net_wm_moveresize_seat;
     union {
         const char *name;
         xcb_intern_atom_cookie_t cookie;
@@ -235,6 +241,15 @@ struct xwl_mwm_hints {
 #define MWM_DECOR_MINIMIZE    (1L << 5)
 #define MWM_DECOR_MAXIMIZE    (1L << 6)
 
+#define NET_WM_MOVERESIZE_SIZE_TOPLEFT     0
+#define NET_WM_MOVERESIZE_SIZE_TOP         1
+#define NET_WM_MOVERESIZE_SIZE_TOPRIGHT    2
+#define NET_WM_MOVERESIZE_SIZE_RIGHT       3
+#define NET_WM_MOVERESIZE_SIZE_BOTTOMRIGHT 4
+#define NET_WM_MOVERESIZE_SIZE_BOTTOM      5
+#define NET_WM_MOVERESIZE_SIZE_BOTTOMLEFT  6
+#define NET_WM_MOVERESIZE_SIZE_LEFT        7
+#define NET_WM_MOVERESIZE_MOVE             8
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
@@ -497,6 +512,7 @@ xwl_window_update(struct xwl_window *window)
 
             switch (properties[i].type) {
                 case PROPERTY_WM_NAME:
+                    assert(!name);
                     name = strndup(xcb_get_property_value(reply),
                                    xcb_get_property_value_length(reply));
                     break;
@@ -1346,6 +1362,8 @@ xwl_pointer_button(void *data,
                            time,
                            button,
                            state);
+
+    host->seat->net_wm_moveresize_serial = serial;
 }
 
 static void
@@ -1831,6 +1849,9 @@ xwl_destroy_host_seat(struct wl_resource *resource)
 {
     struct xwl_host_seat *host = wl_resource_get_user_data(resource);
 
+    if (host->seat->xwl->net_wm_moveresize_seat == host)
+        host->seat->xwl->net_wm_moveresize_seat = NULL;
+
     wl_seat_destroy(host->proxy);
     wl_resource_set_user_data(resource, NULL);
     free(host);
@@ -1862,6 +1883,8 @@ xwl_bind_host_seat(struct wl_client *client,
                                    wl_resource_get_version(host->resource));
     wl_seat_set_user_data(host->proxy, host);
     wl_seat_add_listener(host->proxy, &xwl_seat_listener, host);
+
+    seat->xwl->net_wm_moveresize_seat = host;
 }
 
 static void
@@ -1943,6 +1966,7 @@ xwl_registry_handler(void* data,
                                              seat->version,
                                              seat,
                                              xwl_bind_host_seat);
+        seat->net_wm_moveresize_serial = 0;
         wl_list_insert(&xwl->seats, &seat->link);
     } else if (strcmp(interface, "zxdg_shell_v6") == 0) {
         struct xwl_xdg_shell *xdg_shell = malloc(sizeof(struct xwl_xdg_shell));
@@ -2243,25 +2267,74 @@ xwl_handle_configure_notify(struct xwl *xwl,
     }
 }
 
+static uint32_t
+xwl_resize_edge(int net_wm_moveresize_size)
+{
+    switch (net_wm_moveresize_size) {
+        case NET_WM_MOVERESIZE_SIZE_TOPLEFT:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_TOP_LEFT;
+        case NET_WM_MOVERESIZE_SIZE_TOP:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_TOP;
+        case NET_WM_MOVERESIZE_SIZE_TOPRIGHT:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_TOP_RIGHT;
+        case NET_WM_MOVERESIZE_SIZE_RIGHT:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_RIGHT;
+        case NET_WM_MOVERESIZE_SIZE_BOTTOMRIGHT:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_BOTTOM_RIGHT;
+        case NET_WM_MOVERESIZE_SIZE_BOTTOM:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_BOTTOM;
+        case NET_WM_MOVERESIZE_SIZE_BOTTOMLEFT:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_BOTTOM_LEFT;
+        case NET_WM_MOVERESIZE_SIZE_LEFT:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_LEFT;
+        default:
+            return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_NONE;
+    }
+}
+
 static void
 xwl_handle_client_message(struct xwl *xwl,
                           xcb_client_message_event_t *event)
 {
-  struct xwl_window *window, *unpaired_window = NULL;
+    if (event->type == xwl->atoms[ATOM_WL_SURFACE_ID].value) {
+        struct xwl_window *window, *unpaired_window = NULL;
 
-    if (event->type != xwl->atoms[ATOM_WL_SURFACE_ID].value)
-        return;
-
-    wl_list_for_each(window, &xwl->unpaired_windows, link) {
-        if (window->id == event->window) {
-            unpaired_window = window;
-            break;
+        wl_list_for_each(window, &xwl->unpaired_windows, link) {
+            if (window->id == event->window) {
+                unpaired_window = window;
+                break;
+            }
         }
-    }
 
-    if (unpaired_window) {
-        unpaired_window->host_surface_id = event->data.data32[0];
-        xwl_window_update(unpaired_window);
+        if (unpaired_window) {
+            unpaired_window->host_surface_id = event->data.data32[0];
+            xwl_window_update(unpaired_window);
+        }
+    } else if (event->type == xwl->atoms[ATOM_NET_WM_MOVERESIZE].value) {
+        struct xwl_window *window = xwl_lookup_window(xwl, event->window);
+
+        if (window && window->xdg_toplevel) {
+            struct xwl_host_seat *seat = window->xwl->net_wm_moveresize_seat;
+
+            if (!seat)
+                return;
+
+            if (event->data.data32[2] == NET_WM_MOVERESIZE_MOVE) {
+                zxdg_toplevel_v6_move(window->xdg_toplevel,
+                                      seat->proxy,
+                                      seat->seat->net_wm_moveresize_serial);
+            } else {
+                uint32_t edge = xwl_resize_edge(event->data.data32[2]);
+
+                if (edge == ZXDG_TOPLEVEL_V6_RESIZE_EDGE_NONE)
+                    return;
+
+                zxdg_toplevel_v6_resize(window->xdg_toplevel,
+                                        seat->proxy,
+                                        seat->seat->net_wm_moveresize_serial,
+                                        edge);
+            }
+        }
     }
 }
 
@@ -2388,6 +2461,7 @@ xwl_handle_x_connection_event(int fd,
 static void
 xwl_connect(struct xwl *xwl)
 {
+    const char wm_name[] = "WLWM";
     const xcb_setup_t *setup;
     xcb_screen_iterator_t screen_iterator;
     uint32_t values[1];
@@ -2457,6 +2531,30 @@ xwl_connect(struct xwl *xwl)
         free(atom_reply);
     }
 
+    xcb_change_property(xwl->connection,
+                        XCB_PROP_MODE_REPLACE,
+                        xwl->window,
+                        xwl->atoms[ATOM_NET_SUPPORTING_WM_CHECK].value,
+                        XCB_ATOM_WINDOW,
+                        32,
+                        1,
+                        &xwl->window);
+    xcb_change_property(xwl->connection,
+                        XCB_PROP_MODE_REPLACE,
+                        xwl->window,
+                        xwl->atoms[ATOM_NET_WM_NAME].value,
+                        xwl->atoms[ATOM_UTF8_STRING].value,
+                        8,
+                        strlen(wm_name),
+                        wm_name);
+    xcb_change_property(xwl->connection,
+                        XCB_PROP_MODE_REPLACE,
+                        xwl->screen->root,
+                        xwl->atoms[ATOM_NET_SUPPORTING_WM_CHECK].value,
+                        XCB_ATOM_WINDOW,
+                        32,
+                        1,
+                        &xwl->window);
     xcb_set_selection_owner(xwl->connection,
                             xwl->window,
                             xwl->atoms[ATOM_WM_S0].value,
@@ -2585,12 +2683,17 @@ main(int argc, char **argv)
         .host_focus_window = NULL,
         .focus_window = 0,
         .scale = 1,
+        .net_wm_moveresize_seat = NULL,
         .atoms = {
             [ATOM_WM_S0] = {"WM_S0"},
             [ATOM_WM_PROTOCOLS] = {"WM_PROTOCOLS"},
             [ATOM_WM_DELETE_WINDOW] = {"WM_DELETE_WINDOW"},
             [ATOM_WL_SURFACE_ID] = {"WL_SURFACE_ID"},
+            [ATOM_UTF8_STRING] = {"UTF8_STRING"},
             [ATOM_MOTIF_WM_HINTS] = {"_MOTIF_WM_HINTS"},
+            [ATOM_NET_SUPPORTING_WM_CHECK] = {"_NET_SUPPORTING_WM_CHECK"},
+            [ATOM_NET_WM_NAME] = {"_NET_WM_NAME"},
+            [ATOM_NET_WM_MOVERESIZE] = {"_NET_WM_MOVERESIZE"},
         }
     };
     struct wl_event_loop *event_loop;
