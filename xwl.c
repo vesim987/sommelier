@@ -145,7 +145,7 @@ struct xwl_aura_shell {
 struct xwl_config {
     uint32_t serial;
     uint32_t mask;
-    uint32_t values[3];
+    uint32_t values[5];
     uint32_t states_length;
     uint32_t states[3];
 };
@@ -277,6 +277,31 @@ static const struct zxdg_shell_v6_listener xwl_xdg_shell_listener = {
 };
 
 static void
+xwl_send_configure_notify(struct xwl_window *window)
+{
+    xcb_configure_notify_event_t event;
+
+    event.response_type = XCB_CONFIGURE_NOTIFY;
+    event.event = window->id;
+    event.window = window->id;
+    event.above_sibling = XCB_WINDOW_NONE;
+    event.x = window->x;
+    event.y = window->y;
+    event.width = window->width;
+    event.height = window->height;
+    event.border_width = window->border_width;
+    event.override_redirect = 0;
+    event.pad0 = 0;
+    event.pad1 = 0;
+
+    xcb_send_event(window->xwl->connection,
+                   0,
+                   window->id,
+                   XCB_EVENT_MASK_STRUCTURE_NOTIFY,
+                   (char *) &event);
+}
+
+static void
 xwl_configure_window(struct xwl_window *window)
 {
     assert(!window->pending_config.serial);
@@ -288,6 +313,10 @@ xwl_configure_window(struct xwl_window *window)
                              window->id,
                              window->next_config.mask,
                              window->next_config.values);
+        if (window->next_config.mask & XCB_CONFIG_WINDOW_X)
+            window->x = window->next_config.values[i++];
+        if (window->next_config.mask & XCB_CONFIG_WINDOW_Y)
+            window->y = window->next_config.values[i++];
         if (window->next_config.mask & XCB_CONFIG_WINDOW_WIDTH)
             window->width = window->next_config.values[i++];
         if (window->next_config.mask & XCB_CONFIG_WINDOW_HEIGHT)
@@ -377,17 +406,25 @@ xwl_xdg_toplevel_configure(void *data,
                            struct wl_array *states)
 {
     struct xwl_window *window = zxdg_toplevel_v6_get_user_data(xdg_toplevel);
-    int32_t scale = window->xwl->scale;
     uint32_t *state;
     int i = 0;
 
     if (width && height) {
-        window->next_config.mask = XCB_CONFIG_WINDOW_WIDTH |
+        int32_t width_in_pixels = width * window->xwl->scale;
+        int32_t height_in_pixels = height * window->xwl->scale;
+
+        window->next_config.mask = XCB_CONFIG_WINDOW_X |
+                                   XCB_CONFIG_WINDOW_Y |
+                                   XCB_CONFIG_WINDOW_WIDTH |
                                    XCB_CONFIG_WINDOW_HEIGHT |
                                    XCB_CONFIG_WINDOW_BORDER_WIDTH;
-        window->next_config.values[0] = width * scale;
-        window->next_config.values[1] = height * scale;
-        window->next_config.values[2] = 0;
+        window->next_config.values[0] =
+            window->xwl->screen->width_in_pixels / 2 - width_in_pixels / 2;
+        window->next_config.values[1] =
+            window->xwl->screen->height_in_pixels / 2 - height_in_pixels / 2;
+        window->next_config.values[2] = width_in_pixels;
+        window->next_config.values[3] = height_in_pixels;
+        window->next_config.values[4] = 0;
     }
 
     wl_array_for_each(state, states) {
@@ -2235,8 +2272,10 @@ xwl_handle_configure_request(struct xwl *xwl,
                              xcb_configure_request_event_t *event)
 {
     struct xwl_window *window = xwl_lookup_window(xwl, event->window);
-    uint32_t mask = 0, values[16];
-    int i = 0;
+    int x = window->x;
+    int y = window->y;
+    int width = window->width;
+    int height = window->height;
 
     // Ack configure events as satisfying request removes the guarantee
     // that matching contents will arrive.
@@ -2257,36 +2296,46 @@ xwl_handle_configure_request(struct xwl *xwl,
         }
     }
 
-    if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH)
-        window->width = event->width;
-    if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
-        window->height = event->height;
-
-    // Keep all managed windows centered horizontally.
-    if (event->value_mask & (XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_WIDTH)) {
-        values[i++] = xwl->screen->width_in_pixels / 2 - window->width / 2;
-        mask |= XCB_CONFIG_WINDOW_X;
-    }
-    // Keep all managed windows centered vertically.
-    if (event->value_mask & (XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_HEIGHT)) {
-        values[i++] = xwl->screen->height_in_pixels / 2 - window->height / 2;
-        mask |= XCB_CONFIG_WINDOW_Y;
-    }
     if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH) {
-        values[i++] = event->width;
-        mask |= XCB_CONFIG_WINDOW_WIDTH;
+        // Keep all managed windows centered horizontally.
+        x = xwl->screen->width_in_pixels / 2 - event->width / 2;
+        width = event->width;
     }
     if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT) {
-        values[i++] = event->height;
-        mask |= XCB_CONFIG_WINDOW_HEIGHT;
-    }
-    if (window->border_width) {
-        window->border_width = 0;
-        values[i++] = 0;
-        mask |= XCB_CONFIG_WINDOW_BORDER_WIDTH;
+        // Keep all managed windows centered vertically.
+        y = xwl->screen->height_in_pixels / 2 - event->height / 2;
+        height = event->height;
     }
 
-    xcb_configure_window(xwl->connection, event->window, mask, values);
+    if (x != window->x ||
+        y != window->y ||
+        width != window->width ||
+        height != window->height ||
+        window->border_width) {
+        uint32_t values[16];
+        int i = 0;
+
+        values[i++] = x;
+        values[i++] = y;
+        values[i++] = width;
+        values[i++] = height;
+        values[i++] = 0;
+        xcb_configure_window(xwl->connection,
+                             window->id,
+                             XCB_CONFIG_WINDOW_X |
+                             XCB_CONFIG_WINDOW_Y |
+                             XCB_CONFIG_WINDOW_WIDTH |
+                             XCB_CONFIG_WINDOW_HEIGHT |
+                             XCB_CONFIG_WINDOW_BORDER_WIDTH,
+                             values);
+        window->x = x;
+        window->y = y;
+        window->width = width;
+        window->height = height;
+        window->border_width = 0;
+    } else {
+        xwl_send_configure_notify(window);
+    }
 }
 
 static void
@@ -2297,10 +2346,9 @@ xwl_handle_configure_notify(struct xwl *xwl,
     if (!window)
         return;
 
-    window->x = event->x;
-    window->y = event->y;
-
-    if (!window->xdg_toplevel) {
+    if (event->override_redirect) {
+        window->x = event->x;
+        window->y = event->y;
         window->width = event->width;
         window->height = event->height;
         window->border_width = event->border_width;
