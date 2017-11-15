@@ -530,6 +530,10 @@ xwl_window_update(struct xwl_window *window)
             zxdg_surface_v6_destroy(window->xdg_surface);
             window->xdg_surface = NULL;
         }
+        if (window->aura_surface) {
+            zaura_surface_destroy(window->aura_surface);
+            window->aura_surface = NULL;
+        }
         return;
     }
 
