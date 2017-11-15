@@ -541,7 +541,6 @@ xwl_window_update(struct xwl_window *window)
 
     host_surface = wl_resource_get_user_data(host_resource);
     assert(host_surface);
-    assert(!host_surface->is_cursor);
 
     assert(xwl->xdg_shell);
     assert(xwl->xdg_shell->internal);
@@ -692,6 +691,7 @@ xwl_window_update(struct xwl_window *window)
     if (name)
         free(name);
 
+    host_surface->is_cursor = 0;
     wl_surface_commit(host_surface->proxy);
 }
 
