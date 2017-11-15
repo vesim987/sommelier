@@ -212,6 +212,7 @@ struct xwl {
     struct xwl_window *host_focus_window;
     xcb_window_t focus_window;
     int32_t scale;
+    const char* app_id;
     struct xwl_host_seat *net_wm_moveresize_seat;
     union {
         const char *name;
@@ -683,6 +684,9 @@ xwl_window_update(struct xwl_window *window)
 
         if (name)
             zxdg_toplevel_v6_set_title(window->xdg_toplevel, name);
+
+        if (xwl->app_id)
+            zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, xwl->app_id);
     }
 
     if (name)
@@ -2772,7 +2776,7 @@ xwl_handle_display_event(int fd,
 
 static void
 xwl_usage() {
-    printf("xwl-run [--scale=SCALE] PROGRAM [ARGS...]\n");
+    printf("xwl-run [--scale=SCALE] [--app-id=ID] PROGRAM [ARGS...]\n");
 }
 
 int
@@ -2799,6 +2803,7 @@ main(int argc, char **argv)
         .host_focus_window = NULL,
         .focus_window = 0,
         .scale = 1,
+        .app_id = NULL,
         .net_wm_moveresize_seat = NULL,
         .atoms = {
             [ATOM_WM_S0] = {"WM_S0"},
@@ -2839,6 +2844,10 @@ main(int argc, char **argv)
             ++s;
             xwl.scale = atoi(s);
             assert(xwl.scale >= 1);
+        } else if (strstr(arg, "--app-id=") == arg) {
+            const char *s = strchr(arg, '=');
+            ++s;
+            xwl.app_id = s;
         } else if (arg[0] == '-') {
             if (strcmp(arg, "--") != 0) {
                 fprintf (stderr, "Option `%s' is unknown.\n", arg);
