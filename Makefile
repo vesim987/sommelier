@@ -1,9 +1,9 @@
 CC=gcc
 GIT_VERSION := $(shell git describe --abbrev=4 --dirty --always --tags)
 CFLAGS=-g -Wall `pkg-config --cflags xcb xcb-composite wayland-server wayland-client` -I. -DVERSION=\"$(GIT_VERSION)\"
-LDFLAGS=-lpthread `pkg-config --libs xcb xcb-composite wayland-server wayland-client`
-DEPS = xdg-shell-unstable-v6-client-protocol.h aura-shell-client-protocol.h
-OBJECTS = xwl.o xdg-shell-unstable-v6-protocol.o aura-shell-protocol.o
+LDFLAGS=-lpthread -lm `pkg-config --libs xcb xcb-composite wayland-server wayland-client`
+DEPS = xdg-shell-unstable-v6-client-protocol.h aura-shell-client-protocol.h viewporter-client-protocol.h
+OBJECTS = xwl.o xdg-shell-unstable-v6-protocol.o aura-shell-protocol.o viewporter-protocol.o
 
 xwl-launch: $(OBJECTS)
 	$(CC) $(OBJECTS) -o xwl-run $(LDFLAGS)

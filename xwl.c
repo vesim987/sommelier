@@ -4,12 +4,14 @@
 
 #include <assert.h>
 #include <aura-shell-client-protocol.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <viewporter-client-protocol.h>
 #define WL_HIDE_DEPRECATED
 #include <wayland-client.h>
 #include <wayland-server.h>
@@ -36,6 +38,7 @@ struct xwl_host_surface {
     struct xwl *xwl;
     struct wl_resource *resource;
     struct wl_surface *proxy;
+    struct wp_viewport *viewport;
     uint32_t contents_width;
     uint32_t contents_height;
     int is_cursor;
@@ -142,6 +145,12 @@ struct xwl_aura_shell {
     struct zaura_shell *internal;
 };
 
+struct xwl_viewporter {
+    struct xwl *xwl;
+    uint32_t id;
+    struct wp_viewporter *internal;
+};
+
 struct xwl_config {
     uint32_t serial;
     uint32_t mask;
@@ -198,6 +207,7 @@ struct xwl {
     struct xwl_shell* shell;
     struct xwl_xdg_shell* xdg_shell;
     struct xwl_aura_shell* aura_shell;
+    struct xwl_viewporter* viewporter;
     struct wl_list outputs;
     struct wl_list seats;
     struct wl_event_source *display_event_source;
@@ -211,7 +221,7 @@ struct xwl {
     struct wl_list windows, unpaired_windows;
     struct xwl_window *host_focus_window;
     xcb_window_t focus_window;
-    int32_t scale;
+    double scale;
     const char* app_id;
     struct xwl_host_seat *net_wm_moveresize_seat;
     union {
@@ -718,7 +728,7 @@ xwl_host_surface_attach(struct wl_client *client,
         buffer_resource);
     struct wl_buffer *buffer_proxy = NULL;
     struct xwl_window *window;
-    int32_t scale = host->xwl->scale;
+    double scale = host->xwl->scale;
 
     if (host_buffer) {
         host->contents_width = host_buffer->width;
@@ -727,7 +737,13 @@ xwl_host_surface_attach(struct wl_client *client,
     }
 
     wl_surface_attach(host->proxy, buffer_proxy, x / scale, y / scale);
-    wl_surface_set_buffer_scale(host->proxy, scale);
+    if (host->viewport) {
+        wp_viewport_set_destination(host->viewport,
+                                    host->contents_width / scale,
+                                    host->contents_height / scale);
+    } else {
+        wl_surface_set_buffer_scale(host->proxy, scale);
+    }
 
     wl_list_for_each(window, &host->xwl->windows, link) {
         if (window->host_surface_id == wl_resource_get_id(resource)) {
@@ -748,14 +764,15 @@ xwl_host_surface_damage(struct wl_client *client,
                         int32_t height)
 {
     struct xwl_host_surface *host = wl_resource_get_user_data(resource);
-    int32_t scale = host->xwl->scale;
+    double scale = host->xwl->scale;
     int32_t x1, y1, x2, y2;
 
-    // Round to enclosing rect.
-    x1 = x / scale;
-    y1 = y / scale;
-    x2 = (x + width + scale - 1) / scale;
-    y2 = (y + height + scale - 1) / scale;
+    // Enclosing rect after scaling and outset by one pixel to account for
+    // potential filtering.
+    x1 = (x - 1) / scale;
+    y1 = (y - 1) / scale;
+    x2 = ceil((x + width + 1) / scale);
+    y2 = ceil((y + height + 1) / scale);
 
     wl_surface_damage(host->proxy, x1, y1, x2 - x1, y2 - y1);
 }
@@ -918,6 +935,8 @@ xwl_destroy_host_surface(struct wl_resource *resource)
         xwl_window_update(surface_window);
     }
 
+    if (host->viewport)
+        wp_viewport_destroy(host->viewport);
     wl_surface_destroy(host->proxy);
     wl_resource_set_user_data(resource, NULL);
     free(host);
@@ -950,6 +969,11 @@ xwl_compositor_create_host_surface(struct wl_client *client,
                                    xwl_destroy_host_surface);
     host_surface->proxy = wl_compositor_create_surface(host->proxy);
     wl_surface_set_user_data(host_surface->proxy, host_surface);
+    if (host_surface->xwl->viewporter) {
+        host_surface->viewport =
+            wp_viewporter_get_viewport(host_surface->xwl->viewporter->internal,
+                                       host_surface->proxy);
+    }
 
     wl_list_for_each(window, &host->compositor->xwl->unpaired_windows, link) {
         if (window->host_surface_id == id) {
@@ -1352,7 +1376,7 @@ xwl_host_pointer_set_cursor(struct wl_client *client,
 {
     struct xwl_host_pointer *host = wl_resource_get_user_data(resource);
     struct xwl_host_surface *host_surface = NULL;
-    int32_t scale = host->seat->xwl->scale;
+    double scale = host->seat->xwl->scale;
 
     if (surface_resource) {
         host_surface = wl_resource_get_user_data(surface_resource);
@@ -1390,7 +1414,7 @@ xwl_pointer_enter(void *data,
 {
     struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
     struct xwl_host_surface *host_surface = wl_surface_get_user_data(surface);
-    int32_t scale = host->seat->xwl->scale;
+    double scale = host->seat->xwl->scale;
 
     wl_pointer_send_enter(host->resource,
                           serial,
@@ -1423,7 +1447,7 @@ xwl_pointer_motion(void *data,
                    wl_fixed_t y)
 {
     struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
-    int32_t scale = host->seat->xwl->scale;
+    double scale = host->seat->xwl->scale;
 
     wl_pointer_send_motion(host->resource, time, x * scale, y * scale);
 }
@@ -1455,7 +1479,7 @@ xwl_pointer_axis(void *data,
                  wl_fixed_t value)
 {
     struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
-    int32_t scale = host->seat->xwl->scale;
+    double scale = host->seat->xwl->scale;
 
     wl_pointer_send_axis(host->resource, time, axis, value * scale);
 }
@@ -1706,7 +1730,7 @@ xwl_host_touch_down(void *data,
 {
     struct xwl_host_touch *host = wl_touch_get_user_data(touch);
     struct xwl_host_surface *host_surface = wl_surface_get_user_data(surface);
-    int32_t scale = host->seat->xwl->scale;
+    double scale = host->seat->xwl->scale;
 
     wl_touch_send_down(host->resource,
                        serial,
@@ -1738,7 +1762,7 @@ xwl_host_touch_motion(void *data,
                       wl_fixed_t y)
 {
     struct xwl_host_touch *host = wl_touch_get_user_data(touch);
-    int32_t scale = host->seat->xwl->scale;
+    double scale = host->seat->xwl->scale;
 
     wl_touch_send_motion(host->resource, time, id, x * scale, y * scale);
 }
@@ -2064,7 +2088,8 @@ xwl_registry_handler(void* data,
         assert(!xwl->xdg_shell);
         xwl->xdg_shell = xdg_shell;
     } else if (strcmp(interface, "zaura_shell") == 0) {
-        struct xwl_aura_shell *aura_shell = malloc(sizeof(struct xwl_aura_shell));
+        struct xwl_aura_shell *aura_shell =
+            malloc(sizeof(struct xwl_aura_shell));
         assert(aura_shell);
         aura_shell->xwl = xwl;
         aura_shell->id = id;
@@ -2074,6 +2099,18 @@ xwl_registry_handler(void* data,
                                                 1);
         assert(!xwl->aura_shell);
         xwl->aura_shell = aura_shell;
+    } else if (strcmp(interface, "wp_viewporter") == 0) {
+        struct xwl_viewporter *viewporter =
+            malloc(sizeof(struct xwl_viewporter));
+        assert(viewporter);
+        viewporter->xwl = xwl;
+        viewporter->id = id;
+        viewporter->internal = wl_registry_bind(registry,
+                                                id,
+                                                &wp_viewporter_interface,
+                                                1);
+        assert(!xwl->viewporter);
+        xwl->viewporter = viewporter;
     }
 }
 
@@ -2115,6 +2152,12 @@ xwl_registry_remover(void *data,
         zaura_shell_destroy(xwl->aura_shell->internal);
         free(xwl->aura_shell);
         xwl->aura_shell = NULL;
+        return;
+    }
+    if (xwl->viewporter && xwl->viewporter->id == id) {
+        wp_viewporter_destroy(xwl->viewporter->internal);
+        free(xwl->viewporter);
+        xwl->viewporter = NULL;
         return;
     }
     wl_list_for_each(output, &xwl->outputs, link) {
@@ -2796,6 +2839,7 @@ main(int argc, char **argv)
         .shell = NULL,
         .xdg_shell = NULL,
         .aura_shell = NULL,
+        .viewporter = NULL,
         .display_event_source = NULL,
         .sigchld_event_source = NULL,
         .wm_fd = -1,
@@ -2806,7 +2850,7 @@ main(int argc, char **argv)
         .window = 0,
         .host_focus_window = NULL,
         .focus_window = 0,
-        .scale = 1,
+        .scale = 1.0,
         .app_id = NULL,
         .net_wm_moveresize_seat = NULL,
         .atoms = {
@@ -2846,8 +2890,8 @@ main(int argc, char **argv)
         } else if (strstr(arg, "--scale=") == arg) {
             const char *s = strchr(arg, '=');
             ++s;
-            xwl.scale = atoi(s);
-            assert(xwl.scale >= 1);
+            xwl.scale = atof(s);
+            assert(xwl.scale > 0.0);
         } else if (strstr(arg, "--app-id=") == arg) {
             const char *s = strchr(arg, '=');
             ++s;
@@ -2895,6 +2939,9 @@ main(int argc, char **argv)
                              &xwl);
 
     wl_display_roundtrip(xwl.display);
+
+    if (!xwl.viewporter)
+        xwl.scale = ceil(xwl.scale);
 
     xwl.sigchld_event_source = wl_event_loop_add_signal(event_loop,
                                                         SIGCHLD,
