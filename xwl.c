@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <systemd/sd-daemon.h>
 #include <unistd.h>
 #include <viewporter-client-protocol.h>
 #define WL_HIDE_DEPRECATED
@@ -223,6 +224,7 @@ struct xwl {
     xcb_window_t focus_window;
     double scale;
     const char* app_id;
+    int exit_with_child;
     struct xwl_host_seat *net_wm_moveresize_seat;
     union {
         const char *name;
@@ -2748,7 +2750,8 @@ xwl_handle_sigchld(int signal_number, void *data)
                         "Child exited with status: %d\n",
                         WEXITSTATUS(status));
             }
-            kill(xwl->xwayland_pid, SIGTERM);
+            if (xwl->exit_with_child)
+                kill(xwl->xwayland_pid, SIGTERM);
         } else if (pid == xwl->xwayland_pid) {
             xwl->xwayland_pid = 0;
             if (WIFEXITED(status) && WEXITSTATUS(status)) {
@@ -2817,13 +2820,20 @@ xwl_handle_display_event(int fd,
     xwl->display_event_source = NULL;
     close(fd);
 
+    sd_notify(0, "READY=1");
+
     xwl_runprog(xwl);
     return 1;
 }
 
 static void
 xwl_usage() {
-    printf("xwl-run [--scale=SCALE] [--app-id=ID] PROGRAM [ARGS...]\n");
+    printf("xwl-run "
+           "[--scale=SCALE] "
+           "[--app-id=ID] "
+           "[--display=DISPLAY] "
+           "[--no-exit-with-child] "
+           "PROGRAM [ARGS...]\n");
 }
 
 int
@@ -2852,6 +2862,7 @@ main(int argc, char **argv)
         .focus_window = 0,
         .scale = 1.0,
         .app_id = NULL,
+        .exit_with_child = 1,
         .net_wm_moveresize_seat = NULL,
         .atoms = {
             [ATOM_WM_S0] = {"WM_S0"},
@@ -2874,6 +2885,7 @@ main(int argc, char **argv)
     struct wl_event_loop *event_loop;
     int sv[2], ds[2], wm[2];
     pid_t pid;
+    int display = -1;
     int rv;
     int i;
 
@@ -2896,6 +2908,12 @@ main(int argc, char **argv)
             const char *s = strchr(arg, '=');
             ++s;
             xwl.app_id = s;
+        } else if (strstr(arg, "--display=") == arg) {
+            const char *s = strchr(arg, '=');
+            ++s;
+            display = atoi(s);
+        } else if (strstr(arg, "--no-exit-with-child") == arg) {
+            xwl.exit_with_child = 0;
         } else if (arg[0] == '-') {
             if (strcmp(arg, "--") != 0) {
                 fprintf (stderr, "Option `%s' is unknown.\n", arg);
@@ -2973,7 +2991,9 @@ main(int argc, char **argv)
     pid = fork();
     assert(pid != -1);
     if (pid == 0) {
-        char fd_str[8], display_fd_str[8], wm_fd_str[8];
+        char fd_str[8], display_str[8], display_fd_str[8], wm_fd_str[8];
+        char *args[32];
+        int i = 0;
         int fd;
 
         /* SOCK_CLOEXEC closes both ends, so we need to unset
@@ -2986,13 +3006,21 @@ main(int argc, char **argv)
         fd = dup(wm[1]);
         snprintf(wm_fd_str, sizeof(wm_fd_str), "%d", fd);
 
-        execlp("Xwayland", "Xwayland",
-               "-rootless",
-               "-terminate",
-               "-shm",
-               "-displayfd", display_fd_str,
-               "-wm", wm_fd_str,
-               NULL);
+        args[i++] = XWAYLAND_PATH "/Xwayland";
+        if (display > 0) {
+            snprintf(display_str, sizeof(display_str), ":%d", display);
+            args[i++] = display_str;
+        }
+        args[i++] = "-nolisten";
+        args[i++] = "tcp";
+        args[i++] = "-rootless";
+        args[i++] = "-shm";
+        args[i++] = "-displayfd";
+        args[i++] = display_fd_str;
+        args[i++] = "-wm";
+        args[i++] = wm_fd_str;
+        args[i++] = NULL;
+        execvp(XWAYLAND_PATH "/Xwayland", args);
         perror("Xwayland");
         _exit(EXIT_FAILURE);
     }

@@ -3,4 +3,5 @@ Xwayland to allow unmodified X clients to run as Wayland clients.
 
 Usage:
 
-xwl-run [--scale=SCALE] PROGRAM [ARGS...]
+xwl-run [--scale=SCALE] [--app-id=ID] [--display=DISPLAY]
+	[--no-exit-with-child] PROGRAM [ARGS...]
