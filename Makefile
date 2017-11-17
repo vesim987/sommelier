@@ -35,6 +35,8 @@ xwl-run: $(OBJECTS)
 
 $(OBJECTS): $(DEPS)
 
+.PHONY: all install uninstall dist deb clean
+
 install: all
 	install -D xwl-run \
 		$(DESTDIR)$(PREFIX)/bin/xwl-run
@@ -48,13 +50,18 @@ uninstall:
 	rm -f $(DESTDIR)$(SYSCONFDIR)/xwlrc
 	rm -f $(DESTDIR)$(SYSCONFDIR)/systemd/user/xwl@.service
 
-clean:
-	rm -f *~ *-protocol.c *-client-protocol.h *.o xwl-run xwl@.service
-
 dist:
 	mkdir -p xwl-$(GIT_VERSION)
-	cp $(ALLFILES) xwl-$(GIT_VERSION)
+	cp -r $(ALLFILES) debian xwl-$(GIT_VERSION)
 	tar czf xwl-$(GIT_VERSION).tar.gz xwl-$(GIT_VERSION)
 	rm -rf xwl-$(GIT_VERSION)
 
-.PHONY: install uninstall clean
+deb: dist
+	ln -s xwl-$(GIT_VERSION).tar.gz xwl_$(GIT_VERSION).orig.tar.gz
+	tar xzf xwl-$(GIT_VERSION).tar.gz
+	cd xwl-$(GIT_VERSION) && debuild -i -us -uc -b
+	rm -rf xwl-$(GIT_VERSION) xwl_$(GIT_VERSION).orig.tar.gz
+
+clean:
+	rm -f *~ *-protocol.c *-client-protocol.h *.o xwl-run xwl@.service \
+		xwl-*.tar.gz xwl*.deb xwl_*.build xwl_*.buildinfo xwl_*.changes
