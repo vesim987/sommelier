@@ -740,9 +740,11 @@ xwl_host_surface_attach(struct wl_client *client,
 
     wl_surface_attach(host->proxy, buffer_proxy, x / scale, y / scale);
     if (host->viewport) {
-        wp_viewport_set_destination(host->viewport,
-                                    host->contents_width / scale,
-                                    host->contents_height / scale);
+        if (host_buffer) {
+            wp_viewport_set_destination(host->viewport,
+                                        ceil(host->contents_width / scale),
+                                        ceil(host->contents_height / scale));
+        }
     } else {
         wl_surface_set_buffer_scale(host->proxy, scale);
     }
