@@ -20,6 +20,8 @@
 #include <xcb/xcb.h>
 #include <xdg-shell-unstable-v6-client-protocol.h>
 
+#include "version.h"
+
 struct xwl;
 
 struct xwl_host_callback {
