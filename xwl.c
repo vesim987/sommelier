@@ -371,10 +371,10 @@ xwl_process_pending_configure_acks(struct xwl_window *window,
         }
     }
 
-    assert(window->xdg_surface);
-
-    zxdg_surface_v6_ack_configure(window->xdg_surface,
-                                  window->pending_config.serial);
+    if (window->xdg_surface) {
+        zxdg_surface_v6_ack_configure(window->xdg_surface,
+                                      window->pending_config.serial);
+    }
     window->pending_config.serial = 0;
 
     if (window->next_config.serial)
