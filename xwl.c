@@ -1419,8 +1419,12 @@ xwl_pointer_enter(void *data,
                   wl_fixed_t y)
 {
     struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
-    struct xwl_host_surface *host_surface = wl_surface_get_user_data(surface);
+    struct xwl_host_surface *host_surface =
+        surface ? wl_surface_get_user_data(surface) : NULL;
     double scale = host->seat->xwl->scale;
+
+    if (!host_surface)
+        return;
 
     wl_pointer_send_enter(host->resource,
                           serial,
@@ -1592,9 +1596,13 @@ xwl_keyboard_enter(void *data,
                    struct wl_array *keys)
 {
     struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
-    struct xwl_host_surface *host_surface = wl_surface_get_user_data(surface);
+    struct xwl_host_surface *host_surface =
+        surface ? wl_surface_get_user_data(surface) : NULL;
     struct xwl *xwl = host->seat->xwl;
     struct xwl_window *window;
+
+    if (!host_surface)
+        return;
 
     wl_keyboard_send_enter(host->resource,
                            serial,
@@ -1735,8 +1743,12 @@ xwl_host_touch_down(void *data,
                     wl_fixed_t y)
 {
     struct xwl_host_touch *host = wl_touch_get_user_data(touch);
-    struct xwl_host_surface *host_surface = wl_surface_get_user_data(surface);
+    struct xwl_host_surface *host_surface =
+        surface ? wl_surface_get_user_data(surface) : NULL;
     double scale = host->seat->xwl->scale;
+
+    if (!host_surface)
+        return;
 
     wl_touch_send_down(host->resource,
                        serial,
