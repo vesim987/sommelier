@@ -660,7 +660,7 @@ xwl_window_update(struct xwl_window *window)
         zaura_surface_set_frame(window->aura_surface, frame_type);
     }
 
-    if (window->override_redirect) {
+    if (window->override_redirect && parent) {
         struct zxdg_positioner_v6 *positioner;
 
         positioner = zxdg_shell_v6_create_positioner(xwl->xdg_shell->internal);
