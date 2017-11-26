@@ -16,6 +16,7 @@
 #define WL_HIDE_DEPRECATED
 #include <wayland-client.h>
 #include <wayland-server.h>
+#include <wayland-util.h>
 #include <xcb/composite.h>
 #include <xcb/xcb.h>
 #include <xdg-shell-unstable-v6-client-protocol.h>
@@ -116,12 +117,18 @@ struct xwl_host_pointer {
     struct xwl_seat *seat;
     struct wl_resource *resource;
     struct wl_pointer *proxy;
+    struct wl_resource *focus_resource;
+    struct wl_listener focus_resource_listener;
+    uint32_t focus_serial;
 };
 
 struct xwl_host_keyboard {
     struct xwl_seat *seat;
     struct wl_resource *resource;
     struct wl_keyboard *proxy;
+    struct wl_resource *focus_resource;
+    struct wl_listener focus_resource_listener;
+    uint32_t focus_serial;
 };
 
 struct xwl_host_touch {
@@ -1411,6 +1418,41 @@ static const struct wl_pointer_interface xwl_pointer_implementation = {
 };
 
 static void
+xwl_pointer_set_focus(struct xwl_host_pointer *host,
+                      uint32_t serial,
+                      struct xwl_host_surface *host_surface,
+                      wl_fixed_t x,
+                      wl_fixed_t y)
+{
+    struct wl_resource *surface_resource =
+        host_surface ? host_surface->resource : NULL;
+
+    if (surface_resource == host->focus_resource)
+        return;
+
+    if (host->focus_resource)
+        wl_pointer_send_leave(host->resource, serial, host->focus_resource);
+
+    wl_list_remove(&host->focus_resource_listener.link);
+    wl_list_init(&host->focus_resource_listener.link);
+    host->focus_resource = surface_resource;
+    host->focus_serial = serial;
+
+    if (surface_resource) {
+        double scale = host->seat->xwl->scale;
+
+        wl_resource_add_destroy_listener(surface_resource,
+                                         &host->focus_resource_listener);
+
+        wl_pointer_send_enter(host->resource,
+                              serial,
+                              surface_resource,
+                              x * scale,
+                              y * scale);
+    }
+}
+
+static void
 xwl_pointer_enter(void *data,
                   struct wl_pointer *pointer,
                   uint32_t serial,
@@ -1421,16 +1463,11 @@ xwl_pointer_enter(void *data,
     struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
     struct xwl_host_surface *host_surface =
         surface ? wl_surface_get_user_data(surface) : NULL;
-    double scale = host->seat->xwl->scale;
 
     if (!host_surface)
         return;
 
-    wl_pointer_send_enter(host->resource,
-                          serial,
-                          host_surface->resource,
-                          x * scale,
-                          y * scale);
+    xwl_pointer_set_focus(host, serial, host_surface, x, y);
 }
 
 static void
@@ -1440,13 +1477,8 @@ xwl_pointer_leave(void *data,
                   struct wl_surface *surface)
 {
     struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
-    struct xwl_host_surface *host_surface =
-        surface ? wl_surface_get_user_data(surface) : NULL;
 
-    if (!host_surface)
-        return;
-
-    wl_pointer_send_leave(host->resource, serial, host_surface->resource);
+    xwl_pointer_set_focus(host, serial, NULL, 0, 0);
 }
 
 static void
@@ -1589,6 +1621,75 @@ xwl_keyboard_keymap(void *data,
 }
 
 static void
+xwl_keyboard_set_focus(struct xwl_host_keyboard *host,
+                       uint32_t serial,
+                       struct xwl_host_surface *host_surface,
+                       struct wl_array *keys)
+{
+    struct wl_resource *surface_resource =
+        host_surface ? host_surface->resource : NULL;
+    struct xwl *xwl = host->seat->xwl;
+    struct xwl_window *window;
+
+    if (surface_resource == host->focus_resource)
+        return;
+
+    if (host->focus_resource) {
+        wl_keyboard_send_leave(host->resource, serial, host->focus_resource);
+
+        if (xwl->host_focus_window) {
+            uint32_t host_resource_id =
+                wl_resource_get_id(host->focus_resource);
+            if (xwl->host_focus_window->host_surface_id == host_resource_id) {
+                xwl->host_focus_window = NULL;
+                xcb_set_input_focus(xwl->connection,
+                                    XCB_INPUT_FOCUS_NONE,
+                                    XCB_NONE,
+                                    XCB_CURRENT_TIME);
+            }
+        }
+    }
+
+    wl_list_remove(&host->focus_resource_listener.link);
+    wl_list_init(&host->focus_resource_listener.link);
+    host->focus_resource = surface_resource;
+    host->focus_serial = serial;
+
+    if (surface_resource) {
+        wl_resource_add_destroy_listener(surface_resource,
+                                         &host->focus_resource_listener);
+
+        wl_keyboard_send_enter(host->resource,
+                               serial,
+                               surface_resource,
+                               keys);
+
+        wl_list_for_each(window, &xwl->windows, link) {
+            uint32_t host_resource_id = wl_resource_get_id(surface_resource);
+            if (window->host_surface_id == host_resource_id) {
+                uint32_t values[1];
+
+                xwl->host_focus_window = window;
+
+                if (window->override_redirect)
+                    break;
+
+                xcb_set_input_focus(xwl->connection,
+                                    XCB_INPUT_FOCUS_NONE,
+                                    window->id,
+                                    XCB_CURRENT_TIME);
+                values[0] = XCB_STACK_MODE_ABOVE;
+                xcb_configure_window(xwl->connection,
+                                     window->id,
+                                     XCB_CONFIG_WINDOW_STACK_MODE,
+                                     values);
+                break;
+            }
+        }
+    }
+}
+
+static void
 xwl_keyboard_enter(void *data,
                    struct wl_keyboard *keyboard,
                    uint32_t serial,
@@ -1598,39 +1699,11 @@ xwl_keyboard_enter(void *data,
     struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
     struct xwl_host_surface *host_surface =
         surface ? wl_surface_get_user_data(surface) : NULL;
-    struct xwl *xwl = host->seat->xwl;
-    struct xwl_window *window;
 
     if (!host_surface)
         return;
 
-    wl_keyboard_send_enter(host->resource,
-                           serial,
-                           host_surface->resource,
-                           keys);
-
-    wl_list_for_each(window, &xwl->windows, link) {
-        uint32_t host_resource_id = wl_resource_get_id(host_surface->resource);
-        if (window->host_surface_id == host_resource_id) {
-            uint32_t values[1];
-
-            xwl->host_focus_window = window;
-
-            if (window->override_redirect)
-               return;
-
-            xcb_set_input_focus(xwl->connection,
-                                XCB_INPUT_FOCUS_NONE,
-                                window->id,
-                                XCB_CURRENT_TIME);
-            values[0] = XCB_STACK_MODE_ABOVE;
-            xcb_configure_window(xwl->connection,
-                                 window->id,
-                                 XCB_CONFIG_WINDOW_STACK_MODE,
-                                 values);
-            return;
-        }
-    }
+    xwl_keyboard_set_focus(host, serial, host_surface, keys);
 }
 
 static void
@@ -1640,25 +1713,8 @@ xwl_keyboard_leave(void *data,
                    struct wl_surface *surface)
 {
     struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
-    struct xwl_host_surface *host_surface =
-        surface ? wl_surface_get_user_data(surface) : NULL;
-    struct xwl *xwl = host->seat->xwl;
 
-    if (!host_surface)
-      return;
-
-    wl_keyboard_send_leave(host->resource, serial, host_surface->resource);
-
-    if (xwl->host_focus_window) {
-        uint32_t host_resource_id = wl_resource_get_id(host_surface->resource);
-        if (xwl->host_focus_window->host_surface_id == host_resource_id) {
-            xwl->host_focus_window = NULL;
-            xcb_set_input_focus(xwl->connection,
-                                XCB_INPUT_FOCUS_NONE,
-                                XCB_NONE,
-                                XCB_CURRENT_TIME);
-        }
-    }
+    xwl_keyboard_set_focus(host, serial, NULL, NULL);
 }
 
 static void
@@ -1817,8 +1873,18 @@ xwl_destroy_host_pointer(struct wl_resource *resource)
     struct xwl_host_pointer *host = wl_resource_get_user_data(resource);
 
     wl_pointer_destroy(host->proxy);
+    wl_list_remove(&host->focus_resource_listener.link);
     wl_resource_set_user_data(resource, NULL);
     free(host);
+}
+
+static void
+xwl_pointer_focus_resource_destroyed(struct wl_listener *listener, void *data)
+{
+    struct xwl_host_pointer *host;
+
+    host = wl_container_of(listener, host, focus_resource_listener);
+    xwl_pointer_set_focus(host, host->focus_serial, NULL, 0, 0);
 }
 
 static void
@@ -1847,6 +1913,11 @@ xwl_host_seat_get_host_pointer(struct wl_client *client,
     wl_pointer_add_listener(host_pointer->proxy,
                             &xwl_pointer_listener,
                             host_pointer);
+    wl_list_init(&host_pointer->focus_resource_listener.link);
+    host_pointer->focus_resource_listener.notify =
+        xwl_pointer_focus_resource_destroyed;
+    host_pointer->focus_resource = NULL;
+    host_pointer->focus_serial = 0;
 }
 
 static void
@@ -1855,8 +1926,18 @@ xwl_destroy_host_keyboard(struct wl_resource *resource)
     struct xwl_host_keyboard *host = wl_resource_get_user_data(resource);
 
     wl_keyboard_destroy(host->proxy);
+    wl_list_remove(&host->focus_resource_listener.link);
     wl_resource_set_user_data(resource, NULL);
     free(host);
+}
+
+static void
+xwl_keyboard_focus_resource_destroyed(struct wl_listener *listener, void *data)
+{
+    struct xwl_host_keyboard *host;
+
+    host = wl_container_of(listener, host, focus_resource_listener);
+    xwl_keyboard_set_focus(host, host->focus_serial, NULL, NULL);
 }
 
 static void
@@ -1885,6 +1966,11 @@ xwl_host_seat_get_host_keyboard(struct wl_client *client,
     wl_keyboard_add_listener(host_keyboard->proxy,
                              &xwl_keyboard_listener,
                              host_keyboard);
+    wl_list_init(&host_keyboard->focus_resource_listener.link);
+    host_keyboard->focus_resource_listener.notify =
+        xwl_keyboard_focus_resource_destroyed;
+    host_keyboard->focus_resource = NULL;
+    host_keyboard->focus_serial = 0;
 }
 
 static void
