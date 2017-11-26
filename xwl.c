@@ -181,6 +181,7 @@ struct xwl_window {
     int border_width;
     int mapped;
     int override_redirect;
+    int activated;
     struct xwl_config next_config;
     struct xwl_config pending_config;
     struct zxdg_surface_v6 *xdg_surface;
@@ -194,6 +195,7 @@ enum {
     ATOM_WM_S0,
     ATOM_WM_PROTOCOLS,
     ATOM_WM_DELETE_WINDOW,
+    ATOM_WM_TAKE_FOCUS,
     ATOM_WL_SURFACE_ID,
     ATOM_UTF8_STRING,
     ATOM_MOTIF_WM_HINTS,
@@ -231,6 +233,7 @@ struct xwl {
     struct wl_list windows, unpaired_windows;
     struct xwl_window *host_focus_window;
     xcb_window_t focus_window;
+    int needs_set_input_focus;
     double scale;
     const char* app_id;
     int exit_with_child;
@@ -301,20 +304,20 @@ static const struct zxdg_shell_v6_listener xwl_xdg_shell_listener = {
 static void
 xwl_send_configure_notify(struct xwl_window *window)
 {
-    xcb_configure_notify_event_t event;
-
-    event.response_type = XCB_CONFIGURE_NOTIFY;
-    event.event = window->id;
-    event.window = window->id;
-    event.above_sibling = XCB_WINDOW_NONE;
-    event.x = window->x;
-    event.y = window->y;
-    event.width = window->width;
-    event.height = window->height;
-    event.border_width = window->border_width;
-    event.override_redirect = 0;
-    event.pad0 = 0;
-    event.pad1 = 0;
+    xcb_configure_notify_event_t event = {
+        .response_type = XCB_CONFIGURE_NOTIFY,
+        .event = window->id,
+        .window = window->id,
+        .above_sibling = XCB_WINDOW_NONE,
+        .x = window->x,
+        .y = window->y,
+        .width = window->width,
+        .height = window->height,
+        .border_width = window->border_width,
+        .override_redirect = 0,
+        .pad0 = 0,
+        .pad1 = 0,
+    };
 
     xcb_send_event(window->xwl->connection,
                    0,
@@ -360,6 +363,49 @@ xwl_configure_window(struct xwl_window *window)
     window->next_config.serial = 0;
     window->next_config.mask = 0;
     window->next_config.states_length = 0;
+}
+
+static void
+xwl_set_input_focus(struct xwl *xwl, struct xwl_window *window)
+{
+    if (window) {
+        xcb_client_message_event_t event = {
+            .response_type = XCB_CLIENT_MESSAGE,
+            .format = 32,
+            .window = window->id,
+            .type = xwl->atoms[ATOM_WM_PROTOCOLS].value,
+            .data.data32 = {
+                xwl->atoms[ATOM_WM_TAKE_FOCUS].value,
+                XCB_CURRENT_TIME,
+          },
+        };
+        uint32_t values[1];
+
+        if (window->override_redirect)
+            return;
+
+        xcb_send_event(xwl->connection,
+                       0,
+                       window->id,
+                       XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT,
+                       (char *) &event);
+
+        xcb_set_input_focus(xwl->connection,
+                            XCB_INPUT_FOCUS_NONE,
+                            window->id,
+                            XCB_CURRENT_TIME);
+
+        values[0] = XCB_STACK_MODE_ABOVE;
+        xcb_configure_window(xwl->connection,
+                             window->id,
+                             XCB_CONFIG_WINDOW_STACK_MODE,
+                             values);
+    } else {
+        xcb_set_input_focus(xwl->connection,
+                            XCB_INPUT_FOCUS_NONE,
+                            XCB_NONE,
+                            XCB_CURRENT_TIME);
+    }
 }
 
 static int
@@ -428,6 +474,7 @@ xwl_xdg_toplevel_configure(void *data,
                            struct wl_array *states)
 {
     struct xwl_window *window = zxdg_toplevel_v6_get_user_data(xdg_toplevel);
+    int activated = 0;
     uint32_t *state;
     int i = 0;
 
@@ -460,7 +507,18 @@ xwl_xdg_toplevel_configure(void *data,
             window->next_config.states[i++] =
                 window->xwl->atoms[ATOM_NET_WM_STATE_MAXIMIZED_HORZ].value;
         }
+        if (*state == ZXDG_TOPLEVEL_V6_STATE_ACTIVATED)
+            activated = 1;
     }
+
+    if (activated != window->activated) {
+        if (activated != (window->xwl->host_focus_window == window)) {
+            window->xwl->host_focus_window = activated ? window : NULL;
+            window->xwl->needs_set_input_focus = 1;
+        }
+        window->activated = activated;
+    }
+
     window->next_config.states_length = i;
 }
 
@@ -1628,27 +1686,12 @@ xwl_keyboard_set_focus(struct xwl_host_keyboard *host,
 {
     struct wl_resource *surface_resource =
         host_surface ? host_surface->resource : NULL;
-    struct xwl *xwl = host->seat->xwl;
-    struct xwl_window *window;
 
     if (surface_resource == host->focus_resource)
         return;
 
-    if (host->focus_resource) {
+    if (host->focus_resource)
         wl_keyboard_send_leave(host->resource, serial, host->focus_resource);
-
-        if (xwl->host_focus_window) {
-            uint32_t host_resource_id =
-                wl_resource_get_id(host->focus_resource);
-            if (xwl->host_focus_window->host_surface_id == host_resource_id) {
-                xwl->host_focus_window = NULL;
-                xcb_set_input_focus(xwl->connection,
-                                    XCB_INPUT_FOCUS_NONE,
-                                    XCB_NONE,
-                                    XCB_CURRENT_TIME);
-            }
-        }
-    }
 
     wl_list_remove(&host->focus_resource_listener.link);
     wl_list_init(&host->focus_resource_listener.link);
@@ -1658,34 +1701,10 @@ xwl_keyboard_set_focus(struct xwl_host_keyboard *host,
     if (surface_resource) {
         wl_resource_add_destroy_listener(surface_resource,
                                          &host->focus_resource_listener);
-
         wl_keyboard_send_enter(host->resource,
                                serial,
                                surface_resource,
                                keys);
-
-        wl_list_for_each(window, &xwl->windows, link) {
-            uint32_t host_resource_id = wl_resource_get_id(surface_resource);
-            if (window->host_surface_id == host_resource_id) {
-                uint32_t values[1];
-
-                xwl->host_focus_window = window;
-
-                if (window->override_redirect)
-                    break;
-
-                xcb_set_input_focus(xwl->connection,
-                                    XCB_INPUT_FOCUS_NONE,
-                                    window->id,
-                                    XCB_CURRENT_TIME);
-                values[0] = XCB_STACK_MODE_ABOVE;
-                xcb_configure_window(xwl->connection,
-                                     window->id,
-                                     XCB_CONFIG_WINDOW_STACK_MODE,
-                                     values);
-                break;
-            }
-        }
     }
 }
 
@@ -2348,6 +2367,7 @@ xwl_handle_create_notify(struct xwl *xwl,
     window->border_width = event->border_width;
     window->mapped = 0;
     window->override_redirect = event->override_redirect;
+    window->activated = 0;
     window->xdg_surface = NULL;
     window->xdg_toplevel = NULL;
     window->xdg_popup = NULL;
@@ -2613,6 +2633,15 @@ static void
 xwl_handle_focus_in(struct xwl *xwl, xcb_focus_in_event_t *event)
 {
     xwl->focus_window = event->event;
+
+    if (event->mode == XCB_NOTIFY_MODE_GRAB ||
+        event->mode == XCB_NOTIFY_MODE_UNGRAB) {
+        return;
+    }
+
+    /* Reset the focus to the current focus window if it changed. */
+    if (!xwl->host_focus_window || event->event != xwl->host_focus_window->id)
+        xwl->needs_set_input_focus = 1;
 }
 
 static void
@@ -2962,6 +2991,7 @@ main(int argc, char **argv)
         .window = 0,
         .host_focus_window = NULL,
         .focus_window = 0,
+        .needs_set_input_focus = 0,
         .scale = 1.0,
         .app_id = NULL,
         .exit_with_child = 1,
@@ -2970,6 +3000,7 @@ main(int argc, char **argv)
             [ATOM_WM_S0] = {"WM_S0"},
             [ATOM_WM_PROTOCOLS] = {"WM_PROTOCOLS"},
             [ATOM_WM_DELETE_WINDOW] = {"WM_DELETE_WINDOW"},
+            [ATOM_WM_TAKE_FOCUS] = {"WM_TAKE_FOCUS"},
             [ATOM_WL_SURFACE_ID] = {"WL_SURFACE_ID"},
             [ATOM_UTF8_STRING] = {"UTF8_STRING"},
             [ATOM_MOTIF_WM_HINTS] = {"_MOTIF_WM_HINTS"},
@@ -3134,8 +3165,13 @@ main(int argc, char **argv)
 
     do {
         wl_display_flush_clients(xwl.host_display);
-        if (xwl.connection)
+        if (xwl.connection) {
+            if (xwl.needs_set_input_focus) {
+                xwl_set_input_focus(&xwl, xwl.host_focus_window);
+                xwl.needs_set_input_focus = 0;
+            }
             xcb_flush(xwl.connection);
+        }
         wl_display_flush(xwl.display);
     } while (wl_event_loop_dispatch(event_loop, -1) != -1);
 
