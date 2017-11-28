@@ -5,7 +5,7 @@ SYSCONFDIR = /etc
 BINDIR = $(PREFIX)/bin
 SRCFILES := xwl.c
 XMLFILES := aura-shell.xml viewporter.xml xdg-shell-unstable-v6.xml
-AUXFILES := Makefile README LICENSE AUTHORS xwl@.service.in version.h.in xwlrc
+AUXFILES := Makefile README LICENSE AUTHORS xwl@.service.in version.h.in xwlrc xwl.sh
 ALLFILES := $(SRCFILES) $(XMLFILES) $(AUXFILES)
 GIT_VERSION := $(shell git describe --abbrev=4 --dirty --always --tags)
 DIST_VERSION := $(shell git describe --abbrev=0 --tags)
@@ -24,6 +24,7 @@ xwl@.service: xwl@.service.in
 	$(SED) \
 		-e 's|@bindir[@]|$(BINDIR)|g' \
 		-e 's|@sysconfdir[@]|$(SYSCONFDIR)|g' \
+		-e 's|@version[@]|$(DIST_VERSION)|g' \
 		$< > $@
 
 xwl-run: $(OBJECTS)
@@ -48,15 +49,16 @@ $(OBJECTS): $(DEPS)
 install: all
 	install -D xwl-run \
 		$(DESTDIR)$(PREFIX)/bin/xwl-run
-	install -D xwlrc \
-		$(DESTDIR)$(SYSCONFDIR)/xwlrc
+	install -D xwlrc $(DESTDIR)$(SYSCONFDIR)/xwlrc
 	install -m 644 -D xwl@.service \
 		$(DESTDIR)$(SYSCONFDIR)/systemd/user/xwl@.service
+	install -m 644 -D xwl.sh $(DESTDIR)$(SYSCONFDIR)/profile.d/xwl.sh
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/xwl-run
 	rm -f $(DESTDIR)$(SYSCONFDIR)/xwlrc
 	rm -f $(DESTDIR)$(SYSCONFDIR)/systemd/user/xwl@.service
+	rm -f $(DESTDIR)$(SYSCONFDIR)/profile.d/xwl.sh
 
 update-version: version-clean
 	dch -v $(DIST_VERSION_MAJOR).$(DIST_VERSION_MINOR_NEXT)-1

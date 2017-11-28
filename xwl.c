@@ -2942,6 +2942,8 @@ xwl_handle_display_event(int fd,
     display_name[bytes_read] = '\0';
     setenv("DISPLAY", display_name, 1);
 
+    setenv("XWL_VERSION", VERSION, 1);
+
     // OpenJDK AWT assume that WMs use reparenting unless this is set.
     setenv("_JAVA_AWT_WM_NONREPARENTING", "1", 1);
 
