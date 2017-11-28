@@ -1,5 +1,7 @@
 CC=gcc
 SED=sed
+CLANG_FORMAT=clang-format-3.9
+CLANG_TIDY=clang-tidy-3.9
 PREFIX = /usr
 SYSCONFDIR = /etc
 BINDIR = $(PREFIX)/bin
@@ -44,7 +46,7 @@ version.h: version.h.in
 
 $(OBJECTS): $(DEPS)
 
-.PHONY: all install uninstall update-version dist deb version-clean clean
+.PHONY: all install uninstall update-version dist deb version-clean clean style check-style tidy
 
 install: all
 	install -D xwl-run \
@@ -83,3 +85,41 @@ version-clean:
 clean: version-clean
 	rm -f *~ *-protocol.c *-client-protocol.h *.o xwl-run xwl@.service \
 		xwl-*.tar.gz xwl*.deb xwl_*.build xwl_*.buildinfo xwl_*.changes
+
+style: $(DEPS)
+	@for src in $(SRCFILES) ; do \
+		echo "Formatting $$src..."; \
+		$(CLANG_FORMAT) -i "$$src"; \
+		$(CLANG_TIDY) -checks='-*,readability-identifier-naming' \
+			-config="{CheckOptions: [ \
+			{ key: readability-identifier-naming.StructCase, value: lower_case  }, \
+			{ key: readability-identifier-naming.FunctionCase, value: lower_case }, \
+			{ key: readability-identifier-naming.VariableCase, value: lower_case }, \
+			{ key: readability-identifier-naming.GlobalConstantCase, value: lower_case }, \
+			{ key: readability-identifier-naming.EnumConstantCase, value: UPPER_CASE } \
+			]}" "$$src"; \
+	done
+	@echo "Done"
+
+check-style:
+	@for src in $(SRCFILES) ; do \
+		var=`$(CLANG_FORMAT) "$$src" | diff "$$src" - | wc -l`; \
+		if [ $$var -ne 0 ] ; then \
+			echo "$$src does not respect the coding style (diff: $$var lines)"; \
+			exit 1; \
+		fi; \
+	done
+	@echo "Style check passed"
+
+tidy: $(DEPS)
+	@for src in $(SRCFILES); do \
+		echo "Running tidy on $$src..."; \
+		$(CLANG_TIDY) -checks="-*,modernize-use-auto,modernize-use-nullptr, \
+			readability-else-after-return,readability-simplify-boolean-expr, \
+			readability-redundant-member-init,modernize-use-default-member-init, \
+			modernize-use-equals-default,modernize-use-equals-delete, \
+			modernize-use-using,modernize-loop-convert, \
+			cppcoreguidelines-no-malloc,misc-redundant-expression" \
+			"$$src"; \
+	done
+	@echo "Done"
