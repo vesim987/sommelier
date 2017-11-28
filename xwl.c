@@ -2,8 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+// Needed to include both wayland-client.h and wayland-server.h.
+#ifndef WL_HIDE_DEPRECATED
+#define WL_HIDE_DEPRECATED
+#endif
+
 #include <assert.h>
-#include <aura-shell-client-protocol.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,16 +16,20 @@
 #include <sys/wait.h>
 #include <systemd/sd-daemon.h>
 #include <unistd.h>
-#include <viewporter-client-protocol.h>
-#define WL_HIDE_DEPRECATED
 #include <wayland-client.h>
 #include <wayland-server.h>
 #include <wayland-util.h>
 #include <xcb/composite.h>
 #include <xcb/xcb.h>
-#include <xdg-shell-unstable-v6-client-protocol.h>
 
+#include "aura-shell-client-protocol.h"
 #include "version.h"
+#include "viewporter-client-protocol.h"
+#include "xdg-shell-unstable-v6-client-protocol.h"
+
+#ifndef XWAYLAND_PATH
+#define XWAYLAND_PATH "/usr/bin"
+#endif
 
 struct xwl;
 
