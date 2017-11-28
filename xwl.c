@@ -1209,7 +1209,7 @@ static void xwl_host_pointer_set_cursor(struct wl_client *client,
   if (surface_resource) {
     host_surface = wl_resource_get_user_data(surface_resource);
     host_surface->is_cursor = 1;
-    if (host_surface->contents_width && host_surface->contents_width)
+    if (host_surface->contents_width && host_surface->contents_height)
       wl_surface_commit(host_surface->proxy);
   }
 
