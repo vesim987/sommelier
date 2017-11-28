@@ -2464,10 +2464,12 @@ int main(int argc, char **argv) {
         strcmp(arg, "-?") == 0) {
       xwl_usage();
       return 0;
-    } else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
+    }
+    if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
       printf("Version: %s\n", VERSION);
       return 0;
-    } else if (strstr(arg, "--scale=") == arg) {
+    }
+    if (strstr(arg, "--scale=") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
       xwl.scale = atof(s);
@@ -2486,10 +2488,9 @@ int main(int argc, char **argv) {
       if (strcmp(arg, "--") != 0) {
         fprintf(stderr, "Option `%s' is unknown.\n", arg);
         return 1;
-      } else {
-        xwl.runprog = &argv[i + 1];
-        break;
       }
+      xwl.runprog = &argv[i + 1];
+      break;
     } else {
       xwl.runprog = &argv[i];
       break;
