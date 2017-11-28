@@ -8,3 +8,4 @@ Restart=always
 
 [Install]
 WantedBy=default.target
+DefaultInstance=0
