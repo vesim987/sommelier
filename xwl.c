@@ -811,7 +811,7 @@ static void
 xwl_host_surface_set_opaque_region(struct wl_client *client,
                                    struct wl_resource *resource,
                                    struct wl_resource *region_resource) {
-  /* Not implemented */
+  // Not implemented
   wl_resource_post_no_memory(resource);
 }
 
@@ -819,7 +819,7 @@ static void
 xwl_host_surface_set_input_region(struct wl_client *client,
                                   struct wl_resource *resource,
                                   struct wl_resource *region_resource) {
-  /* Not implemented */
+  // Not implemented
   wl_resource_post_no_memory(resource);
 }
 
@@ -849,14 +849,14 @@ static void xwl_host_surface_commit(struct wl_client *client,
 static void xwl_host_surface_set_buffer_transform(struct wl_client *client,
                                                   struct wl_resource *resource,
                                                   int32_t transform) {
-  /* Not implemented */
+  // Not implemented.
   wl_resource_post_no_memory(resource);
 }
 
 static void xwl_host_surface_set_buffer_scale(struct wl_client *client,
                                               struct wl_resource *resource,
                                               int32_t scale) {
-  /* Not implemented */
+  // Not implemented.
   wl_resource_post_no_memory(resource);
 }
 
@@ -865,7 +865,7 @@ static void xwl_host_surface_damage_buffer(struct wl_client *client,
                                            struct wl_resource *resource,
                                            int32_t x, int32_t y, int32_t width,
                                            int32_t height) {
-  /* Not implemented */
+  // Not implemented.
   wl_resource_post_no_memory(resource);
 }
 #endif
@@ -943,7 +943,7 @@ static void xwl_compositor_create_host_surface(struct wl_client *client,
 static void xwl_compositor_create_host_region(struct wl_client *client,
                                               struct wl_resource *resource,
                                               uint32_t id) {
-  /* Not implemented */
+  // Not implemented.
   wl_resource_post_no_memory(resource);
 }
 
@@ -1103,7 +1103,7 @@ static void
 xwl_host_shell_get_host_shell_surface(struct wl_client *client,
                                       struct wl_resource *resource, uint32_t id,
                                       struct wl_resource *surface_resource) {
-  /* Not implemented */
+  // Not implemented.
   wl_resource_post_no_memory(resource);
 }
 
@@ -1839,7 +1839,7 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
     }
   }
 
-  /* Not reached */
+  // Not reached.
   assert(0);
 }
 
@@ -2137,7 +2137,7 @@ static void xwl_handle_focus_in(struct xwl *xwl, xcb_focus_in_event_t *event) {
     return;
   }
 
-  /* Reset the focus to the current focus window if it changed. */
+  // Reset the focus to the current focus window if it changed.
   if (!xwl->host_focus_window || event->event != xwl->host_focus_window->id)
     xwl->needs_set_input_focus = 1;
 }
@@ -2261,7 +2261,7 @@ static void xwl_connect(struct xwl *xwl) {
   screen_iterator = xcb_setup_roots_iterator(setup);
   xwl->screen = screen_iterator.data;
 
-  /* Select for substructure redirect. */
+  // Select for substructure redirect.
   values[0] =
       XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY | XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
   change_attributes_cookie = xcb_change_window_attributes(
@@ -2278,11 +2278,11 @@ static void xwl_connect(struct xwl *xwl) {
   redirect_subwindows_cookie = xcb_composite_redirect_subwindows_checked(
       xwl->connection, xwl->screen->root, XCB_COMPOSITE_REDIRECT_MANUAL);
 
-  /* Another window manager should not be running */
+  // Another window manager should not be running.
   error = xcb_request_check(xwl->connection, change_attributes_cookie);
   assert(!error);
 
-  /* Redirecting subwindows of root for compositing should have succeeded */
+  // Redirecting subwindows of root for compositing should have succeeded.
   error = xcb_request_check(xwl->connection, redirect_subwindows_cookie);
   assert(!error);
 
@@ -2529,20 +2529,20 @@ int main(int argc, char **argv) {
   xwl.sigchld_event_source =
       wl_event_loop_add_signal(event_loop, SIGCHLD, xwl_handle_sigchld, &xwl);
 
-  /* Wayland connection from Xwayland */
+  // Wayland connection from Xwayland.
   rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
   assert(!rv);
 
   xwl.client = wl_client_create(xwl.host_display, sv[0]);
 
-  /* Xwayland display ready socket */
+  // Xwayland display ready socket.
   rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ds);
   assert(!rv);
 
   xwl.display_event_source = wl_event_loop_add_fd(
       event_loop, ds[0], WL_EVENT_READABLE, xwl_handle_display_event, &xwl);
 
-  /* X connection to Xwayland */
+  // X connection to Xwayland.
   rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wm);
   assert(!rv);
 
@@ -2556,8 +2556,8 @@ int main(int argc, char **argv) {
     int i = 0;
     int fd;
 
-    /* SOCK_CLOEXEC closes both ends, so we need to unset
-     * the flag on the client fd. */
+    // SOCK_CLOEXEC closes both ends, so we need to unset the flag on the
+    // client fd.
     fd = dup(sv[1]);
     snprintf(fd_str, sizeof(fd_str), "%d", fd);
     setenv("WAYLAND_SOCKET", fd_str, 1);
