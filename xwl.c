@@ -102,6 +102,11 @@ struct xwl_host_output {
   struct xwl_output *output;
   struct wl_resource *resource;
   struct wl_output *proxy;
+  uint32_t flags;
+  int width;
+  int height;
+  int refresh;
+  int scale;
 };
 
 struct xwl_output {
@@ -1154,18 +1159,29 @@ static void xwl_output_mode(void *data, struct wl_output *output,
                             int refresh) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
 
-  wl_output_send_mode(host->resource, flags, width, height, refresh);
+  // Wait until scale is known before sending mode.
+  host->flags = flags;
+  host->width = width;
+  host->height = height;
+  host->refresh = refresh;
 }
 
 static void xwl_output_done(void *data, struct wl_output *output) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
+  double scale = host->output->xwl->scale;
 
+  // Send mode now that scale is known.
+  wl_output_send_mode(host->resource, host->flags,
+                      (scale * host->width) / host->scale,
+                      (scale * host->height) / host->scale, host->refresh);
   wl_output_send_done(host->resource);
 }
 
 static void xwl_output_scale(void *data, struct wl_output *output,
                              int32_t scale) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
+
+  host->scale = scale;
 
   // Always 1 as device scale factor is emulated.
   wl_output_send_scale(host->resource, 1);
@@ -1199,6 +1215,11 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
                                  wl_resource_get_version(host->resource));
   wl_output_set_user_data(host->proxy, host);
   wl_output_add_listener(host->proxy, &xwl_output_listener, host);
+  host->flags = 0;
+  host->width = 1024;
+  host->height = 768;
+  host->refresh = 60000;
+  host->scale = 1;
 }
 
 static void xwl_host_pointer_set_cursor(struct wl_client *client,
