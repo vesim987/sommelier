@@ -180,6 +180,7 @@ struct xwl_config {
 struct xwl_window {
   struct xwl *xwl;
   xcb_window_t id;
+  xcb_window_t frame_id;
   uint32_t host_surface_id;
   int unpaired;
   int x;
@@ -187,7 +188,6 @@ struct xwl_window {
   int width;
   int height;
   int border_width;
-  int mapped;
   int override_redirect;
   int activated;
   struct xwl_config next_config;
@@ -251,6 +251,8 @@ struct xwl {
     xcb_intern_atom_cookie_t cookie;
     xcb_atom_t value;
   } atoms[ATOM_LAST + 1];
+  xcb_visualid_t visual_ids[256];
+  xcb_colormap_t colormaps[256];
 };
 
 enum {
@@ -294,6 +296,8 @@ struct xwl_mwm_hints {
 #define NET_WM_STATE_ADD 1
 #define NET_WM_STATE_TOGGLE 2
 
+#define SEND_EVENT_MASK 0x80
+
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 
@@ -331,12 +335,19 @@ static void xwl_configure_window(struct xwl_window *window) {
   if (window->next_config.mask) {
     int i = 0;
 
-    xcb_configure_window(window->xwl->connection, window->id,
+    xcb_configure_window(window->xwl->connection, window->frame_id,
                          window->next_config.mask, window->next_config.values);
+
     if (window->next_config.mask & XCB_CONFIG_WINDOW_X)
       window->x = window->next_config.values[i++];
     if (window->next_config.mask & XCB_CONFIG_WINDOW_Y)
       window->y = window->next_config.values[i++];
+
+    xcb_configure_window(window->xwl->connection, window->id,
+                         window->next_config.mask &
+                             ~(XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y),
+                         &window->next_config.values[i]);
+
     if (window->next_config.mask & XCB_CONFIG_WINDOW_WIDTH)
       window->width = window->next_config.values[i++];
     if (window->next_config.mask & XCB_CONFIG_WINDOW_HEIGHT)
@@ -380,7 +391,7 @@ static void xwl_set_input_focus(struct xwl *xwl, struct xwl_window *window) {
                         XCB_CURRENT_TIME);
 
     values[0] = XCB_STACK_MODE_ABOVE;
-    xcb_configure_window(xwl->connection, window->id,
+    xcb_configure_window(xwl->connection, window->frame_id,
                          XCB_CONFIG_WINDOW_STACK_MODE, values);
   } else {
     xcb_set_input_focus(xwl->connection, XCB_INPUT_FOCUS_NONE, XCB_NONE,
@@ -546,7 +557,7 @@ static void xwl_window_update(struct xwl_window *window) {
     window->unpaired = 1;
   }
 
-  if (!window->mapped) {
+  if (!host_resource) {
     if (window->xdg_popup) {
       zxdg_popup_v6_destroy(window->xdg_popup);
       window->xdg_popup = NULL;
@@ -559,17 +570,10 @@ static void xwl_window_update(struct xwl_window *window) {
       zxdg_surface_v6_destroy(window->xdg_surface);
       window->xdg_surface = NULL;
     }
-    if (window->aura_surface) {
-      zaura_surface_destroy(window->aura_surface);
-      window->aura_surface = NULL;
-    }
     return;
   }
 
   if (window->xdg_surface)
-    return;
-
-  if (!host_resource)
     return;
 
   host_surface = wl_resource_get_user_data(host_resource);
@@ -1866,35 +1870,22 @@ static int xwl_handle_event(int fd, uint32_t mask, void *data) {
   return count;
 }
 
-static struct xwl_window *xwl_lookup_window(struct xwl *xwl, xcb_window_t id) {
-  struct xwl_window *window;
-
-  wl_list_for_each(window, &xwl->windows, link) {
-    if (window->id == id)
-      return window;
-  }
-  wl_list_for_each(window, &xwl->unpaired_windows, link) {
-    if (window->id == id)
-      return window;
-  }
-  return NULL;
-}
-
-static void xwl_handle_create_notify(struct xwl *xwl,
-                                     xcb_create_notify_event_t *event) {
+static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
+                              int width, int height, int border_width,
+                              int override_redirect) {
   struct xwl_window *window = malloc(sizeof(struct xwl_window));
   assert(window);
   window->xwl = xwl;
-  window->id = event->window;
+  window->id = id;
+  window->frame_id = XCB_WINDOW_NONE;
   window->host_surface_id = 0;
   window->unpaired = 1;
-  window->x = event->x;
-  window->y = event->y;
-  window->width = event->width;
-  window->height = event->height;
-  window->border_width = event->border_width;
-  window->mapped = 0;
-  window->override_redirect = event->override_redirect;
+  window->x = x;
+  window->y = y;
+  window->width = width;
+  window->height = height;
+  window->border_width = border_width;
+  window->override_redirect = override_redirect;
   window->activated = 0;
   window->xdg_surface = NULL;
   window->xdg_toplevel = NULL;
@@ -1907,7 +1898,7 @@ static void xwl_handle_create_notify(struct xwl *xwl,
   window->pending_config.mask = 0;
   window->pending_config.states_length = 0;
   wl_list_insert(&xwl->unpaired_windows, &window->link);
-  if (!event->override_redirect) {
+  if (!override_redirect) {
     uint32_t values[1];
 
     values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_FOCUS_CHANGE;
@@ -1916,47 +1907,204 @@ static void xwl_handle_create_notify(struct xwl *xwl,
   }
 }
 
+static void xwl_destroy_window(struct xwl_window *window) {
+  if (window->frame_id)
+    xcb_destroy_window(window->xwl->connection, window->frame_id);
+
+  if (window->xwl->host_focus_window == window) {
+    window->xwl->host_focus_window = NULL;
+    window->xwl->needs_set_input_focus = 1;
+  }
+  if (window->xwl->focus_window == window->id)
+    window->xwl->focus_window = 0;
+
+  if (window->xdg_popup)
+    zxdg_popup_v6_destroy(window->xdg_popup);
+  if (window->xdg_toplevel)
+    zxdg_toplevel_v6_destroy(window->xdg_toplevel);
+  if (window->xdg_surface)
+    zxdg_surface_v6_destroy(window->xdg_surface);
+  if (window->aura_surface)
+    zaura_surface_destroy(window->aura_surface);
+
+  wl_list_remove(&window->link);
+  free(window);
+}
+
+static int xwl_is_window(struct xwl_window *window, xcb_window_t id) {
+  if (window->id == id)
+    return 1;
+
+  if (window->frame_id != XCB_WINDOW_NONE) {
+    if (window->frame_id == id)
+      return 1;
+  }
+
+  return 0;
+}
+
+static struct xwl_window *xwl_lookup_window(struct xwl *xwl, xcb_window_t id) {
+  struct xwl_window *window;
+
+  wl_list_for_each(window, &xwl->windows, link) {
+    if (xwl_is_window(window, id))
+      return window;
+  }
+  wl_list_for_each(window, &xwl->unpaired_windows, link) {
+    if (xwl_is_window(window, id))
+      return window;
+  }
+  return NULL;
+}
+
+static int xwl_is_our_window(struct xwl *xwl, xcb_window_t id) {
+  const xcb_setup_t *setup = xcb_get_setup(xwl->connection);
+
+  return (id & ~setup->resource_id_mask) == setup->resource_id_base;
+}
+
+static void xwl_handle_create_notify(struct xwl *xwl,
+                                     xcb_create_notify_event_t *event) {
+  if (xwl_is_our_window(xwl, event->window))
+    return;
+
+  xwl_create_window(xwl, event->window, event->x, event->y, event->width,
+                    event->height, event->border_width,
+                    event->override_redirect);
+}
+
 static void xwl_handle_destroy_notify(struct xwl *xwl,
                                       xcb_destroy_notify_event_t *event) {
-  struct xwl_window *window = xwl_lookup_window(xwl, event->window);
-  if (window) {
-    if (xwl->host_focus_window == window)
-      xwl->host_focus_window = NULL;
-    if (xwl->focus_window == event->window)
-      xwl->focus_window = 0;
-    if (window->xdg_surface)
-      zxdg_surface_v6_destroy(window->xdg_surface);
-    if (window->xdg_toplevel)
-      zxdg_toplevel_v6_destroy(window->xdg_toplevel);
-    if (window->aura_surface)
-      zaura_surface_destroy(window->aura_surface);
-    wl_list_remove(&window->link);
-    free(window);
+  struct xwl_window *window;
+
+  if (xwl_is_our_window(xwl, event->window))
+    return;
+
+  window = xwl_lookup_window(xwl, event->window);
+  if (!window)
+    return;
+
+  xwl_destroy_window(window);
+}
+
+static void xwl_handle_reparent_notify(struct xwl *xwl,
+                                       xcb_reparent_notify_event_t *event) {
+  struct xwl_window *window;
+
+  if (event->parent == xwl->screen->root) {
+    int width = 1;
+    int height = 1;
+    int border_width = 0;
+    xcb_get_geometry_reply_t *geometry_reply = xcb_get_geometry_reply(
+        xwl->connection, xcb_get_geometry(xwl->connection, event->window),
+        NULL);
+
+    if (geometry_reply) {
+      width = geometry_reply->width;
+      height = geometry_reply->height;
+      border_width = geometry_reply->border_width;
+      free(geometry_reply);
+    }
+    xwl_create_window(xwl, event->window, event->x, event->y, width, height,
+                      border_width, event->override_redirect);
+    return;
   }
+
+  if (xwl_is_our_window(xwl, event->parent))
+    return;
+
+  window = xwl_lookup_window(xwl, event->window);
+  if (!window)
+    return;
+
+  xwl_destroy_window(window);
 }
 
 static void xwl_handle_map_request(struct xwl *xwl,
                                    xcb_map_request_event_t *event) {
-  xcb_map_window(xwl->connection, event->window);
+  struct xwl_window *window = xwl_lookup_window(xwl, event->window);
+  if (!window)
+    return;
+
+  assert(!xwl_is_our_window(xwl, event->window));
+
+  // Keep all managed windows centered horizontally/vertically.
+  window->x = xwl->screen->width_in_pixels / 2 - window->width / 2;
+  window->y = xwl->screen->height_in_pixels / 2 - window->height / 2;
+
+  if (window->frame_id == XCB_WINDOW_NONE) {
+    xcb_get_geometry_reply_t *geometry_reply;
+    uint32_t values[3];
+    int depth = xwl->screen->root_depth;
+
+    geometry_reply = xcb_get_geometry_reply(
+        xwl->connection, xcb_get_geometry(xwl->connection, window->id), NULL);
+    if (geometry_reply) {
+      depth = geometry_reply->depth;
+      free(geometry_reply);
+    }
+
+    values[0] = 0;
+    xcb_configure_window(xwl->connection, window->id,
+                         XCB_CONFIG_WINDOW_BORDER_WIDTH, values);
+    window->border_width = 0;
+
+    values[0] = xwl->screen->black_pixel;
+    values[1] = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
+                XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
+    values[2] = xwl->colormaps[depth];
+
+    window->frame_id = xcb_generate_id(xwl->connection);
+    xcb_create_window(
+        xwl->connection, depth, window->frame_id, xwl->screen->root, window->x,
+        window->y, window->width, window->height, 0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT, xwl->visual_ids[depth],
+        XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, values);
+    xcb_reparent_window(xwl->connection, window->id, window->frame_id, 0, 0);
+  } else {
+    uint32_t values[2];
+
+    values[0] = window->x;
+    values[1] = window->y;
+    xcb_configure_window(xwl->connection, window->frame_id,
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
+  }
+
+  xwl_send_configure_notify(window);
+
+  xcb_map_window(xwl->connection, window->id);
+  xcb_map_window(xwl->connection, window->frame_id);
 }
 
 static void xwl_handle_map_notify(struct xwl *xwl,
-                                  xcb_map_notify_event_t *event) {
-  struct xwl_window *window = xwl_lookup_window(xwl, event->window);
-  if (window) {
-    assert(!window->mapped);
-    window->mapped = 1;
-    xwl_window_update(window);
-  }
-}
+                                  xcb_map_notify_event_t *event) {}
 
 static void xwl_handle_unmap_notify(struct xwl *xwl,
                                     xcb_unmap_notify_event_t *event) {
-  struct xwl_window *window = xwl_lookup_window(xwl, event->window);
-  if (window && window->mapped) {
-    window->mapped = 0;
+  struct xwl_window *window;
+
+  if (xwl_is_our_window(xwl, event->window))
+    return;
+
+  if (event->response_type & SEND_EVENT_MASK)
+    return;
+
+  window = xwl_lookup_window(xwl, event->window);
+  if (!window)
+    return;
+
+  if (xwl->host_focus_window == window) {
+    xwl->host_focus_window = NULL;
+    xwl->needs_set_input_focus = 1;
+  }
+
+  if (window->host_surface_id) {
+    window->host_surface_id = 0;
     xwl_window_update(window);
   }
+
+  if (window->frame_id)
+    xcb_unmap_window(xwl->connection, window->frame_id);
 }
 
 static void xwl_handle_configure_request(struct xwl *xwl,
@@ -1966,6 +2114,10 @@ static void xwl_handle_configure_request(struct xwl *xwl,
   int y = window->y;
   int width = window->width;
   int height = window->height;
+  int size_changed;
+  uint32_t values[16];
+
+  assert(!xwl_is_our_window(xwl, event->window));
 
   // Ack configure events as satisfying request removes the guarantee
   // that matching contents will arrive.
@@ -1986,37 +2138,42 @@ static void xwl_handle_configure_request(struct xwl *xwl,
     }
   }
 
-  if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH) {
-    // Keep all managed windows centered horizontally.
-    x = xwl->screen->width_in_pixels / 2 - event->width / 2;
+  if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH)
     width = event->width;
-  }
-  if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT) {
-    // Keep all managed windows centered vertically.
-    y = xwl->screen->height_in_pixels / 2 - event->height / 2;
+  if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
     height = event->height;
+
+  // Keep all managed windows centered horizontally/vertically.
+  x = xwl->screen->width_in_pixels / 2 - width / 2;
+  y = xwl->screen->height_in_pixels / 2 - height / 2;
+
+  size_changed = width != (window->width + window->border_width * 2) ||
+                 height != (window->height + window->border_width * 2);
+
+  values[0] = x;
+  values[1] = y;
+  values[2] = width;
+  values[3] = height;
+  values[4] = 0;
+
+  if (x != window->x || y != window->y || size_changed) {
+    xcb_configure_window(xwl->connection, window->frame_id,
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                             XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                         values);
   }
 
-  if (x != window->x || y != window->y || width != window->width ||
-      height != window->height || window->border_width) {
-    uint32_t values[16];
-    int i = 0;
+  window->x = x;
+  window->y = y;
+  window->width = width;
+  window->height = height;
+  window->border_width = 0;
 
-    values[i++] = x;
-    values[i++] = y;
-    values[i++] = width;
-    values[i++] = height;
-    values[i++] = 0;
-    xcb_configure_window(
-        xwl->connection, window->id,
-        XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH |
-            XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_BORDER_WIDTH,
-        values);
-    window->x = x;
-    window->y = y;
-    window->width = width;
-    window->height = height;
-    window->border_width = 0;
+  if (size_changed) {
+    xcb_configure_window(xwl->connection, window->id,
+                         XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
+                             XCB_CONFIG_WINDOW_BORDER_WIDTH,
+                         &values[2]);
   } else {
     xwl_send_configure_notify(window);
   }
@@ -2024,17 +2181,23 @@ static void xwl_handle_configure_request(struct xwl *xwl,
 
 static void xwl_handle_configure_notify(struct xwl *xwl,
                                         xcb_configure_notify_event_t *event) {
-  struct xwl_window *window = xwl_lookup_window(xwl, event->window);
+  struct xwl_window *window;
+
+  if (xwl_is_our_window(xwl, event->window))
+    return;
+
+  window = xwl_lookup_window(xwl, event->window);
   if (!window)
     return;
 
-  if (event->override_redirect) {
-    window->x = event->x;
-    window->y = event->y;
-    window->width = event->width;
-    window->height = event->height;
-    window->border_width = event->border_width;
-  }
+  if (!window->override_redirect)
+    return;
+
+  window->x = event->x;
+  window->y = event->y;
+  window->width = event->width;
+  window->height = event->height;
+  window->border_width = event->border_width;
 }
 
 static uint32_t xwl_resize_edge(int net_wm_moveresize_size) {
@@ -2066,7 +2229,7 @@ static void xwl_handle_client_message(struct xwl *xwl,
     struct xwl_window *window, *unpaired_window = NULL;
 
     wl_list_for_each(window, &xwl->unpaired_windows, link) {
-      if (window->id == event->window) {
+      if (xwl_is_window(window, event->window)) {
         unpaired_window = window;
         break;
       }
@@ -2188,12 +2351,15 @@ static int xwl_handle_x_connection_event(int fd, uint32_t mask, void *data) {
     return 0;
 
   while ((event = xcb_poll_for_event(xwl->connection))) {
-    switch (event->response_type & ~0x80) {
+    switch (event->response_type & ~SEND_EVENT_MASK) {
     case XCB_CREATE_NOTIFY:
       xwl_handle_create_notify(xwl, (xcb_create_notify_event_t *)event);
       break;
     case XCB_DESTROY_NOTIFY:
       xwl_handle_destroy_notify(xwl, (xcb_destroy_notify_event_t *)event);
+      break;
+    case XCB_REPARENT_NOTIFY:
+      xwl_handle_reparent_notify(xwl, (xcb_reparent_notify_event_t *)event);
       break;
     case XCB_MAP_REQUEST:
       xwl_handle_map_request(xwl, (xcb_map_request_event_t *)event);
@@ -2243,6 +2409,7 @@ static void xwl_connect(struct xwl *xwl) {
   xcb_void_cookie_t change_attributes_cookie, redirect_subwindows_cookie;
   xcb_generic_error_t *error;
   xcb_intern_atom_reply_t *atom_reply;
+  xcb_depth_iterator_t depth_iterator;
   const xcb_query_extension_reply_t *composite_extension;
   unsigned i;
 
@@ -2298,6 +2465,26 @@ static void xwl_connect(struct xwl *xwl) {
     xwl->atoms[i].value = atom_reply->atom;
     free(atom_reply);
   }
+
+  depth_iterator = xcb_screen_allowed_depths_iterator(xwl->screen);
+  while (depth_iterator.rem > 0) {
+    int depth = depth_iterator.data->depth;
+    if (depth == xwl->screen->root_depth) {
+      xwl->visual_ids[depth] = xwl->screen->root_visual;
+      xwl->colormaps[depth] = xwl->screen->default_colormap;
+    } else {
+      xcb_visualtype_iterator_t visualtype_iterator =
+          xcb_depth_visuals_iterator(depth_iterator.data);
+
+      xwl->visual_ids[depth] = visualtype_iterator.data->visual_id;
+      xwl->colormaps[depth] = xcb_generate_id(xwl->connection);
+      xcb_create_colormap(xwl->connection, XCB_COLORMAP_ALLOC_NONE,
+                          xwl->colormaps[depth], xwl->screen->root,
+                          xwl->visual_ids[depth]);
+    }
+    xcb_depth_next(&depth_iterator);
+  }
+  assert(xwl->visual_ids[xwl->screen->root_depth]);
 
   xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, xwl->window,
                       xwl->atoms[ATOM_NET_SUPPORTING_WM_CHECK].value,
@@ -2383,9 +2570,6 @@ static int xwl_handle_display_event(int fd, uint32_t mask, void *data) {
 
   setenv("XWL_VERSION", VERSION, 1);
 
-  // OpenJDK AWT assume that WMs use reparenting unless this is set.
-  setenv("_JAVA_AWT_WM_NONREPARENTING", "1", 1);
-
   xwl_connect(xwl);
 
   wl_event_source_remove(xwl->display_event_source);
@@ -2434,23 +2618,27 @@ int main(int argc, char **argv) {
       .app_id = NULL,
       .exit_with_child = 1,
       .net_wm_moveresize_seat = NULL,
-      .atoms = {
-              [ATOM_WM_S0] = {"WM_S0"}, [ATOM_WM_PROTOCOLS] = {"WM_PROTOCOLS"},
-              [ATOM_WM_DELETE_WINDOW] = {"WM_DELETE_WINDOW"},
-              [ATOM_WM_TAKE_FOCUS] = {"WM_TAKE_FOCUS"},
-              [ATOM_WL_SURFACE_ID] = {"WL_SURFACE_ID"},
-              [ATOM_UTF8_STRING] = {"UTF8_STRING"},
-              [ATOM_MOTIF_WM_HINTS] = {"_MOTIF_WM_HINTS"},
-              [ATOM_NET_SUPPORTING_WM_CHECK] = {"_NET_SUPPORTING_WM_CHECK"},
-              [ATOM_NET_WM_NAME] = {"_NET_WM_NAME"},
-              [ATOM_NET_WM_MOVERESIZE] = {"_NET_WM_MOVERESIZE"},
-              [ATOM_NET_WM_STATE] = {"_NET_WM_STATE"},
-              [ATOM_NET_WM_STATE_FULLSCREEN] = {"_NET_WM_STATE_FULLSCREEN"},
-              [ATOM_NET_WM_STATE_MAXIMIZED_VERT] =
-                  {"_NET_WM_STATE_MAXIMIZED_VERT"},
-              [ATOM_NET_WM_STATE_MAXIMIZED_HORZ] =
-                  {"_NET_WM_STATE_MAXIMIZED_HORZ"},
-      }};
+      .atoms =
+          {
+                  [ATOM_WM_S0] = {"WM_S0"},
+                  [ATOM_WM_PROTOCOLS] = {"WM_PROTOCOLS"},
+                  [ATOM_WM_DELETE_WINDOW] = {"WM_DELETE_WINDOW"},
+                  [ATOM_WM_TAKE_FOCUS] = {"WM_TAKE_FOCUS"},
+                  [ATOM_WL_SURFACE_ID] = {"WL_SURFACE_ID"},
+                  [ATOM_UTF8_STRING] = {"UTF8_STRING"},
+                  [ATOM_MOTIF_WM_HINTS] = {"_MOTIF_WM_HINTS"},
+                  [ATOM_NET_SUPPORTING_WM_CHECK] = {"_NET_SUPPORTING_WM_CHECK"},
+                  [ATOM_NET_WM_NAME] = {"_NET_WM_NAME"},
+                  [ATOM_NET_WM_MOVERESIZE] = {"_NET_WM_MOVERESIZE"},
+                  [ATOM_NET_WM_STATE] = {"_NET_WM_STATE"},
+                  [ATOM_NET_WM_STATE_FULLSCREEN] = {"_NET_WM_STATE_FULLSCREEN"},
+                  [ATOM_NET_WM_STATE_MAXIMIZED_VERT] =
+                      {"_NET_WM_STATE_MAXIMIZED_VERT"},
+                  [ATOM_NET_WM_STATE_MAXIMIZED_HORZ] =
+                      {"_NET_WM_STATE_MAXIMIZED_HORZ"},
+          },
+      .visual_ids = {0},
+      .colormaps = {0}};
   struct wl_event_loop *event_loop;
   int sv[2], ds[2], wm[2];
   pid_t pid;

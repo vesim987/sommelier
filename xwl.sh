@@ -8,4 +8,3 @@
 [ $(systemctl --user show-environment | grep ^XWL_VERSION=) ] || return 0
 
 export $(systemctl --user show-environment | grep ^DISPLAY=)
-export _JAVA_AWT_WM_NONREPARENTING=1
