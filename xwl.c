@@ -195,6 +195,10 @@ struct xwl_window {
   int border_width;
   int override_redirect;
   int activated;
+  xcb_window_t transient_for;
+  int decorated;
+  char *name;
+  char *clazz;
   struct xwl_config next_config;
   struct xwl_config pending_config;
   struct zxdg_surface_v6 *xdg_surface;
@@ -267,14 +271,6 @@ enum {
   PROPERTY_WM_CLASS,
   PROPERTY_WM_TRANSIENT_FOR,
   PROPERTY_MOTIF_WM_HINTS,
-};
-
-struct xwl_mwm_hints {
-  uint32_t flags;
-  uint32_t functions;
-  uint32_t decorations;
-  int32_t input_mode;
-  uint32_t status;
 };
 
 #define MWM_HINTS_FUNCTIONS (1L << 0)
@@ -574,8 +570,6 @@ static void xwl_window_update(struct xwl_window *window) {
   struct xwl_window *parent = NULL;
   uint32_t frame_type = ZAURA_SURFACE_FRAME_TYPE_NORMAL;
   const char *app_id = xwl->app_id;
-  char *name = NULL;
-  char *clazz = NULL;
 
   if (window->host_surface_id) {
     host_resource = wl_client_get_object(xwl->client, window->host_surface_id);
@@ -628,89 +622,23 @@ static void xwl_window_update(struct xwl_window *window) {
     }
     frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
   } else {
-    struct {
-      int type;
-      xcb_atom_t atom;
-    } properties[] = {
-        {PROPERTY_WM_NAME, XCB_ATOM_WM_NAME},
-        {PROPERTY_WM_CLASS, XCB_ATOM_WM_CLASS},
-        {PROPERTY_WM_TRANSIENT_FOR, XCB_ATOM_WM_TRANSIENT_FOR},
-        {PROPERTY_MOTIF_WM_HINTS, xwl->atoms[ATOM_MOTIF_WM_HINTS].value},
-    };
-    xcb_get_property_cookie_t cookies[ARRAY_SIZE(properties)];
-    struct xwl_mwm_hints mwm_hints;
-    int i;
+    if (!app_id)
+      app_id = window->clazz;
 
-    for (i = 0; i < ARRAY_SIZE(properties); ++i) {
-      cookies[i] = xcb_get_property(xwl->connection, 0, window->id,
-                                    properties[i].atom, XCB_ATOM_ANY, 0, 2048);
+    if (window->transient_for != XCB_WINDOW_NONE) {
+      struct xwl_window *sibling;
+
+      wl_list_for_each(sibling, &xwl->windows, link) {
+        if (sibling->id == window->transient_for) {
+          if (sibling->xdg_toplevel)
+            parent = sibling;
+          break;
+        }
+      }
     }
 
-    for (i = 0; i < ARRAY_SIZE(properties); ++i) {
-      xcb_get_property_reply_t *reply =
-          xcb_get_property_reply(xwl->connection, cookies[i], NULL);
-
-      if (!reply)
-        continue;
-
-      if (reply->type == XCB_ATOM_NONE) {
-        free(reply);
-        continue;
-      }
-
-      switch (properties[i].type) {
-      case PROPERTY_WM_NAME:
-        assert(!name);
-        name = strndup(xcb_get_property_value(reply),
-                       xcb_get_property_value_length(reply));
-        break;
-      case PROPERTY_WM_CLASS:
-        // WM_CLASS property contains two consecutive null-terminated strings.
-        // These specify the Instance and Class names. If a global app ID is
-        // not set then use Class name for app ID.
-        if (!app_id) {
-          const char *value = xcb_get_property_value(reply);
-          int value_length = xcb_get_property_value_length(reply);
-          int instance_length = strnlen(value, value_length);
-          if (value_length > instance_length) {
-            assert(!clazz);
-            clazz = strndup(value + instance_length + 1,
-                            value_length - instance_length - 1);
-            app_id = clazz;
-          }
-        }
-        break;
-      case PROPERTY_WM_TRANSIENT_FOR: {
-        uint32_t transient_for = *((uint32_t *)xcb_get_property_value(reply));
-        struct xwl_window *sibling;
-
-        wl_list_for_each(sibling, &xwl->windows, link) {
-          if (sibling->id == transient_for) {
-            if (sibling->xdg_toplevel)
-              parent = sibling;
-            break;
-          }
-        }
-      } break;
-      case PROPERTY_MOTIF_WM_HINTS:
-        memcpy(&mwm_hints, xcb_get_property_value(reply), sizeof(mwm_hints));
-        if (mwm_hints.flags & MWM_HINTS_DECORATIONS) {
-          int decorate;
-
-          if (mwm_hints.decorations & MWM_DECOR_ALL)
-            decorate = ~mwm_hints.decorations & MWM_DECOR_TITLE;
-          else
-            decorate = mwm_hints.decorations & MWM_DECOR_TITLE;
-
-          if (!decorate)
-            frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
-        }
-        break;
-      default:
-        break;
-      }
-      free(reply);
-    }
+    if (!window->decorated)
+      frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
   }
 
   window->xdg_surface = zxdg_shell_v6_get_xdg_surface(xwl->xdg_shell->internal,
@@ -755,16 +683,11 @@ static void xwl_window_update(struct xwl_window *window) {
 
     if (parent)
       zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
-    if (name)
-      zxdg_toplevel_v6_set_title(window->xdg_toplevel, name);
+    if (window->name)
+      zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
     if (app_id)
       zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
   }
-
-  if (name)
-    free(name);
-  if (clazz)
-    free(clazz);
 
   host_surface->is_cursor = 0;
   wl_surface_commit(host_surface->proxy);
@@ -1959,6 +1882,10 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
   window->border_width = border_width;
   window->override_redirect = override_redirect;
   window->activated = 0;
+  window->transient_for = XCB_WINDOW_NONE;
+  window->decorated = 0;
+  window->name = NULL;
+  window->clazz = NULL;
   window->xdg_surface = NULL;
   window->xdg_toplevel = NULL;
   window->xdg_popup = NULL;
@@ -1998,6 +1925,11 @@ static void xwl_destroy_window(struct xwl_window *window) {
     zxdg_surface_v6_destroy(window->xdg_surface);
   if (window->aura_surface)
     zaura_surface_destroy(window->aura_surface);
+
+  if (window->name)
+    free(window->name);
+  if (window->clazz)
+    free(window->clazz);
 
   wl_list_remove(&window->link);
   free(window);
@@ -2095,10 +2027,39 @@ static void xwl_handle_reparent_notify(struct xwl *xwl,
 static void xwl_handle_map_request(struct xwl *xwl,
                                    xcb_map_request_event_t *event) {
   struct xwl_window *window = xwl_lookup_window(xwl, event->window);
+  struct {
+    int type;
+    xcb_atom_t atom;
+  } properties[] = {
+      {PROPERTY_WM_NAME, XCB_ATOM_WM_NAME},
+      {PROPERTY_WM_CLASS, XCB_ATOM_WM_CLASS},
+      {PROPERTY_WM_TRANSIENT_FOR, XCB_ATOM_WM_TRANSIENT_FOR},
+      {PROPERTY_MOTIF_WM_HINTS, xwl->atoms[ATOM_MOTIF_WM_HINTS].value},
+  };
+  xcb_get_geometry_cookie_t geometry_cookie;
+  xcb_get_property_cookie_t property_cookies[ARRAY_SIZE(properties)];
+  struct xwl_mwm_hints {
+    uint32_t flags;
+    uint32_t functions;
+    uint32_t decorations;
+    int32_t input_mode;
+    uint32_t status;
+  } mwm_hints = {0};
+  int i;
+
   if (!window)
     return;
 
   assert(!xwl_is_our_window(xwl, event->window));
+
+  if (window->frame_id == XCB_WINDOW_NONE)
+    geometry_cookie = xcb_get_geometry(xwl->connection, window->id);
+
+  for (i = 0; i < ARRAY_SIZE(properties); ++i) {
+    property_cookies[i] =
+        xcb_get_property(xwl->connection, 0, window->id, properties[i].atom,
+                         XCB_ATOM_ANY, 0, 2048);
+  }
 
   // Keep all managed windows centered horizontally/vertically.
   window->x = xwl->screen->width_in_pixels / 2 - window->width / 2;
@@ -2106,11 +2067,11 @@ static void xwl_handle_map_request(struct xwl *xwl,
 
   if (window->frame_id == XCB_WINDOW_NONE) {
     xcb_get_geometry_reply_t *geometry_reply;
-    uint32_t values[4];
     int depth = xwl->screen->root_depth;
+    uint32_t values[4];
 
-    geometry_reply = xcb_get_geometry_reply(
-        xwl->connection, xcb_get_geometry(xwl->connection, window->id), NULL);
+    geometry_reply =
+        xcb_get_geometry_reply(xwl->connection, geometry_cookie, NULL);
     if (geometry_reply) {
       depth = geometry_reply->depth;
       free(geometry_reply);
@@ -2148,6 +2109,67 @@ static void xwl_handle_map_request(struct xwl *xwl,
     values[1] = window->y;
     xcb_configure_window(xwl->connection, window->frame_id,
                          XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
+  }
+
+  if (window->name) {
+    free(window->name);
+    window->name = NULL;
+  }
+  if (window->clazz) {
+    free(window->clazz);
+    window->clazz = NULL;
+  }
+  window->transient_for = XCB_WINDOW_NONE;
+  window->decorated = 1;
+
+  for (i = 0; i < ARRAY_SIZE(properties); ++i) {
+    xcb_get_property_reply_t *reply =
+        xcb_get_property_reply(xwl->connection, property_cookies[i], NULL);
+
+    if (!reply)
+      continue;
+
+    if (reply->type == XCB_ATOM_NONE) {
+      free(reply);
+      continue;
+    }
+
+    switch (properties[i].type) {
+    case PROPERTY_WM_NAME:
+      window->name = strndup(xcb_get_property_value(reply),
+                             xcb_get_property_value_length(reply));
+      break;
+    case PROPERTY_WM_CLASS: {
+      // WM_CLASS property contains two consecutive null-terminated strings.
+      // These specify the Instance and Class names. If a global app ID is
+      // not set then use Class name for app ID.
+      const char *value = xcb_get_property_value(reply);
+      int value_length = xcb_get_property_value_length(reply);
+      int instance_length = strnlen(value, value_length);
+      if (value_length > instance_length) {
+        window->clazz = strndup(value + instance_length + 1,
+                                value_length - instance_length - 1);
+      }
+    } break;
+    case PROPERTY_WM_TRANSIENT_FOR:
+      if (xcb_get_property_value_length(reply) >= 4)
+        window->transient_for = *((uint32_t *)xcb_get_property_value(reply));
+      break;
+    case PROPERTY_MOTIF_WM_HINTS:
+      if (xcb_get_property_value_length(reply) >= sizeof(mwm_hints)) {
+        memcpy(&mwm_hints, xcb_get_property_value(reply), sizeof(mwm_hints));
+        if (mwm_hints.flags & MWM_HINTS_DECORATIONS) {
+          if (mwm_hints.decorations & MWM_DECOR_ALL)
+            window->decorated = ~mwm_hints.decorations & MWM_DECOR_TITLE;
+          else
+            window->decorated = mwm_hints.decorations & MWM_DECOR_TITLE;
+        }
+      }
+      break;
+    default:
+      break;
+    }
+    free(reply);
   }
 
   xwl_window_set_wm_state(window, WM_STATE_NORMAL);
@@ -2386,10 +2408,10 @@ static void xwl_handle_property_notify(struct xwl *xwl,
     return;
 
   if (event->atom == XCB_ATOM_WM_NAME) {
-    char *name = NULL;
-
-    if (!window->xdg_toplevel)
-      return;
+    if (window->name) {
+      free(window->name);
+      window->name = NULL;
+    }
 
     if (event->state != XCB_PROPERTY_DELETE) {
       xcb_get_property_reply_t *reply = xcb_get_property_reply(
@@ -2398,15 +2420,17 @@ static void xwl_handle_property_notify(struct xwl *xwl,
                            XCB_ATOM_ANY, 0, 2048),
           NULL);
       if (reply) {
-        name = strndup(xcb_get_property_value(reply),
-                       xcb_get_property_value_length(reply));
+        window->name = strndup(xcb_get_property_value(reply),
+                               xcb_get_property_value_length(reply));
         free(reply);
       }
     }
 
-    if (name) {
-      zxdg_toplevel_v6_set_title(window->xdg_toplevel, name);
-      free(name);
+    if (!window->xdg_toplevel)
+      return;
+
+    if (window->name) {
+      zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
     } else {
       zxdg_toplevel_v6_set_title(window->xdg_toplevel, "");
     }
