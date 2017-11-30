@@ -264,6 +264,7 @@ struct xwl {
 
 enum {
   PROPERTY_WM_NAME,
+  PROPERTY_WM_CLASS,
   PROPERTY_WM_TRANSIENT_FOR,
   PROPERTY_MOTIF_WM_HINTS,
 };
@@ -565,7 +566,9 @@ static void xwl_window_update(struct xwl_window *window) {
   struct xwl_window *parent = NULL;
   xcb_window_t parent_window = 0;
   uint32_t frame_type = ZAURA_SURFACE_FRAME_TYPE_NORMAL;
+  const char *app_id = xwl->app_id;
   char *name = NULL;
+  char *clazz = NULL;
 
   if (window->host_surface_id) {
     host_resource = wl_client_get_object(xwl->client, window->host_surface_id);
@@ -614,6 +617,7 @@ static void xwl_window_update(struct xwl_window *window) {
       xcb_atom_t atom;
     } properties[] = {
         {PROPERTY_WM_NAME, XCB_ATOM_WM_NAME},
+        {PROPERTY_WM_CLASS, XCB_ATOM_WM_CLASS},
         {PROPERTY_WM_TRANSIENT_FOR, XCB_ATOM_WM_TRANSIENT_FOR},
         {PROPERTY_MOTIF_WM_HINTS, xwl->atoms[ATOM_MOTIF_WM_HINTS].value},
     };
@@ -643,6 +647,22 @@ static void xwl_window_update(struct xwl_window *window) {
         assert(!name);
         name = strndup(xcb_get_property_value(reply),
                        xcb_get_property_value_length(reply));
+        break;
+      case PROPERTY_WM_CLASS:
+        // WM_CLASS property contains two consecutive null-terminated strings.
+        // These specify the Instance and Class names. If a global app ID is
+        // not set then use Class name for app ID.
+        if (!app_id) {
+          const char *value = xcb_get_property_value(reply);
+          int value_length = xcb_get_property_value_length(reply);
+          int instance_length = strnlen(value, value_length);
+          if (value_length > instance_length) {
+            assert(!clazz);
+            clazz = strndup(value + instance_length + 1,
+                            value_length - instance_length - 1);
+            app_id = clazz;
+          }
+        }
         break;
       case PROPERTY_WM_TRANSIENT_FOR:
         parent_window = *((uint32_t *)xcb_get_property_value(reply));
@@ -719,19 +739,18 @@ static void xwl_window_update(struct xwl_window *window) {
     zxdg_toplevel_v6_add_listener(window->xdg_toplevel,
                                   &xwl_xdg_toplevel_listener, window);
 
-    if (parent) {
+    if (parent)
       zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
-    }
-
     if (name)
       zxdg_toplevel_v6_set_title(window->xdg_toplevel, name);
-
-    if (xwl->app_id)
-      zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, xwl->app_id);
+    if (app_id)
+      zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
   }
 
   if (name)
     free(name);
+  if (clazz)
+    free(clazz);
 
   host_surface->is_cursor = 0;
   wl_surface_commit(host_surface->proxy);
