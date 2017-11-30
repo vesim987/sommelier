@@ -213,6 +213,7 @@ enum {
   ATOM_WL_SURFACE_ID,
   ATOM_UTF8_STRING,
   ATOM_MOTIF_WM_HINTS,
+  ATOM_NET_FRAME_EXTENTS,
   ATOM_NET_SUPPORTING_WM_CHECK,
   ATOM_NET_WM_NAME,
   ATOM_NET_WM_MOVERESIZE,
@@ -2072,7 +2073,7 @@ static void xwl_handle_map_request(struct xwl *xwl,
 
   if (window->frame_id == XCB_WINDOW_NONE) {
     xcb_get_geometry_reply_t *geometry_reply;
-    uint32_t values[3];
+    uint32_t values[4];
     int depth = xwl->screen->root_depth;
 
     geometry_reply = xcb_get_geometry_reply(
@@ -2086,6 +2087,14 @@ static void xwl_handle_map_request(struct xwl *xwl,
     xcb_configure_window(xwl->connection, window->id,
                          XCB_CONFIG_WINDOW_BORDER_WIDTH, values);
     window->border_width = 0;
+
+    values[0] = 0;
+    values[1] = 0;
+    values[2] = 32 * xwl->scale;
+    values[3] = 0;
+    xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, window->id,
+                        xwl->atoms[ATOM_NET_FRAME_EXTENTS].value,
+                        XCB_ATOM_CARDINAL, 32, 4, values);
 
     values[0] = xwl->screen->black_pixel;
     values[1] = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
@@ -2669,6 +2678,7 @@ int main(int argc, char **argv) {
                   [ATOM_WL_SURFACE_ID] = {"WL_SURFACE_ID"},
                   [ATOM_UTF8_STRING] = {"UTF8_STRING"},
                   [ATOM_MOTIF_WM_HINTS] = {"_MOTIF_WM_HINTS"},
+                  [ATOM_NET_FRAME_EXTENTS] = {"_NET_FRAME_EXTENTS"},
                   [ATOM_NET_SUPPORTING_WM_CHECK] = {"_NET_SUPPORTING_WM_CHECK"},
                   [ATOM_NET_WM_NAME] = {"_NET_WM_NAME"},
                   [ATOM_NET_WM_MOVERESIZE] = {"_NET_WM_MOVERESIZE"},
