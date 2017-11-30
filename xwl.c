@@ -572,7 +572,6 @@ static void xwl_window_update(struct xwl_window *window) {
   struct xwl_host_surface *host_surface;
   struct xwl *xwl = window->xwl;
   struct xwl_window *parent = NULL;
-  xcb_window_t parent_window = 0;
   uint32_t frame_type = ZAURA_SURFACE_FRAME_TYPE_NORMAL;
   const char *app_id = xwl->app_id;
   char *name = NULL;
@@ -617,7 +616,16 @@ static void xwl_window_update(struct xwl_window *window) {
   assert(xwl->xdg_shell->internal);
 
   if (window->override_redirect) {
-    parent_window = xwl->focus_window;
+    struct xwl_window *sibling;
+
+    wl_list_for_each(sibling, &xwl->windows, link) {
+      if (sibling->xdg_toplevel || sibling->xdg_popup)
+        parent = sibling;
+
+      // Any parent will do but prefer focus window when possible.
+      if (parent && sibling->id == xwl->focus_window)
+        break;
+    }
     frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
   } else {
     struct {
@@ -672,9 +680,18 @@ static void xwl_window_update(struct xwl_window *window) {
           }
         }
         break;
-      case PROPERTY_WM_TRANSIENT_FOR:
-        parent_window = *((uint32_t *)xcb_get_property_value(reply));
-        break;
+      case PROPERTY_WM_TRANSIENT_FOR: {
+        uint32_t transient_for = *((uint32_t *)xcb_get_property_value(reply));
+        struct xwl_window *sibling;
+
+        wl_list_for_each(sibling, &xwl->windows, link) {
+          if (sibling->id == transient_for) {
+            if (sibling->xdg_toplevel)
+              parent = sibling;
+            break;
+          }
+        }
+      } break;
       case PROPERTY_MOTIF_WM_HINTS:
         memcpy(&mwm_hints, xcb_get_property_value(reply), sizeof(mwm_hints));
         if (mwm_hints.flags & MWM_HINTS_DECORATIONS) {
@@ -693,17 +710,6 @@ static void xwl_window_update(struct xwl_window *window) {
         break;
       }
       free(reply);
-    }
-  }
-
-  if (parent_window) {
-    struct xwl_window *sibling;
-
-    wl_list_for_each(sibling, &xwl->windows, link) {
-      if (sibling->id == parent_window) {
-        parent = sibling;
-        break;
-      }
     }
   }
 
