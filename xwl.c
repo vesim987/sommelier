@@ -207,6 +207,7 @@ struct xwl_window {
 enum {
   ATOM_WM_S0,
   ATOM_WM_PROTOCOLS,
+  ATOM_WM_STATE,
   ATOM_WM_DELETE_WINDOW,
   ATOM_WM_TAKE_FOCUS,
   ATOM_WL_SURFACE_ID,
@@ -300,6 +301,10 @@ struct xwl_mwm_hints {
 #define NET_WM_STATE_REMOVE 0
 #define NET_WM_STATE_ADD 1
 #define NET_WM_STATE_TOGGLE 2
+
+#define WM_STATE_WITHDRAWN 0
+#define WM_STATE_NORMAL 1
+#define WM_STATE_ICONIC 3
 
 #define SEND_EVENT_MASK 0x80
 
@@ -539,6 +544,18 @@ static void xwl_xdg_popup_done(void *data,
 
 static const struct zxdg_popup_v6_listener xwl_xdg_popup_listener = {
     xwl_xdg_popup_configure, xwl_xdg_popup_done};
+
+static void xwl_window_set_wm_state(struct xwl_window *window, int state) {
+  struct xwl *xwl = window->xwl;
+  uint32_t values[2];
+
+  values[0] = state;
+  values[1] = XCB_WINDOW_NONE;
+
+  xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, window->id,
+                      xwl->atoms[ATOM_WM_STATE].value,
+                      xwl->atoms[ATOM_WM_STATE].value, 32, 2, values);
+}
 
 static void xwl_window_update(struct xwl_window *window) {
   struct wl_resource *host_resource = NULL;
@@ -2091,6 +2108,7 @@ static void xwl_handle_map_request(struct xwl *xwl,
                          XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
   }
 
+  xwl_window_set_wm_state(window, WM_STATE_NORMAL);
   xwl_send_configure_notify(window);
 
   xcb_map_window(xwl->connection, window->id);
@@ -2123,6 +2141,8 @@ static void xwl_handle_unmap_notify(struct xwl *xwl,
     window->host_surface_id = 0;
     xwl_window_update(window);
   }
+
+  xwl_window_set_wm_state(window, WM_STATE_WITHDRAWN);
 
   if (window->frame_id)
     xcb_unmap_window(xwl->connection, window->frame_id);
@@ -2643,6 +2663,7 @@ int main(int argc, char **argv) {
           {
                   [ATOM_WM_S0] = {"WM_S0"},
                   [ATOM_WM_PROTOCOLS] = {"WM_PROTOCOLS"},
+                  [ATOM_WM_STATE] = {"WM_STATE"},
                   [ATOM_WM_DELETE_WINDOW] = {"WM_DELETE_WINDOW"},
                   [ATOM_WM_TAKE_FOCUS] = {"WM_TAKE_FOCUS"},
                   [ATOM_WL_SURFACE_ID] = {"WL_SURFACE_ID"},
