@@ -345,15 +345,17 @@ static void xwl_configure_window(struct xwl_window *window) {
   assert(!window->pending_config.serial);
 
   if (window->next_config.mask) {
+    int x = window->x;
+    int y = window->y;
     int i = 0;
 
     xcb_configure_window(window->xwl->connection, window->frame_id,
                          window->next_config.mask, window->next_config.values);
 
     if (window->next_config.mask & XCB_CONFIG_WINDOW_X)
-      window->x = window->next_config.values[i++];
+      x = window->next_config.values[i++];
     if (window->next_config.mask & XCB_CONFIG_WINDOW_Y)
-      window->y = window->next_config.values[i++];
+      y = window->next_config.values[i++];
 
     xcb_configure_window(window->xwl->connection, window->id,
                          window->next_config.mask &
@@ -366,6 +368,12 @@ static void xwl_configure_window(struct xwl_window *window) {
       window->height = window->next_config.values[i++];
     if (window->next_config.mask & XCB_CONFIG_WINDOW_BORDER_WIDTH)
       window->border_width = window->next_config.values[i++];
+
+    if (x != window->x || y != window->y) {
+      window->x = x;
+      window->y = y;
+      xwl_send_configure_notify(window);
+    }
   }
 
   xcb_change_property(window->xwl->connection, XCB_PROP_MODE_REPLACE,
@@ -2181,10 +2189,7 @@ static void xwl_handle_configure_request(struct xwl *xwl,
   struct xwl_window *window = xwl_lookup_window(xwl, event->window);
   int x = window->x;
   int y = window->y;
-  int width = window->width;
-  int height = window->height;
-  int size_changed;
-  uint32_t values[16];
+  uint32_t values[5];
 
   assert(!xwl_is_our_window(xwl, event->window));
 
@@ -2208,42 +2213,33 @@ static void xwl_handle_configure_request(struct xwl *xwl,
   }
 
   if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH)
-    width = event->width;
+    window->width = event->width;
   if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
-    height = event->height;
+    window->height = event->height;
+
+  window->border_width = 0;
 
   // Keep all managed windows centered horizontally/vertically.
-  x = xwl->screen->width_in_pixels / 2 - width / 2;
-  y = xwl->screen->height_in_pixels / 2 - height / 2;
-
-  size_changed = width != (window->width + window->border_width * 2) ||
-                 height != (window->height + window->border_width * 2);
+  x = xwl->screen->width_in_pixels / 2 - window->width / 2;
+  y = xwl->screen->height_in_pixels / 2 - window->height / 2;
 
   values[0] = x;
   values[1] = y;
-  values[2] = width;
-  values[3] = height;
+  values[2] = window->width;
+  values[3] = window->height;
   values[4] = 0;
+  xcb_configure_window(xwl->connection, window->frame_id,
+                       XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                           XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                       values);
+  xcb_configure_window(xwl->connection, window->id,
+                       XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
+                           XCB_CONFIG_WINDOW_BORDER_WIDTH,
+                       &values[2]);
 
-  if (x != window->x || y != window->y || size_changed) {
-    xcb_configure_window(xwl->connection, window->frame_id,
-                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
-                             XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
-                         values);
-  }
-
-  window->x = x;
-  window->y = y;
-  window->width = width;
-  window->height = height;
-  window->border_width = 0;
-
-  if (size_changed) {
-    xcb_configure_window(xwl->connection, window->id,
-                         XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
-                             XCB_CONFIG_WINDOW_BORDER_WIDTH,
-                         &values[2]);
-  } else {
+  if (x != window->x || y != window->y) {
+    window->x = x;
+    window->y = y;
     xwl_send_configure_notify(window);
   }
 }
