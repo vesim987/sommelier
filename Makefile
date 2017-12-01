@@ -74,7 +74,7 @@ dist: version-clean $(DEPS)
 	rm -rf xwl-$(DIST_VERSION)
 
 deb: dist
-	ln -s xwl-$(DIST_VERSION).tar.gz xwl_$(DIST_VERSION).orig.tar.gz
+	ln -sf xwl-$(DIST_VERSION).tar.gz xwl_$(DIST_VERSION).orig.tar.gz
 	tar xzf xwl-$(DIST_VERSION).tar.gz
 	cd xwl-$(DIST_VERSION) && debuild -i -us -uc -b
 	rm -rf xwl-$(DIST_VERSION) xwl_$(DIST_VERSION).orig.tar.gz
