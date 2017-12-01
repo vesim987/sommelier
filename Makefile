@@ -15,8 +15,8 @@ DIST_VERSION_BITS := $(subst ., ,$(DIST_VERSION))
 DIST_VERSION_MAJOR := $(word 1,$(DIST_VERSION_BITS))
 DIST_VERSION_MINOR := $(word 2,$(DIST_VERSION_BITS))
 DIST_VERSION_MINOR_NEXT := $(shell expr $(DIST_VERSION_MINOR) + 1)
-CFLAGS=-g -Wall `pkg-config --cflags xcb xcb-composite wayland-server wayland-client libsystemd` -I. -DXWAYLAND_PATH=\"$(PREFIX)/bin\"
-LDFLAGS=-lpthread -lm `pkg-config --libs xcb xcb-composite wayland-server wayland-client libsystemd`
+CFLAGS=-g -Wall `pkg-config --cflags xcb xcb-composite xcb-xfixes wayland-server wayland-client libsystemd` -I. -DXWAYLAND_PATH=\"$(PREFIX)/bin\"
+LDFLAGS=-lpthread -lm `pkg-config --libs xcb xcb-composite xcb-xfixes wayland-server wayland-client libsystemd`
 DEPS = xdg-shell-unstable-v6-client-protocol.h aura-shell-client-protocol.h viewporter-client-protocol.h version.h
 OBJECTS = xwl.o xdg-shell-unstable-v6-protocol.o aura-shell-protocol.o viewporter-protocol.o
 

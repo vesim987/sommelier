@@ -7,7 +7,13 @@
 #define WL_HIDE_DEPRECATED
 #endif
 
+// Needed for pipe2.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <assert.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +27,7 @@
 #include <wayland-util.h>
 #include <xcb/composite.h>
 #include <xcb/xcb.h>
+#include <xcb/xfixes.h>
 
 #include "aura-shell-client-protocol.h"
 #include "version.h"
@@ -124,7 +131,7 @@ struct xwl_seat {
   uint32_t id;
   uint32_t version;
   struct wl_global *host_global;
-  uint32_t net_wm_moveresize_serial;
+  uint32_t last_serial;
   struct wl_list link;
 };
 
@@ -156,6 +163,24 @@ struct xwl_host_seat {
   struct xwl_seat *seat;
   struct wl_resource *resource;
   struct wl_seat *proxy;
+};
+
+struct xwl_data_device_manager {
+  struct xwl *xwl;
+  uint32_t id;
+  uint32_t version;
+  struct wl_data_device_manager *internal;
+};
+
+struct xwl_data_offer {
+  struct xwl *xwl;
+  struct wl_data_offer *internal;
+  int utf8_text;
+};
+
+struct xwl_data_source {
+  struct xwl *xwl;
+  struct wl_data_source *internal;
 };
 
 struct xwl_xdg_shell {
@@ -230,7 +255,14 @@ enum {
   ATOM_NET_WM_STATE_FULLSCREEN,
   ATOM_NET_WM_STATE_MAXIMIZED_VERT,
   ATOM_NET_WM_STATE_MAXIMIZED_HORZ,
-  ATOM_LAST = ATOM_NET_WM_STATE_MAXIMIZED_HORZ,
+  ATOM_CLIPBOARD,
+  ATOM_CLIPBOARD_MANAGER,
+  ATOM_TARGETS,
+  ATOM_TIMESTAMP,
+  ATOM_TEXT,
+  ATOM_INCR,
+  ATOM_WL_SELECTION,
+  ATOM_LAST = ATOM_WL_SELECTION,
 };
 
 struct xwl {
@@ -241,6 +273,7 @@ struct xwl {
   struct xwl_compositor *compositor;
   struct xwl_shm *shm;
   struct xwl_shell *shell;
+  struct xwl_data_device_manager *data_device_manager;
   struct xwl_xdg_shell *xdg_shell;
   struct xwl_aura_shell *aura_shell;
   struct xwl_viewporter *viewporter;
@@ -252,6 +285,7 @@ struct xwl {
   pid_t xwayland_pid;
   pid_t child_pid;
   xcb_connection_t *connection;
+  const xcb_query_extension_reply_t *xfixes_extension;
   xcb_screen_t *screen;
   xcb_window_t window;
   struct wl_list windows, unpaired_windows;
@@ -261,7 +295,23 @@ struct xwl {
   double scale;
   const char *app_id;
   int exit_with_child;
-  struct xwl_host_seat *net_wm_moveresize_seat;
+  struct xwl_host_seat *default_seat;
+  xcb_window_t selection_window;
+  xcb_window_t selection_owner;
+  int selection_incremental_transfer;
+  xcb_selection_request_event_t selection_request;
+  xcb_timestamp_t selection_timestamp;
+  struct wl_data_device *selection_data_device;
+  struct xwl_data_offer *selection_data_offer;
+  struct xwl_data_source *selection_data_source;
+  int selection_data_source_send_fd;
+  struct wl_event_source *selection_send_event_source;
+  xcb_get_property_reply_t *selection_property_reply;
+  int selection_property_offset;
+  struct wl_event_source *selection_event_source;
+  struct wl_array selection_data;
+  int selection_data_offer_receive_fd;
+  int selection_data_ack_pending;
   union {
     const char *name;
     xcb_intern_atom_cookie_t cookie;
@@ -1305,6 +1355,101 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
   }
 }
 
+static void xwl_data_offer_destroy(struct xwl_data_offer *host) {
+  wl_data_offer_destroy(host->internal);
+  free(host);
+}
+
+static void xwl_set_selection(struct xwl *xwl,
+                              struct xwl_data_offer *data_offer) {
+
+  if (xwl->selection_data_offer) {
+    xwl_data_offer_destroy(xwl->selection_data_offer);
+    xwl->selection_data_offer = NULL;
+  }
+
+  if (!data_offer) {
+    if (xwl->selection_owner == xwl->selection_window)
+      xcb_set_selection_owner(xwl->connection, XCB_ATOM_NONE,
+                              xwl->atoms[ATOM_CLIPBOARD].value,
+                              xwl->selection_timestamp);
+    return;
+  }
+
+  xcb_set_selection_owner(xwl->connection, xwl->selection_window,
+                          xwl->atoms[ATOM_CLIPBOARD].value, XCB_CURRENT_TIME);
+
+  xwl->selection_data_offer = data_offer;
+}
+
+static const char *xwl_utf8_mime_type = "text/plain;charset=utf-8";
+
+static void xwl_data_offer_offer(void *data, struct wl_data_offer *data_offer,
+                                 const char *type) {
+  struct xwl_data_offer *host = data;
+
+  if (strcmp(type, xwl_utf8_mime_type) == 0)
+    host->utf8_text = 1;
+}
+
+static void xwl_data_offer_source_actions(void *data,
+                                          struct wl_data_offer *data_offer,
+                                          uint32_t source_actions) {}
+
+static void xwl_data_offer_action(void *data, struct wl_data_offer *data_offer,
+                                  uint32_t dnd_action) {}
+
+static const struct wl_data_offer_listener xwl_data_offer_listener = {
+    xwl_data_offer_offer, xwl_data_offer_source_actions, xwl_data_offer_action};
+
+static void xwl_data_device_data_offer(void *data,
+                                       struct wl_data_device *data_device,
+                                       struct wl_data_offer *data_offer) {
+  struct xwl *xwl = (struct xwl *)data;
+  struct xwl_data_offer *host_data_offer;
+
+  host_data_offer = malloc(sizeof(*host_data_offer));
+  assert(host_data_offer);
+
+  host_data_offer->xwl = xwl;
+  host_data_offer->internal = data_offer;
+  host_data_offer->utf8_text = 0;
+
+  wl_data_offer_add_listener(host_data_offer->internal,
+                             &xwl_data_offer_listener, host_data_offer);
+}
+
+static void xwl_data_device_enter(void *data,
+                                  struct wl_data_device *data_device,
+                                  uint32_t serial, struct wl_surface *surface,
+                                  wl_fixed_t x, wl_fixed_t y,
+                                  struct wl_data_offer *data_offer) {}
+
+static void xwl_data_device_leave(void *data,
+                                  struct wl_data_device *data_device) {}
+
+static void xwl_data_device_motion(void *data,
+                                   struct wl_data_device *data_device,
+                                   uint32_t time, wl_fixed_t x, wl_fixed_t y) {}
+
+static void xwl_data_device_drop(void *data,
+                                 struct wl_data_device *data_device) {}
+
+static void xwl_data_device_selection(void *data,
+                                      struct wl_data_device *data_device,
+                                      struct wl_data_offer *data_offer) {
+  struct xwl *xwl = (struct xwl *)data;
+  struct xwl_data_offer *host_data_offer =
+      data_offer ? wl_data_offer_get_user_data(data_offer) : NULL;
+
+  xwl_set_selection(xwl, host_data_offer);
+}
+
+static const struct wl_data_device_listener xwl_data_device_listener = {
+    xwl_data_device_data_offer, xwl_data_device_enter,
+    xwl_data_device_leave,      xwl_data_device_motion,
+    xwl_data_device_drop,       xwl_data_device_selection};
+
 static void xwl_host_pointer_set_cursor(struct wl_client *client,
                                         struct wl_resource *resource,
                                         uint32_t serial,
@@ -1374,6 +1519,8 @@ static void xwl_pointer_enter(void *data, struct wl_pointer *pointer,
     return;
 
   xwl_pointer_set_focus(host, serial, host_surface, x, y);
+
+  host->seat->last_serial = serial;
 }
 
 static void xwl_pointer_leave(void *data, struct wl_pointer *pointer,
@@ -1398,7 +1545,7 @@ static void xwl_pointer_button(void *data, struct wl_pointer *pointer,
 
   wl_pointer_send_button(host->resource, serial, time, button, state);
 
-  host->seat->net_wm_moveresize_serial = serial;
+  host->seat->last_serial = serial;
 }
 
 static void xwl_pointer_axis(void *data, struct wl_pointer *pointer,
@@ -1481,6 +1628,8 @@ static void xwl_keyboard_set_focus(struct xwl_host_keyboard *host,
                                      &host->focus_resource_listener);
     wl_keyboard_send_enter(host->resource, serial, surface_resource, keys);
   }
+
+  host->seat->last_serial = serial;
 }
 
 static void xwl_keyboard_enter(void *data, struct wl_keyboard *keyboard,
@@ -1494,6 +1643,8 @@ static void xwl_keyboard_enter(void *data, struct wl_keyboard *keyboard,
     return;
 
   xwl_keyboard_set_focus(host, serial, host_surface, keys);
+
+  host->seat->last_serial = serial;
 }
 
 static void xwl_keyboard_leave(void *data, struct wl_keyboard *keyboard,
@@ -1509,6 +1660,8 @@ static void xwl_keyboard_key(void *data, struct wl_keyboard *keyboard,
   struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
 
   wl_keyboard_send_key(host->resource, serial, time, key, state);
+
+  host->seat->last_serial = serial;
 }
 
 static void xwl_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
@@ -1519,6 +1672,8 @@ static void xwl_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
 
   wl_keyboard_send_modifiers(host->resource, serial, mods_depressed,
                              mods_latched, mods_locked, group);
+
+  host->seat->last_serial = serial;
 }
 
 static void xwl_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
@@ -1554,6 +1709,8 @@ static void xwl_host_touch_down(void *data, struct wl_touch *touch,
 
   wl_touch_send_down(host->resource, serial, time, host_surface->resource, id,
                      x * scale, y * scale);
+
+  host->seat->last_serial = serial;
 }
 
 static void xwl_host_touch_up(void *data, struct wl_touch *touch,
@@ -1561,6 +1718,8 @@ static void xwl_host_touch_up(void *data, struct wl_touch *touch,
   struct xwl_host_touch *host = wl_touch_get_user_data(touch);
 
   wl_touch_send_up(host->resource, serial, time, id);
+
+  host->seat->last_serial = serial;
 }
 
 static void xwl_host_touch_motion(void *data, struct wl_touch *touch,
@@ -1732,8 +1891,8 @@ static const struct wl_seat_listener xwl_seat_listener = {xwl_seat_capabilities,
 static void xwl_destroy_host_seat(struct wl_resource *resource) {
   struct xwl_host_seat *host = wl_resource_get_user_data(resource);
 
-  if (host->seat->xwl->net_wm_moveresize_seat == host)
-    host->seat->xwl->net_wm_moveresize_seat = NULL;
+  if (host->seat->xwl->default_seat == host)
+    host->seat->xwl->default_seat = NULL;
 
   wl_seat_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
@@ -1758,7 +1917,15 @@ static void xwl_bind_host_seat(struct wl_client *client, void *data,
   wl_seat_set_user_data(host->proxy, host);
   wl_seat_add_listener(host->proxy, &xwl_seat_listener, host);
 
-  seat->xwl->net_wm_moveresize_seat = host;
+  if (!seat->xwl->default_seat) {
+    seat->xwl->default_seat = host;
+    if (seat->xwl->data_device_manager) {
+      seat->xwl->selection_data_device = wl_data_device_manager_get_data_device(
+          seat->xwl->data_device_manager->internal, host->proxy);
+      wl_data_device_add_listener(seat->xwl->selection_data_device,
+                                  &xwl_data_device_listener, seat->xwl);
+    }
+  }
 }
 
 static void xwl_registry_handler(void *data, struct wl_registry *registry,
@@ -1817,8 +1984,19 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     seat->host_global =
         wl_global_create(xwl->host_display, &wl_seat_interface, seat->version,
                          seat, xwl_bind_host_seat);
-    seat->net_wm_moveresize_serial = 0;
+    seat->last_serial = 0;
     wl_list_insert(&xwl->seats, &seat->link);
+  } else if (strcmp(interface, "wl_data_device_manager") == 0) {
+    struct xwl_data_device_manager *data_device_manager =
+        malloc(sizeof(struct xwl_data_device_manager));
+    assert(data_device_manager);
+    data_device_manager->xwl = xwl;
+    data_device_manager->id = id;
+    data_device_manager->version = MIN(3, version);
+    data_device_manager->internal =
+        wl_registry_bind(registry, id, &wl_data_device_manager_interface,
+                         data_device_manager->version);
+    xwl->data_device_manager = data_device_manager;
   } else if (strcmp(interface, "zxdg_shell_v6") == 0) {
     struct xwl_xdg_shell *xdg_shell = malloc(sizeof(struct xwl_xdg_shell));
     assert(xdg_shell);
@@ -1875,6 +2053,12 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
     wl_global_destroy(xwl->shell->host_global);
     free(xwl->shell);
     xwl->shell = NULL;
+    return;
+  }
+  if (xwl->data_device_manager && xwl->data_device_manager->id == id) {
+    wl_data_device_manager_destroy(xwl->data_device_manager->internal);
+    free(xwl->data_device_manager);
+    xwl->data_device_manager = NULL;
     return;
   }
   if (xwl->xdg_shell && xwl->xdg_shell->id == id) {
@@ -1942,6 +2126,7 @@ static int xwl_handle_event(int fd, uint32_t mask, void *data) {
 static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
                               int width, int height, int border_width) {
   struct xwl_window *window = malloc(sizeof(struct xwl_window));
+  uint32_t values[1];
   assert(window);
   window->xwl = xwl;
   window->id = id;
@@ -1972,6 +2157,9 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
   window->pending_config.mask = 0;
   window->pending_config.states_length = 0;
   wl_list_insert(&xwl->unpaired_windows, &window->link);
+  values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_FOCUS_CHANGE;
+  xcb_change_window_attributes(xwl->connection, window->id, XCB_CW_EVENT_MASK,
+                               values);
 }
 
 static void xwl_destroy_window(struct xwl_window *window) {
@@ -2137,10 +2325,6 @@ static void xwl_handle_map_request(struct xwl *xwl,
   assert(!xwl_is_our_window(xwl, event->window));
 
   window->managed = 1;
-  values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_FOCUS_CHANGE;
-  xcb_change_window_attributes(xwl->connection, window->id, XCB_CW_EVENT_MASK,
-                               values);
-
   if (window->frame_id == XCB_WINDOW_NONE)
     geometry_cookie = xcb_get_geometry(xwl->connection, window->id);
 
@@ -2529,14 +2713,14 @@ static void xwl_handle_client_message(struct xwl *xwl,
     struct xwl_window *window = xwl_lookup_window(xwl, event->window);
 
     if (window && window->xdg_toplevel) {
-      struct xwl_host_seat *seat = window->xwl->net_wm_moveresize_seat;
+      struct xwl_host_seat *seat = window->xwl->default_seat;
 
       if (!seat)
         return;
 
       if (event->data.data32[2] == NET_WM_MOVERESIZE_MOVE) {
         zxdg_toplevel_v6_move(window->xdg_toplevel, seat->proxy,
-                              seat->seat->net_wm_moveresize_serial);
+                              seat->seat->last_serial);
       } else {
         uint32_t edge = xwl_resize_edge(event->data.data32[2]);
 
@@ -2544,7 +2728,7 @@ static void xwl_handle_client_message(struct xwl *xwl,
           return;
 
         zxdg_toplevel_v6_resize(window->xdg_toplevel, seat->proxy,
-                                seat->seat->net_wm_moveresize_serial, edge);
+                                seat->seat->last_serial, edge);
       }
     }
   } else if (event->type == xwl->atoms[ATOM_NET_WM_STATE].value) {
@@ -2594,13 +2778,145 @@ static void xwl_handle_focus_in(struct xwl *xwl, xcb_focus_in_event_t *event) {
 static void xwl_handle_focus_out(struct xwl *xwl,
                                  xcb_focus_out_event_t *event) {}
 
-static void xwl_handle_property_notify(struct xwl *xwl,
-                                       xcb_property_notify_event_t *event) {
-  struct xwl_window *window = xwl_lookup_window(xwl, event->window);
-  if (!window)
+static int xwl_handle_selection_fd_writable(int fd, uint32_t mask, void *data) {
+  struct xwl *xwl = data;
+  uint8_t *value;
+  int bytes, bytes_left;
+
+  value = xcb_get_property_value(xwl->selection_property_reply);
+  bytes_left = xcb_get_property_value_length(xwl->selection_property_reply) -
+               xwl->selection_property_offset;
+
+  bytes = write(fd, value + xwl->selection_property_offset, bytes_left);
+  if (bytes == -1) {
+    fprintf(stderr, "write error to target fd: %m\n");
+    close(fd);
+  } else if (bytes == bytes_left) {
+    if (xwl->selection_incremental_transfer) {
+      xcb_delete_property(xwl->connection, xwl->selection_window,
+                          xwl->atoms[ATOM_WL_SELECTION].value);
+    } else {
+      close(fd);
+    }
+  } else {
+    xwl->selection_property_offset += bytes;
+    return 1;
+  }
+
+  free(xwl->selection_property_reply);
+  xwl->selection_property_reply = NULL;
+  if (xwl->selection_send_event_source) {
+    wl_event_source_remove(xwl->selection_send_event_source);
+    xwl->selection_send_event_source = NULL;
+  }
+  return 1;
+}
+
+static void xwl_write_selection_property(struct xwl *xwl,
+                                         xcb_get_property_reply_t *reply) {
+  xwl->selection_property_offset = 0;
+  xwl->selection_property_reply = reply;
+  xwl_handle_selection_fd_writable(xwl->selection_data_source_send_fd,
+                                   WL_EVENT_WRITABLE, xwl);
+
+  if (!xwl->selection_property_reply)
     return;
 
+  assert(!xwl->selection_send_event_source);
+  xwl->selection_send_event_source = wl_event_loop_add_fd(
+      wl_display_get_event_loop(xwl->host_display),
+      xwl->selection_data_source_send_fd, WL_EVENT_WRITABLE,
+      xwl_handle_selection_fd_writable, xwl);
+}
+
+static void xwl_send_selection_notify(struct xwl *xwl, xcb_atom_t property) {
+  xcb_selection_notify_event_t event = {
+      .response_type = XCB_SELECTION_NOTIFY,
+      .sequence = 0,
+      .time = xwl->selection_request.time,
+      .requestor = xwl->selection_request.requestor,
+      .selection = xwl->selection_request.selection,
+      .target = xwl->selection_request.target,
+      .property = property,
+      .pad0 = 0};
+
+  xcb_send_event(xwl->connection, 0, xwl->selection_request.requestor,
+                 XCB_EVENT_MASK_NO_EVENT, (char *)&event);
+}
+
+static void xwl_send_selection_data(struct xwl *xwl) {
+  assert(!xwl->selection_data_ack_pending);
+  xcb_change_property(
+      xwl->connection, XCB_PROP_MODE_REPLACE, xwl->selection_request.requestor,
+      xwl->selection_request.property, xwl->atoms[ATOM_UTF8_STRING].value, 8,
+      xwl->selection_data.size, xwl->selection_data.data);
+  xwl->selection_data_ack_pending = 1;
+  xwl->selection_data.size = 0;
+}
+
+static const uint32_t xwl_incr_chunk_size = 64 * 1024;
+
+static int xwl_handle_selection_fd_readable(int fd, uint32_t mask, void *data) {
+  struct xwl *xwl = data;
+  int bytes, offset, bytes_left;
+  void *p;
+
+  offset = xwl->selection_data.size;
+  if (xwl->selection_data.size < xwl_incr_chunk_size)
+    p = wl_array_add(&xwl->selection_data, xwl_incr_chunk_size);
+  else
+    p = (char *)xwl->selection_data.data + xwl->selection_data.size;
+  bytes_left = xwl->selection_data.alloc - offset;
+
+  bytes = read(fd, p, bytes_left);
+  if (bytes == -1) {
+    fprintf(stderr, "read error from data source: %m\n");
+    xwl_send_selection_notify(xwl, XCB_ATOM_NONE);
+    xwl->selection_data_offer_receive_fd = -1;
+    close(fd);
+  } else {
+    xwl->selection_data.size = offset + bytes;
+    if (xwl->selection_data.size >= xwl_incr_chunk_size) {
+      if (!xwl->selection_incremental_transfer) {
+        xwl->selection_incremental_transfer = 1;
+        xcb_change_property(
+            xwl->connection, XCB_PROP_MODE_REPLACE,
+            xwl->selection_request.requestor, xwl->selection_request.property,
+            xwl->atoms[ATOM_INCR].value, 32, 1, &xwl_incr_chunk_size);
+        xwl->selection_data_ack_pending = 1;
+        xwl_send_selection_notify(xwl, xwl->selection_request.property);
+      } else if (!xwl->selection_data_ack_pending) {
+        xwl_send_selection_data(xwl);
+      }
+    } else if (bytes == 0) {
+      if (!xwl->selection_data_ack_pending)
+        xwl_send_selection_data(xwl);
+      if (!xwl->selection_incremental_transfer) {
+        xwl_send_selection_notify(xwl, xwl->selection_request.property);
+        xwl->selection_request.requestor = XCB_NONE;
+        wl_array_release(&xwl->selection_data);
+      }
+      xcb_flush(xwl->connection);
+      xwl->selection_data_offer_receive_fd = -1;
+      close(fd);
+    } else {
+      xwl->selection_data.size = offset + bytes;
+      return 1;
+    }
+  }
+
+  wl_event_source_remove(xwl->selection_event_source);
+  xwl->selection_event_source = NULL;
+  return 1;
+}
+
+static void xwl_handle_property_notify(struct xwl *xwl,
+                                       xcb_property_notify_event_t *event) {
   if (event->atom == XCB_ATOM_WM_NAME) {
+    struct xwl_window *window = xwl_lookup_window(xwl, event->window);
+    if (!window)
+      return;
+
     if (window->name) {
       free(window->name);
       window->name = NULL;
@@ -2627,7 +2943,283 @@ static void xwl_handle_property_notify(struct xwl *xwl,
     } else {
       zxdg_toplevel_v6_set_title(window->xdg_toplevel, "");
     }
+  } else if (event->atom == xwl->atoms[ATOM_WL_SELECTION].value) {
+    if (event->window == xwl->selection_window &&
+        event->state == XCB_PROPERTY_NEW_VALUE &&
+        xwl->selection_incremental_transfer) {
+      xcb_get_property_reply_t *reply = xcb_get_property_reply(
+          xwl->connection,
+          xcb_get_property(xwl->connection, 0, xwl->selection_window,
+                           xwl->atoms[ATOM_WL_SELECTION].value,
+                           XCB_GET_PROPERTY_TYPE_ANY, 0, 0x1fffffff),
+          NULL);
+
+      if (!reply)
+        return;
+
+      if (xcb_get_property_value_length(reply) > 0) {
+        xwl_write_selection_property(xwl, reply);
+      } else {
+        assert(!xwl->selection_send_event_source);
+        close(xwl->selection_data_source_send_fd);
+        free(reply);
+      }
+    }
+  } else if (event->atom == xwl->selection_request.property) {
+    if (event->window == xwl->selection_request.requestor &&
+        event->state == XCB_PROPERTY_DELETE &&
+        xwl->selection_incremental_transfer) {
+      int data_size = xwl->selection_data.size;
+
+      xwl->selection_data_ack_pending = 0;
+
+      // Handle the case when there's more data to be received.
+      if (xwl->selection_data_offer_receive_fd >= 0) {
+        // Avoid sending empty data until transfer is complete.
+        if (data_size)
+          xwl_send_selection_data(xwl);
+
+        if (!xwl->selection_event_source) {
+          xwl->selection_event_source = wl_event_loop_add_fd(
+              wl_display_get_event_loop(xwl->host_display),
+              xwl->selection_data_offer_receive_fd, WL_EVENT_READABLE,
+              xwl_handle_selection_fd_readable, xwl);
+        }
+        return;
+      }
+
+      xwl_send_selection_data(xwl);
+
+      // Release data if transfer is complete.
+      if (!data_size) {
+        xwl->selection_request.requestor = XCB_NONE;
+        wl_array_release(&xwl->selection_data);
+      }
+    }
   }
+}
+
+static void xwl_data_source_target(void *data,
+                                   struct wl_data_source *data_source,
+                                   const char *mime_type) {}
+
+static void xwl_data_source_send(void *data, struct wl_data_source *data_source,
+                                 const char *mime_type, int32_t fd) {
+  struct xwl_data_source *host = data;
+  struct xwl *xwl = host->xwl;
+
+  if (strcmp(mime_type, xwl_utf8_mime_type) == 0) {
+    xcb_convert_selection(
+        xwl->connection, xwl->selection_window,
+        xwl->atoms[ATOM_CLIPBOARD].value, xwl->atoms[ATOM_UTF8_STRING].value,
+        xwl->atoms[ATOM_WL_SELECTION].value, XCB_CURRENT_TIME);
+    fcntl(fd, F_SETFL, O_WRONLY | O_NONBLOCK);
+    xwl->selection_data_source_send_fd = fd;
+  } else {
+    close(fd);
+  }
+}
+
+static void xwl_data_source_cancelled(void *data,
+                                      struct wl_data_source *data_source) {
+  struct xwl_data_source *host = data;
+
+  if (host->xwl->selection_data_source == host)
+    host->xwl->selection_data_source = NULL;
+
+  wl_data_source_destroy(data_source);
+}
+
+static const struct wl_data_source_listener xwl_data_source_listener = {
+    xwl_data_source_target, xwl_data_source_send, xwl_data_source_cancelled};
+
+static void xwl_get_selection_targets(struct xwl *xwl) {
+  struct xwl_data_source *data_source = NULL;
+  xcb_get_property_reply_t *reply;
+  xcb_atom_t *value;
+  uint32_t i;
+
+  reply = xcb_get_property_reply(
+      xwl->connection,
+      xcb_get_property(xwl->connection, 1, xwl->selection_window,
+                       xwl->atoms[ATOM_WL_SELECTION].value,
+                       XCB_GET_PROPERTY_TYPE_ANY, 0, 4096),
+      NULL);
+  if (!reply)
+    return;
+
+  if (reply->type != XCB_ATOM_ATOM) {
+    free(reply);
+    return;
+  }
+
+  if (xwl->data_device_manager) {
+    data_source = malloc(sizeof(*data_source));
+    assert(data_source);
+
+    data_source->xwl = xwl;
+    data_source->internal = wl_data_device_manager_create_data_source(
+        xwl->data_device_manager->internal);
+    wl_data_source_add_listener(data_source->internal,
+                                &xwl_data_source_listener, data_source);
+
+    value = xcb_get_property_value(reply);
+    for (i = 0; i < reply->value_len; i++) {
+      if (value[i] == xwl->atoms[ATOM_UTF8_STRING].value)
+        wl_data_source_offer(data_source->internal, "text/plain;charset=utf-8");
+    }
+
+    if (xwl->selection_data_device && xwl->default_seat) {
+      wl_data_device_set_selection(xwl->selection_data_device,
+                                   data_source->internal,
+                                   xwl->default_seat->seat->last_serial);
+    }
+
+    if (xwl->selection_data_source) {
+      wl_data_source_destroy(xwl->selection_data_source->internal);
+      free(xwl->selection_data_source);
+    }
+    xwl->selection_data_source = data_source;
+  }
+
+  free(reply);
+}
+
+static void xwl_get_selection_data(struct xwl *xwl) {
+  xcb_get_property_reply_t *reply = xcb_get_property_reply(
+      xwl->connection,
+      xcb_get_property(xwl->connection, 1, xwl->selection_window,
+                       xwl->atoms[ATOM_WL_SELECTION].value,
+                       XCB_GET_PROPERTY_TYPE_ANY, 0, 0x1fffffff),
+      NULL);
+  if (!reply)
+    return;
+
+  if (reply->type == xwl->atoms[ATOM_INCR].value) {
+    xwl->selection_incremental_transfer = 1;
+    free(reply);
+  } else {
+    xwl->selection_incremental_transfer = 0;
+    xwl_write_selection_property(xwl, reply);
+  }
+}
+
+static void xwl_handle_selection_notify(struct xwl *xwl,
+                                        xcb_selection_notify_event_t *event) {
+  if (event->property == XCB_ATOM_NONE)
+    return;
+
+  if (event->target == xwl->atoms[ATOM_TARGETS].value)
+    xwl_get_selection_targets(xwl);
+  else
+    xwl_get_selection_data(xwl);
+}
+
+static void xwl_send_targets(struct xwl *xwl) {
+  xcb_atom_t targets[] = {
+      xwl->atoms[ATOM_TIMESTAMP].value, xwl->atoms[ATOM_TARGETS].value,
+      xwl->atoms[ATOM_UTF8_STRING].value, xwl->atoms[ATOM_TEXT].value,
+  };
+
+  xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE,
+                      xwl->selection_request.requestor,
+                      xwl->selection_request.property, XCB_ATOM_ATOM, 32,
+                      ARRAY_SIZE(targets), targets);
+
+  xwl_send_selection_notify(xwl, xwl->selection_request.property);
+}
+
+static void xwl_send_timestamp(struct xwl *xwl) {
+  xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE,
+                      xwl->selection_request.requestor,
+                      xwl->selection_request.property, XCB_ATOM_INTEGER, 32, 1,
+                      &xwl->selection_timestamp);
+
+  xwl_send_selection_notify(xwl, xwl->selection_request.property);
+}
+
+static void xwl_send_data(struct xwl *xwl) {
+  int p[2];
+
+  if (!xwl->selection_data_offer || !xwl->selection_data_offer->utf8_text) {
+    xwl_send_selection_notify(xwl, XCB_ATOM_NONE);
+    return;
+  }
+
+  if (pipe2(p, O_CLOEXEC | O_NONBLOCK) == -1) {
+    fprintf(stderr, "pipe2 failed: %m\n");
+    xwl_send_selection_notify(xwl, XCB_ATOM_NONE);
+    return;
+  }
+
+  wl_array_init(&xwl->selection_data);
+  xwl->selection_data_offer_receive_fd = p[0];
+  xwl->selection_data_ack_pending = 0;
+
+  assert(!xwl->selection_event_source);
+  xwl->selection_event_source = wl_event_loop_add_fd(
+      wl_display_get_event_loop(xwl->host_display),
+      xwl->selection_data_offer_receive_fd, WL_EVENT_READABLE,
+      xwl_handle_selection_fd_readable, xwl);
+
+  wl_data_offer_receive(xwl->selection_data_offer->internal,
+                        "text/plain;charset=utf-8", p[1]);
+  close(p[1]);
+}
+
+static void xwl_handle_selection_request(struct xwl *xwl,
+                                         xcb_selection_request_event_t *event) {
+  xwl->selection_request = *event;
+  xwl->selection_incremental_transfer = 0;
+
+  if (event->selection == xwl->atoms[ATOM_CLIPBOARD_MANAGER].value) {
+    xwl_send_selection_notify(xwl, xwl->selection_request.property);
+    return;
+  }
+
+  if (event->target == xwl->atoms[ATOM_TARGETS].value) {
+    xwl_send_targets(xwl);
+  } else if (event->target == xwl->atoms[ATOM_TIMESTAMP].value) {
+    xwl_send_timestamp(xwl);
+  } else if (event->target == xwl->atoms[ATOM_UTF8_STRING].value ||
+             event->target == xwl->atoms[ATOM_TEXT].value) {
+    xwl_send_data(xwl);
+  } else {
+    xwl_send_selection_notify(xwl, XCB_ATOM_NONE);
+  }
+}
+
+static void
+xwl_handle_xfixes_selection_notify(struct xwl *xwl,
+                                   xcb_xfixes_selection_notify_event_t *event) {
+  if (event->selection != xwl->atoms[ATOM_CLIPBOARD].value)
+    return;
+
+  if (event->owner == XCB_WINDOW_NONE) {
+    // If client selection is gone. Set NULL selection for each seat.
+    if (xwl->selection_owner != xwl->selection_window) {
+      if (xwl->selection_data_device && xwl->default_seat) {
+        wl_data_device_set_selection(xwl->selection_data_device, NULL,
+                                     xwl->default_seat->seat->last_serial);
+      }
+    }
+    xwl->selection_owner = XCB_WINDOW_NONE;
+    return;
+  }
+
+  xwl->selection_owner = event->owner;
+
+  // Save timestamp if it's our selection.
+  if (event->owner == xwl->selection_window) {
+    xwl->selection_timestamp = event->timestamp;
+    return;
+  }
+
+  xwl->selection_incremental_transfer = 0;
+  xcb_convert_selection(xwl->connection, xwl->selection_window,
+                        xwl->atoms[ATOM_CLIPBOARD].value,
+                        xwl->atoms[ATOM_TARGETS].value,
+                        xwl->atoms[ATOM_WL_SELECTION].value, event->timestamp);
 }
 
 static int xwl_handle_x_connection_event(int fd, uint32_t mask, void *data) {
@@ -2676,9 +3268,21 @@ static int xwl_handle_x_connection_event(int fd, uint32_t mask, void *data) {
     case XCB_PROPERTY_NOTIFY:
       xwl_handle_property_notify(xwl, (xcb_property_notify_event_t *)event);
       break;
-    default:
+    case XCB_SELECTION_NOTIFY:
+      xwl_handle_selection_notify(xwl, (xcb_selection_notify_event_t *)event);
+      break;
+    case XCB_SELECTION_REQUEST:
+      xwl_handle_selection_request(xwl, (xcb_selection_request_event_t *)event);
       break;
     }
+
+    switch (event->response_type - xwl->xfixes_extension->first_event) {
+    case XCB_XFIXES_SELECTION_NOTIFY:
+      xwl_handle_xfixes_selection_notify(
+          xwl, (xcb_xfixes_selection_notify_event_t *)event);
+      break;
+    }
+
     free(event);
     ++count;
   }
@@ -2698,12 +3302,14 @@ static void xwl_connect(struct xwl *xwl) {
   xcb_generic_error_t *error;
   xcb_intern_atom_reply_t *atom_reply;
   xcb_depth_iterator_t depth_iterator;
+  xcb_xfixes_query_version_reply_t *xfixes_query_version_reply;
   const xcb_query_extension_reply_t *composite_extension;
   unsigned i;
 
   xwl->connection = xcb_connect_to_fd(xwl->wm_fd, NULL);
   assert(!xcb_connection_has_error(xwl->connection));
 
+  xcb_prefetch_extension_data(xwl->connection, &xcb_xfixes_id);
   xcb_prefetch_extension_data(xwl->connection, &xcb_composite_id);
 
   for (i = 0; i < ARRAY_SIZE(xwl->atoms); ++i) {
@@ -2726,6 +3332,19 @@ static void xwl_connect(struct xwl *xwl) {
   wl_event_loop_add_fd(wl_display_get_event_loop(xwl->host_display),
                        xcb_get_file_descriptor(xwl->connection),
                        WL_EVENT_READABLE, &xwl_handle_x_connection_event, xwl);
+
+  xwl->xfixes_extension =
+      xcb_get_extension_data(xwl->connection, &xcb_xfixes_id);
+  assert(xwl->xfixes_extension->present);
+
+  xfixes_query_version_reply = xcb_xfixes_query_version_reply(
+      xwl->connection,
+      xcb_xfixes_query_version(xwl->connection, XCB_XFIXES_MAJOR_VERSION,
+                               XCB_XFIXES_MINOR_VERSION),
+      NULL);
+  assert(xfixes_query_version_reply);
+  assert(xfixes_query_version_reply->major_version >= 5);
+  free(xfixes_query_version_reply);
 
   composite_extension =
       xcb_get_extension_data(xwl->connection, &xcb_composite_id);
@@ -2775,6 +3394,22 @@ static void xwl_connect(struct xwl *xwl) {
   }
   assert(xwl->visual_ids[xwl->screen->root_depth]);
 
+  values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE;
+  xwl->selection_window = xcb_generate_id(xwl->connection);
+  xcb_create_window(xwl->connection, XCB_COPY_FROM_PARENT,
+                    xwl->selection_window, xwl->screen->root, 0, 0, 1, 1, 0,
+                    XCB_WINDOW_CLASS_INPUT_OUTPUT, xwl->screen->root_visual,
+                    XCB_CW_EVENT_MASK, values);
+  xcb_set_selection_owner(xwl->connection, xwl->selection_window,
+                          xwl->atoms[ATOM_CLIPBOARD_MANAGER].value,
+                          XCB_CURRENT_TIME);
+  xcb_xfixes_select_selection_input(
+      xwl->connection, xwl->selection_window, xwl->atoms[ATOM_CLIPBOARD].value,
+      XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER |
+          XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
+          XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE);
+  xwl_set_selection(xwl, NULL);
+
   xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, xwl->window,
                       xwl->atoms[ATOM_NET_SUPPORTING_WM_CHECK].value,
                       XCB_ATOM_WINDOW, 32, 1, &xwl->window);
@@ -2787,6 +3422,7 @@ static void xwl_connect(struct xwl *xwl) {
                       XCB_ATOM_WINDOW, 32, 1, &xwl->window);
   xcb_set_selection_owner(xwl->connection, xwl->window,
                           xwl->atoms[ATOM_WM_S0].value, XCB_CURRENT_TIME);
+
   xcb_set_input_focus(xwl->connection, XCB_INPUT_FOCUS_NONE, XCB_NONE,
                       XCB_CURRENT_TIME);
   xcb_flush(xwl->connection);
@@ -2889,6 +3525,7 @@ int main(int argc, char **argv) {
       .compositor = NULL,
       .shm = NULL,
       .shell = NULL,
+      .data_device_manager = NULL,
       .xdg_shell = NULL,
       .aura_shell = NULL,
       .viewporter = NULL,
@@ -2898,6 +3535,7 @@ int main(int argc, char **argv) {
       .xwayland_pid = -1,
       .child_pid = -1,
       .connection = NULL,
+      .xfixes_extension = NULL,
       .screen = NULL,
       .window = 0,
       .host_focus_window = NULL,
@@ -2906,7 +3544,22 @@ int main(int argc, char **argv) {
       .scale = 1.0,
       .app_id = NULL,
       .exit_with_child = 1,
-      .net_wm_moveresize_seat = NULL,
+      .default_seat = NULL,
+      .selection_window = XCB_WINDOW_NONE,
+      .selection_owner = XCB_WINDOW_NONE,
+      .selection_incremental_transfer = 0,
+      .selection_request = {.requestor = XCB_NONE, .property = XCB_ATOM_NONE},
+      .selection_timestamp = XCB_CURRENT_TIME,
+      .selection_data_device = NULL,
+      .selection_data_offer = NULL,
+      .selection_data_source = NULL,
+      .selection_data_source_send_fd = -1,
+      .selection_send_event_source = NULL,
+      .selection_property_reply = NULL,
+      .selection_property_offset = 0,
+      .selection_event_source = NULL,
+      .selection_data_offer_receive_fd = -1,
+      .selection_data_ack_pending = 0,
       .atoms =
           {
                   [ATOM_WM_S0] = {"WM_S0"},
@@ -2927,6 +3580,12 @@ int main(int argc, char **argv) {
                       {"_NET_WM_STATE_MAXIMIZED_VERT"},
                   [ATOM_NET_WM_STATE_MAXIMIZED_HORZ] =
                       {"_NET_WM_STATE_MAXIMIZED_HORZ"},
+                  [ATOM_CLIPBOARD] = {"CLIPBOARD"},
+                  [ATOM_CLIPBOARD_MANAGER] = {"CLIPBOARD_MANAGER"},
+                  [ATOM_TARGETS] = {"TARGETS"},
+                  [ATOM_TIMESTAMP] = {"TIMESTAMP"}, [ATOM_TEXT] = {"TEXT"},
+                  [ATOM_INCR] = {"INCR"},
+                  [ATOM_WL_SELECTION] = {"_WL_SELECTION"},
           },
       .visual_ids = {0},
       .colormaps = {0}};
