@@ -2215,8 +2215,8 @@ static void xwl_handle_unmap_notify(struct xwl *xwl,
 static void xwl_handle_configure_request(struct xwl *xwl,
                                          xcb_configure_request_event_t *event) {
   struct xwl_window *window = xwl_lookup_window(xwl, event->window);
-  int x = window->x;
-  int y = window->y;
+  int width = window->width;
+  int height = window->height;
   uint32_t values[5];
 
   assert(!xwl_is_our_window(xwl, event->window));
@@ -2245,14 +2245,12 @@ static void xwl_handle_configure_request(struct xwl *xwl,
   if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
     window->height = event->height;
 
-  window->border_width = 0;
-
   // Keep all managed windows centered horizontally/vertically.
-  x = xwl->screen->width_in_pixels / 2 - window->width / 2;
-  y = xwl->screen->height_in_pixels / 2 - window->height / 2;
+  window->x = xwl->screen->width_in_pixels / 2 - window->width / 2;
+  window->y = xwl->screen->height_in_pixels / 2 - window->height / 2;
 
-  values[0] = x;
-  values[1] = y;
+  values[0] = window->x;
+  values[1] = window->y;
   values[2] = window->width;
   values[3] = window->height;
   values[4] = 0;
@@ -2260,14 +2258,18 @@ static void xwl_handle_configure_request(struct xwl *xwl,
                        XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
                            XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
                        values);
-  xcb_configure_window(xwl->connection, window->id,
-                       XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
-                           XCB_CONFIG_WINDOW_BORDER_WIDTH,
-                       &values[2]);
 
-  if (x != window->x || y != window->y) {
-    window->x = x;
-    window->y = y;
+  // We need to send a synthetic configure notify if:
+  // - Not changing the size, location, border width.
+  // - Moving the window without resizing it or changing its border width.
+  if (width != window->width || height != window->height ||
+      window->border_width) {
+    xcb_configure_window(xwl->connection, window->id,
+                         XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
+                             XCB_CONFIG_WINDOW_BORDER_WIDTH,
+                         &values[2]);
+    window->border_width = 0;
+  } else {
     xwl_send_configure_notify(window);
   }
 }
