@@ -621,19 +621,7 @@ static void xwl_window_update(struct xwl_window *window) {
   assert(xwl->xdg_shell);
   assert(xwl->xdg_shell->internal);
 
-  if (!window->managed) {
-    struct xwl_window *sibling;
-
-    wl_list_for_each(sibling, &xwl->windows, link) {
-      if (sibling->realized)
-        parent = sibling;
-
-      // Any parent will do but prefer focus window when possible.
-      if (parent && sibling->id == xwl->focus_window)
-        break;
-    }
-    frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
-  } else {
+  if (window->managed) {
     if (!app_id)
       app_id = window->clazz;
 
@@ -651,6 +639,18 @@ static void xwl_window_update(struct xwl_window *window) {
 
     if (!window->decorated)
       frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
+  } else {
+    struct xwl_window *sibling;
+
+    wl_list_for_each(sibling, &xwl->windows, link) {
+      if (sibling->realized)
+        parent = sibling;
+
+      // Any parent will do but prefer focus window when possible.
+      if (parent && sibling->id == xwl->focus_window)
+        break;
+    }
+    frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
   }
 
   window->xdg_surface = zxdg_shell_v6_get_xdg_surface(xwl->xdg_shell->internal,
@@ -665,7 +665,19 @@ static void xwl_window_update(struct xwl_window *window) {
     zaura_surface_set_frame(window->aura_surface, frame_type);
   }
 
-  if (!window->managed && parent) {
+  if (window->managed || !parent) {
+    window->xdg_toplevel = zxdg_surface_v6_get_toplevel(window->xdg_surface);
+    zxdg_toplevel_v6_set_user_data(window->xdg_toplevel, window);
+    zxdg_toplevel_v6_add_listener(window->xdg_toplevel,
+                                  &xwl_xdg_toplevel_listener, window);
+
+    if (parent)
+      zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
+    if (window->name)
+      zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
+    if (app_id)
+      zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
+  } else {
     struct zxdg_positioner_v6 *positioner;
 
     positioner = zxdg_shell_v6_create_positioner(xwl->xdg_shell->internal);
@@ -687,18 +699,6 @@ static void xwl_window_update(struct xwl_window *window) {
                                window);
 
     zxdg_positioner_v6_destroy(positioner);
-  } else {
-    window->xdg_toplevel = zxdg_surface_v6_get_toplevel(window->xdg_surface);
-    zxdg_toplevel_v6_set_user_data(window->xdg_toplevel, window);
-    zxdg_toplevel_v6_add_listener(window->xdg_toplevel,
-                                  &xwl_xdg_toplevel_listener, window);
-
-    if (parent)
-      zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
-    if (window->name)
-      zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
-    if (app_id)
-      zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
   }
 
   wl_surface_commit(host_surface->proxy);
