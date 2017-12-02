@@ -593,7 +593,7 @@ static void xwl_window_update(struct xwl_window *window) {
   struct xwl_host_surface *host_surface;
   struct xwl *xwl = window->xwl;
   struct xwl_window *parent = NULL;
-  const char *app_id = xwl->app_id;
+  const char *app_id = NULL;
 
   if (window->host_surface_id) {
     host_resource = wl_client_get_object(xwl->client, window->host_surface_id);
@@ -635,8 +635,7 @@ static void xwl_window_update(struct xwl_window *window) {
   assert(xwl->xdg_shell->internal);
 
   if (window->managed) {
-    if (!app_id)
-      app_id = window->clazz;
+    app_id = xwl->app_id ? xwl->app_id : window->clazz;
 
     if (window->transient_for != XCB_WINDOW_NONE) {
       struct xwl_window *sibling;
