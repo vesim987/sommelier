@@ -340,6 +340,20 @@ static void xwl_send_configure_notify(struct xwl_window *window) {
                  XCB_EVENT_MASK_STRUCTURE_NOTIFY, (char *)&event);
 }
 
+static void
+xwl_adjust_window_geometry_for_screen_size(struct xwl_window *window) {
+  struct xwl *xwl = window->xwl;
+
+  // Clamp size to screen.
+  window->width = MIN(window->width, xwl->screen->width_in_pixels);
+  window->height = MIN(window->height, xwl->screen->height_in_pixels);
+  // Center horizontally/vertically.
+  window->x = xwl->screen->width_in_pixels / 2 - window->width / 2;
+  window->y = xwl->screen->height_in_pixels / 2 - window->height / 2;
+  // Remove border.
+  window->border_width = 0;
+}
+
 static void xwl_configure_window(struct xwl_window *window) {
   assert(!window->pending_config.serial);
 
@@ -2078,17 +2092,13 @@ static void xwl_handle_map_request(struct xwl *xwl,
   geometry_reply =
       xcb_get_geometry_reply(xwl->connection, geometry_cookie, NULL);
   if (geometry_reply) {
-    window->x = geometry_reply->x;
-    window->y = geometry_reply->y;
     window->width = geometry_reply->width;
     window->height = geometry_reply->height;
     depth = geometry_reply->depth;
     free(geometry_reply);
   }
 
-  // Keep all managed windows centered horizontally/vertically.
-  window->x = xwl->screen->width_in_pixels / 2 - window->width / 2;
-  window->y = xwl->screen->height_in_pixels / 2 - window->height / 2;
+  xwl_adjust_window_geometry_for_screen_size(window);
 
   if (window->name) {
     free(window->name);
@@ -2151,20 +2161,22 @@ static void xwl_handle_map_request(struct xwl *xwl,
     free(reply);
   }
 
+  values[0] = window->width;
+  values[1] = window->height;
+  values[2] = 0;
+  xcb_configure_window(xwl->connection, window->id,
+                       XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
+                           XCB_CONFIG_WINDOW_BORDER_WIDTH,
+                       values);
+  values[0] = 0;
+  values[1] = 0;
+  values[2] = window->decorated ? CAPTION_HEIGHT * xwl->scale : 0;
+  values[3] = 0;
+  xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, window->id,
+                      xwl->atoms[ATOM_NET_FRAME_EXTENTS].value,
+                      XCB_ATOM_CARDINAL, 32, 4, values);
+
   if (window->frame_id == XCB_WINDOW_NONE) {
-    values[0] = 0;
-    xcb_configure_window(xwl->connection, window->id,
-                         XCB_CONFIG_WINDOW_BORDER_WIDTH, values);
-    window->border_width = 0;
-
-    values[0] = 0;
-    values[1] = 0;
-    values[2] = window->decorated ? CAPTION_HEIGHT * xwl->scale : 0;
-    values[3] = 0;
-    xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, window->id,
-                        xwl->atoms[ATOM_NET_FRAME_EXTENTS].value,
-                        XCB_ATOM_CARDINAL, 32, 4, values);
-
     values[0] = xwl->screen->black_pixel;
     values[1] = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
                 XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
@@ -2182,8 +2194,12 @@ static void xwl_handle_map_request(struct xwl *xwl,
 
     values[0] = window->x;
     values[1] = window->y;
+    values[2] = window->width;
+    values[3] = window->height;
     xcb_configure_window(xwl->connection, window->frame_id,
-                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                             XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                         values);
   }
 
   xwl_window_set_wm_state(window, WM_STATE_NORMAL);
@@ -2282,9 +2298,7 @@ static void xwl_handle_configure_request(struct xwl *xwl,
   if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
     window->height = event->height;
 
-  // Keep all managed windows centered horizontally/vertically.
-  window->x = xwl->screen->width_in_pixels / 2 - window->width / 2;
-  window->y = xwl->screen->height_in_pixels / 2 - window->height / 2;
+  xwl_adjust_window_geometry_for_screen_size(window);
 
   values[0] = window->x;
   values[1] = window->y;
