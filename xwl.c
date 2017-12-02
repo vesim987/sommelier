@@ -593,7 +593,6 @@ static void xwl_window_update(struct xwl_window *window) {
   struct xwl_host_surface *host_surface;
   struct xwl *xwl = window->xwl;
   struct xwl_window *parent = NULL;
-  uint32_t frame_type = ZAURA_SURFACE_FRAME_TYPE_NORMAL;
   const char *app_id = xwl->app_id;
 
   if (window->host_surface_id) {
@@ -650,9 +649,6 @@ static void xwl_window_update(struct xwl_window *window) {
         }
       }
     }
-
-    if (!window->decorated)
-      frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
   } else {
     struct xwl_window *sibling;
 
@@ -664,7 +660,6 @@ static void xwl_window_update(struct xwl_window *window) {
       if (parent && sibling->id == xwl->focus_window)
         break;
     }
-    frame_type = ZAURA_SURFACE_FRAME_TYPE_SHADOW;
   }
 
   window->xdg_surface = zxdg_shell_v6_get_xdg_surface(xwl->xdg_shell->internal,
@@ -676,7 +671,10 @@ static void xwl_window_update(struct xwl_window *window) {
   if (xwl->aura_shell) {
     window->aura_surface = zaura_shell_get_aura_surface(
         xwl->aura_shell->internal, host_surface->proxy);
-    zaura_surface_set_frame(window->aura_surface, frame_type);
+    zaura_surface_set_frame(window->aura_surface,
+                            window->decorated
+                                ? ZAURA_SURFACE_FRAME_TYPE_NORMAL
+                                : ZAURA_SURFACE_FRAME_TYPE_SHADOW);
   }
 
   if (window->managed || !parent) {
