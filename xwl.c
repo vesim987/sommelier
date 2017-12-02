@@ -608,10 +608,15 @@ static void xwl_window_update(struct xwl_window *window) {
     window->unpaired = 1;
   }
 
+  if (window->xdg_popup) {
+    zxdg_popup_v6_destroy(window->xdg_popup);
+    window->xdg_popup = NULL;
+  }
+
   if (!host_resource) {
-    if (window->xdg_popup) {
-      zxdg_popup_v6_destroy(window->xdg_popup);
-      window->xdg_popup = NULL;
+    if (window->aura_surface) {
+      zaura_surface_destroy(window->aura_surface);
+      window->aura_surface = NULL;
     }
     if (window->xdg_toplevel) {
       zxdg_toplevel_v6_destroy(window->xdg_toplevel);
@@ -624,7 +629,8 @@ static void xwl_window_update(struct xwl_window *window) {
     return;
   }
 
-  if (window->xdg_surface)
+  // Top level windows can't be updated once paired.
+  if (window->xdg_toplevel)
     return;
 
   host_surface = wl_resource_get_user_data(host_resource);
@@ -661,6 +667,8 @@ static void xwl_window_update(struct xwl_window *window) {
     }
   }
 
+  if (window->xdg_surface)
+    zxdg_surface_v6_destroy(window->xdg_surface);
   window->xdg_surface = zxdg_shell_v6_get_xdg_surface(xwl->xdg_shell->internal,
                                                       host_surface->proxy);
   zxdg_surface_v6_set_user_data(window->xdg_surface, window);
@@ -668,6 +676,8 @@ static void xwl_window_update(struct xwl_window *window) {
                                window);
 
   if (xwl->aura_shell) {
+    if (window->aura_surface)
+      zaura_surface_destroy(window->aura_surface);
     window->aura_surface = zaura_shell_get_aura_surface(
         xwl->aura_shell->internal, host_surface->proxy);
     zaura_surface_set_frame(window->aura_surface,
@@ -681,7 +691,6 @@ static void xwl_window_update(struct xwl_window *window) {
     zxdg_toplevel_v6_set_user_data(window->xdg_toplevel, window);
     zxdg_toplevel_v6_add_listener(window->xdg_toplevel,
                                   &xwl_xdg_toplevel_listener, window);
-
     if (parent)
       zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
     if (window->name)
@@ -2336,11 +2345,14 @@ static void xwl_handle_configure_notify(struct xwl *xwl,
   if (window->managed)
     return;
 
-  window->x = event->x;
-  window->y = event->y;
   window->width = event->width;
   window->height = event->height;
   window->border_width = event->border_width;
+  if (event->x != window->x || event->y != window->y) {
+    window->x = event->x;
+    window->y = event->y;
+    xwl_window_update(window);
+  }
 }
 
 static uint32_t xwl_resize_edge(int net_wm_moveresize_size) {
