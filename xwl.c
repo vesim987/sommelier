@@ -193,7 +193,8 @@ struct xwl_window {
   int width;
   int height;
   int border_width;
-  int override_redirect;
+  int managed;
+  int realized;
   int activated;
   xcb_window_t transient_for;
   int decorated;
@@ -353,6 +354,7 @@ static void xwl_configure_window(struct xwl_window *window) {
     if (window->next_config.mask & XCB_CONFIG_WINDOW_Y)
       y = window->next_config.values[i++];
 
+    assert(window->managed);
     xcb_configure_window(window->xwl->connection, window->id,
                          window->next_config.mask &
                              ~(XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y),
@@ -372,10 +374,12 @@ static void xwl_configure_window(struct xwl_window *window) {
     }
   }
 
-  xcb_change_property(window->xwl->connection, XCB_PROP_MODE_REPLACE,
-                      window->id, window->xwl->atoms[ATOM_NET_WM_STATE].value,
-                      XCB_ATOM_ATOM, 32, window->next_config.states_length,
-                      window->next_config.states);
+  if (window->managed) {
+    xcb_change_property(window->xwl->connection, XCB_PROP_MODE_REPLACE,
+                        window->id, window->xwl->atoms[ATOM_NET_WM_STATE].value,
+                        XCB_ATOM_ATOM, 32, window->next_config.states_length,
+                        window->next_config.states);
+  }
 
   window->pending_config = window->next_config;
   window->next_config.serial = 0;
@@ -397,7 +401,7 @@ static void xwl_set_input_focus(struct xwl *xwl, struct xwl_window *window) {
     };
     uint32_t values[1];
 
-    if (window->override_redirect)
+    if (!window->managed)
       return;
 
     xcb_send_event(xwl->connection, 0, window->id,
@@ -421,9 +425,11 @@ xwl_process_pending_configure_acks(struct xwl_window *window,
   if (!window->pending_config.serial)
     return 0;
 
-  if (host_surface) {
+  if (window->managed && host_surface) {
     int width = window->width + window->border_width * 2;
     int height = window->height + window->border_width * 2;
+    // Early out if we expect contents to match window size at some point in
+    // the future.
     if (width != host_surface->contents_width ||
         height != host_surface->contents_height) {
       return 0;
@@ -477,6 +483,9 @@ static void xwl_xdg_toplevel_configure(void *data,
   int activated = 0;
   uint32_t *state;
   int i = 0;
+
+  if (!window->managed)
+    return;
 
   if (width && height) {
     int32_t width_in_pixels = width * window->xwl->scale;
@@ -605,15 +614,16 @@ static void xwl_window_update(struct xwl_window *window) {
 
   host_surface = wl_resource_get_user_data(host_resource);
   assert(host_surface);
+  assert(!host_surface->is_cursor);
 
   assert(xwl->xdg_shell);
   assert(xwl->xdg_shell->internal);
 
-  if (window->override_redirect) {
+  if (!window->managed) {
     struct xwl_window *sibling;
 
     wl_list_for_each(sibling, &xwl->windows, link) {
-      if (sibling->xdg_toplevel || sibling->xdg_popup)
+      if (sibling->realized)
         parent = sibling;
 
       // Any parent will do but prefer focus window when possible.
@@ -653,7 +663,7 @@ static void xwl_window_update(struct xwl_window *window) {
     zaura_surface_set_frame(window->aura_surface, frame_type);
   }
 
-  if (window->override_redirect && parent) {
+  if (!window->managed && parent) {
     struct zxdg_positioner_v6 *positioner;
 
     positioner = zxdg_shell_v6_create_positioner(xwl->xdg_shell->internal);
@@ -689,8 +699,9 @@ static void xwl_window_update(struct xwl_window *window) {
       zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
   }
 
-  host_surface->is_cursor = 0;
   wl_surface_commit(host_surface->proxy);
+  if (host_surface->contents_width && host_surface->contents_height)
+    window->realized = 1;
 }
 
 static void xwl_host_surface_destroy(struct wl_client *client,
@@ -823,6 +834,8 @@ static void xwl_host_surface_commit(struct wl_client *client,
     if (window->host_surface_id == wl_resource_get_id(resource)) {
       if (window->xdg_surface) {
         wl_surface_commit(host->proxy);
+        if (host->contents_width && host->contents_height)
+          window->realized = 1;
       }
       break;
     }
@@ -1866,8 +1879,7 @@ static int xwl_handle_event(int fd, uint32_t mask, void *data) {
 }
 
 static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
-                              int width, int height, int border_width,
-                              int override_redirect) {
+                              int width, int height, int border_width) {
   struct xwl_window *window = malloc(sizeof(struct xwl_window));
   assert(window);
   window->xwl = xwl;
@@ -1880,7 +1892,8 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
   window->width = width;
   window->height = height;
   window->border_width = border_width;
-  window->override_redirect = override_redirect;
+  window->managed = 0;
+  window->realized = 0;
   window->activated = 0;
   window->transient_for = XCB_WINDOW_NONE;
   window->decorated = 0;
@@ -1897,17 +1910,10 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
   window->pending_config.mask = 0;
   window->pending_config.states_length = 0;
   wl_list_insert(&xwl->unpaired_windows, &window->link);
-  if (!override_redirect) {
-    uint32_t values[1];
-
-    values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_FOCUS_CHANGE;
-    xcb_change_window_attributes(xwl->connection, window->id, XCB_CW_EVENT_MASK,
-                                 values);
-  }
 }
 
 static void xwl_destroy_window(struct xwl_window *window) {
-  if (window->frame_id)
+  if (window->frame_id != XCB_WINDOW_NONE)
     xcb_destroy_window(window->xwl->connection, window->frame_id);
 
   if (window->xwl->host_focus_window == window) {
@@ -1973,8 +1979,7 @@ static void xwl_handle_create_notify(struct xwl *xwl,
     return;
 
   xwl_create_window(xwl, event->window, event->x, event->y, event->width,
-                    event->height, event->border_width,
-                    event->override_redirect);
+                    event->height, event->border_width);
 }
 
 static void xwl_handle_destroy_notify(struct xwl *xwl,
@@ -2010,7 +2015,7 @@ static void xwl_handle_reparent_notify(struct xwl *xwl,
       free(geometry_reply);
     }
     xwl_create_window(xwl, event->window, event->x, event->y, width, height,
-                      border_width, event->override_redirect);
+                      border_width);
     return;
   }
 
@@ -2045,12 +2050,18 @@ static void xwl_handle_map_request(struct xwl *xwl,
     int32_t input_mode;
     uint32_t status;
   } mwm_hints = {0};
+  uint32_t values[4];
   int i;
 
   if (!window)
     return;
 
   assert(!xwl_is_our_window(xwl, event->window));
+
+  window->managed = 1;
+  values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_FOCUS_CHANGE;
+  xcb_change_window_attributes(xwl->connection, window->id, XCB_CW_EVENT_MASK,
+                               values);
 
   if (window->frame_id == XCB_WINDOW_NONE)
     geometry_cookie = xcb_get_geometry(xwl->connection, window->id);
@@ -2073,6 +2084,10 @@ static void xwl_handle_map_request(struct xwl *xwl,
     geometry_reply =
         xcb_get_geometry_reply(xwl->connection, geometry_cookie, NULL);
     if (geometry_reply) {
+      window->x = geometry_reply->x;
+      window->y = geometry_reply->y;
+      window->width = geometry_reply->width;
+      window->height = geometry_reply->height;
       depth = geometry_reply->depth;
       free(geometry_reply);
     }
@@ -2208,7 +2223,7 @@ static void xwl_handle_unmap_notify(struct xwl *xwl,
 
   xwl_window_set_wm_state(window, WM_STATE_WITHDRAWN);
 
-  if (window->frame_id)
+  if (window->frame_id != XCB_WINDOW_NONE)
     xcb_unmap_window(xwl->connection, window->frame_id);
 }
 
@@ -2217,13 +2232,36 @@ static void xwl_handle_configure_request(struct xwl *xwl,
   struct xwl_window *window = xwl_lookup_window(xwl, event->window);
   int width = window->width;
   int height = window->height;
-  uint32_t values[5];
+  uint32_t values[7];
 
   assert(!xwl_is_our_window(xwl, event->window));
 
+  if (!window->managed) {
+    int i = 0;
+
+    if (event->value_mask & XCB_CONFIG_WINDOW_X)
+      values[i++] = event->x;
+    if (event->value_mask & XCB_CONFIG_WINDOW_Y)
+      values[i++] = event->y;
+    if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH)
+      values[i++] = event->width;
+    if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
+      values[i++] = event->height;
+    if (event->value_mask & XCB_CONFIG_WINDOW_BORDER_WIDTH)
+      values[i++] = event->border_width;
+    if (event->value_mask & XCB_CONFIG_WINDOW_SIBLING)
+      values[i++] = event->sibling;
+    if (event->value_mask & XCB_CONFIG_WINDOW_STACK_MODE)
+      values[i++] = event->stack_mode;
+
+    xcb_configure_window(xwl->connection, window->id, event->value_mask,
+                         values);
+    return;
+  }
+
   // Ack configure events as satisfying request removes the guarantee
   // that matching contents will arrive.
-  if (window && window->xdg_toplevel) {
+  if (window->xdg_toplevel) {
     if (window->pending_config.serial) {
       zxdg_surface_v6_ack_configure(window->xdg_surface,
                                     window->pending_config.serial);
@@ -2285,7 +2323,7 @@ static void xwl_handle_configure_notify(struct xwl *xwl,
   if (!window)
     return;
 
-  if (!window->override_redirect)
+  if (window->managed)
     return;
 
   window->x = event->x;
