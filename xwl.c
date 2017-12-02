@@ -307,6 +307,8 @@ enum {
 
 #define SEND_EVENT_MASK 0x80
 
+#define CAPTION_HEIGHT 32
+
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 
@@ -2042,6 +2044,7 @@ static void xwl_handle_map_request(struct xwl *xwl,
       {PROPERTY_MOTIF_WM_HINTS, xwl->atoms[ATOM_MOTIF_WM_HINTS].value},
   };
   xcb_get_geometry_cookie_t geometry_cookie;
+  xcb_get_geometry_reply_t *geometry_reply;
   xcb_get_property_cookie_t property_cookies[ARRAY_SIZE(properties)];
   struct xwl_mwm_hints {
     uint32_t flags;
@@ -2050,6 +2053,7 @@ static void xwl_handle_map_request(struct xwl *xwl,
     int32_t input_mode;
     uint32_t status;
   } mwm_hints = {0};
+  int depth = xwl->screen->root_depth;
   uint32_t values[4];
   int i;
 
@@ -2063,8 +2067,7 @@ static void xwl_handle_map_request(struct xwl *xwl,
   xcb_change_window_attributes(xwl->connection, window->id, XCB_CW_EVENT_MASK,
                                values);
 
-  if (window->frame_id == XCB_WINDOW_NONE)
-    geometry_cookie = xcb_get_geometry(xwl->connection, window->id);
+  geometry_cookie = xcb_get_geometry(xwl->connection, window->id);
 
   for (i = 0; i < ARRAY_SIZE(properties); ++i) {
     property_cookies[i] =
@@ -2072,59 +2075,20 @@ static void xwl_handle_map_request(struct xwl *xwl,
                          XCB_ATOM_ANY, 0, 2048);
   }
 
+  geometry_reply =
+      xcb_get_geometry_reply(xwl->connection, geometry_cookie, NULL);
+  if (geometry_reply) {
+    window->x = geometry_reply->x;
+    window->y = geometry_reply->y;
+    window->width = geometry_reply->width;
+    window->height = geometry_reply->height;
+    depth = geometry_reply->depth;
+    free(geometry_reply);
+  }
+
   // Keep all managed windows centered horizontally/vertically.
   window->x = xwl->screen->width_in_pixels / 2 - window->width / 2;
   window->y = xwl->screen->height_in_pixels / 2 - window->height / 2;
-
-  if (window->frame_id == XCB_WINDOW_NONE) {
-    xcb_get_geometry_reply_t *geometry_reply;
-    int depth = xwl->screen->root_depth;
-    uint32_t values[4];
-
-    geometry_reply =
-        xcb_get_geometry_reply(xwl->connection, geometry_cookie, NULL);
-    if (geometry_reply) {
-      window->x = geometry_reply->x;
-      window->y = geometry_reply->y;
-      window->width = geometry_reply->width;
-      window->height = geometry_reply->height;
-      depth = geometry_reply->depth;
-      free(geometry_reply);
-    }
-
-    values[0] = 0;
-    xcb_configure_window(xwl->connection, window->id,
-                         XCB_CONFIG_WINDOW_BORDER_WIDTH, values);
-    window->border_width = 0;
-
-    values[0] = 0;
-    values[1] = 0;
-    values[2] = 32 * xwl->scale;
-    values[3] = 0;
-    xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, window->id,
-                        xwl->atoms[ATOM_NET_FRAME_EXTENTS].value,
-                        XCB_ATOM_CARDINAL, 32, 4, values);
-
-    values[0] = xwl->screen->black_pixel;
-    values[1] = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
-                XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
-    values[2] = xwl->colormaps[depth];
-
-    window->frame_id = xcb_generate_id(xwl->connection);
-    xcb_create_window(
-        xwl->connection, depth, window->frame_id, xwl->screen->root, window->x,
-        window->y, window->width, window->height, 0,
-        XCB_WINDOW_CLASS_INPUT_OUTPUT, xwl->visual_ids[depth],
-        XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, values);
-    xcb_reparent_window(xwl->connection, window->id, window->frame_id, 0, 0);
-  } else {
-    uint32_t values[2];
-
-    values[0] = window->x;
-    values[1] = window->y;
-    xcb_configure_window(xwl->connection, window->frame_id,
-                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
-  }
 
   if (window->name) {
     free(window->name);
@@ -2185,6 +2149,41 @@ static void xwl_handle_map_request(struct xwl *xwl,
       break;
     }
     free(reply);
+  }
+
+  if (window->frame_id == XCB_WINDOW_NONE) {
+    values[0] = 0;
+    xcb_configure_window(xwl->connection, window->id,
+                         XCB_CONFIG_WINDOW_BORDER_WIDTH, values);
+    window->border_width = 0;
+
+    values[0] = 0;
+    values[1] = 0;
+    values[2] = window->decorated ? CAPTION_HEIGHT * xwl->scale : 0;
+    values[3] = 0;
+    xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, window->id,
+                        xwl->atoms[ATOM_NET_FRAME_EXTENTS].value,
+                        XCB_ATOM_CARDINAL, 32, 4, values);
+
+    values[0] = xwl->screen->black_pixel;
+    values[1] = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
+                XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
+    values[2] = xwl->colormaps[depth];
+
+    window->frame_id = xcb_generate_id(xwl->connection);
+    xcb_create_window(
+        xwl->connection, depth, window->frame_id, xwl->screen->root, window->x,
+        window->y, window->width, window->height, 0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT, xwl->visual_ids[depth],
+        XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, values);
+    xcb_reparent_window(xwl->connection, window->id, window->frame_id, 0, 0);
+  } else {
+    uint32_t values[2];
+
+    values[0] = window->x;
+    values[1] = window->y;
+    xcb_configure_window(xwl->connection, window->frame_id,
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
   }
 
   xwl_window_set_wm_state(window, WM_STATE_NORMAL);
