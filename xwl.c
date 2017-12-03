@@ -102,11 +102,13 @@ struct xwl_host_output {
   struct xwl_output *output;
   struct wl_resource *resource;
   struct wl_output *proxy;
+  struct zaura_output *aura_output;
   uint32_t flags;
   int width;
   int height;
   int refresh;
-  int scale;
+  double scale;
+  double max_scale;
 };
 
 struct xwl_output {
@@ -165,6 +167,7 @@ struct xwl_xdg_shell {
 struct xwl_aura_shell {
   struct xwl *xwl;
   uint32_t id;
+  uint32_t version;
   struct zaura_shell *internal;
 };
 
@@ -200,6 +203,7 @@ struct xwl_window {
   int decorated;
   char *name;
   char *clazz;
+  uint32_t size_flags;
   struct xwl_config next_config;
   struct xwl_config pending_config;
   struct zxdg_surface_v6 *xdg_surface;
@@ -271,8 +275,20 @@ enum {
   PROPERTY_WM_NAME,
   PROPERTY_WM_CLASS,
   PROPERTY_WM_TRANSIENT_FOR,
+  PROPERTY_WM_NORMAL_HINTS,
   PROPERTY_MOTIF_WM_HINTS,
 };
+
+#define US_POSITION (1L << 0)
+#define US_SIZE (1L << 1)
+#define P_POSITION (1L << 2)
+#define P_SIZE (1L << 3)
+#define P_MIN_SIZE (1L << 4)
+#define P_MAX_SIZE (1L << 5)
+#define P_RESIZE_INC (1L << 6)
+#define P_ASPECT (1L << 7)
+#define P_BASE_SIZE (1L << 8)
+#define P_WIN_GRAVITY (1L << 9)
 
 #define MWM_HINTS_FUNCTIONS (1L << 0)
 #define MWM_HINTS_DECORATIONS (1L << 1)
@@ -310,6 +326,7 @@ enum {
 #define CAPTION_HEIGHT 32
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 
 static void xwl_xdg_shell_ping(void *data, struct zxdg_shell_v6 *xdg_shell,
@@ -340,18 +357,21 @@ static void xwl_send_configure_notify(struct xwl_window *window) {
                  XCB_EVENT_MASK_STRUCTURE_NOTIFY, (char *)&event);
 }
 
-static void
-xwl_adjust_window_geometry_for_screen_size(struct xwl_window *window) {
+static void xwl_adjust_window_size_for_screen_size(struct xwl_window *window) {
   struct xwl *xwl = window->xwl;
 
   // Clamp size to screen.
   window->width = MIN(window->width, xwl->screen->width_in_pixels);
   window->height = MIN(window->height, xwl->screen->height_in_pixels);
+}
+
+static void
+xwl_adjust_window_position_for_screen_size(struct xwl_window *window) {
+  struct xwl *xwl = window->xwl;
+
   // Center horizontally/vertically.
   window->x = xwl->screen->width_in_pixels / 2 - window->width / 2;
   window->y = xwl->screen->height_in_pixels / 2 - window->height / 2;
-  // Remove border.
-  window->border_width = 0;
 }
 
 static void xwl_configure_window(struct xwl_window *window) {
@@ -506,17 +526,21 @@ static void xwl_xdg_toplevel_configure(void *data,
   if (width && height) {
     int32_t width_in_pixels = width * window->xwl->scale;
     int32_t height_in_pixels = height * window->xwl->scale;
+    int i = 0;
 
-    window->next_config.mask =
-        XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH |
-        XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_BORDER_WIDTH;
-    window->next_config.values[0] =
-        window->xwl->screen->width_in_pixels / 2 - width_in_pixels / 2;
-    window->next_config.values[1] =
-        window->xwl->screen->height_in_pixels / 2 - height_in_pixels / 2;
-    window->next_config.values[2] = width_in_pixels;
-    window->next_config.values[3] = height_in_pixels;
-    window->next_config.values[4] = 0;
+    window->next_config.mask = XCB_CONFIG_WINDOW_WIDTH |
+                               XCB_CONFIG_WINDOW_HEIGHT |
+                               XCB_CONFIG_WINDOW_BORDER_WIDTH;
+    if (!(window->size_flags & (US_POSITION | P_POSITION))) {
+      window->next_config.mask |= XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y;
+      window->next_config.values[i++] =
+          window->xwl->screen->width_in_pixels / 2 - width_in_pixels / 2;
+      window->next_config.values[i++] =
+          window->xwl->screen->height_in_pixels / 2 - height_in_pixels / 2;
+    }
+    window->next_config.values[i++] = width_in_pixels;
+    window->next_config.values[i++] = height_in_pixels;
+    window->next_config.values[i++] = 0;
   }
 
   wl_array_for_each(state, states) {
@@ -608,11 +632,6 @@ static void xwl_window_update(struct xwl_window *window) {
     window->unpaired = 1;
   }
 
-  if (window->xdg_popup) {
-    zxdg_popup_v6_destroy(window->xdg_popup);
-    window->xdg_popup = NULL;
-  }
-
   if (!host_resource) {
     if (window->aura_surface) {
       zaura_surface_destroy(window->aura_surface);
@@ -622,16 +641,16 @@ static void xwl_window_update(struct xwl_window *window) {
       zxdg_toplevel_v6_destroy(window->xdg_toplevel);
       window->xdg_toplevel = NULL;
     }
+    if (window->xdg_popup) {
+      zxdg_popup_v6_destroy(window->xdg_popup);
+      window->xdg_popup = NULL;
+    }
     if (window->xdg_surface) {
       zxdg_surface_v6_destroy(window->xdg_surface);
       window->xdg_surface = NULL;
     }
     return;
   }
-
-  // Top level windows can't be updated once paired.
-  if (window->xdg_toplevel)
-    return;
 
   host_surface = wl_resource_get_user_data(host_resource);
   assert(host_surface);
@@ -667,19 +686,19 @@ static void xwl_window_update(struct xwl_window *window) {
     }
   }
 
-  if (window->xdg_surface)
-    zxdg_surface_v6_destroy(window->xdg_surface);
-  window->xdg_surface = zxdg_shell_v6_get_xdg_surface(xwl->xdg_shell->internal,
-                                                      host_surface->proxy);
-  zxdg_surface_v6_set_user_data(window->xdg_surface, window);
-  zxdg_surface_v6_add_listener(window->xdg_surface, &xwl_xdg_surface_listener,
-                               window);
+  if (!window->xdg_surface) {
+    window->xdg_surface = zxdg_shell_v6_get_xdg_surface(
+        xwl->xdg_shell->internal, host_surface->proxy);
+    zxdg_surface_v6_set_user_data(window->xdg_surface, window);
+    zxdg_surface_v6_add_listener(window->xdg_surface, &xwl_xdg_surface_listener,
+                                 window);
+  }
 
   if (xwl->aura_shell) {
-    if (window->aura_surface)
-      zaura_surface_destroy(window->aura_surface);
-    window->aura_surface = zaura_shell_get_aura_surface(
-        xwl->aura_shell->internal, host_surface->proxy);
+    if (!window->aura_surface) {
+      window->aura_surface = zaura_shell_get_aura_surface(
+          xwl->aura_shell->internal, host_surface->proxy);
+    }
     zaura_surface_set_frame(window->aura_surface,
                             window->decorated
                                 ? ZAURA_SURFACE_FRAME_TYPE_NORMAL
@@ -687,17 +706,19 @@ static void xwl_window_update(struct xwl_window *window) {
   }
 
   if (window->managed || !parent) {
-    window->xdg_toplevel = zxdg_surface_v6_get_toplevel(window->xdg_surface);
-    zxdg_toplevel_v6_set_user_data(window->xdg_toplevel, window);
-    zxdg_toplevel_v6_add_listener(window->xdg_toplevel,
-                                  &xwl_xdg_toplevel_listener, window);
+    if (!window->xdg_toplevel) {
+      window->xdg_toplevel = zxdg_surface_v6_get_toplevel(window->xdg_surface);
+      zxdg_toplevel_v6_set_user_data(window->xdg_toplevel, window);
+      zxdg_toplevel_v6_add_listener(window->xdg_toplevel,
+                                    &xwl_xdg_toplevel_listener, window);
+    }
     if (parent)
       zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
     if (window->name)
       zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
     if (app_id)
       zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
-  } else {
+  } else if (!window->xdg_popup) {
     struct zxdg_positioner_v6 *positioner;
 
     positioner = zxdg_shell_v6_create_positioner(xwl->xdg_shell->internal);
@@ -719,6 +740,14 @@ static void xwl_window_update(struct xwl_window *window) {
                                window);
 
     zxdg_positioner_v6_destroy(positioner);
+  }
+
+  if ((window->size_flags & (US_POSITION | P_POSITION)) && parent &&
+      xwl->aura_shell &&
+      xwl->aura_shell->version >= ZAURA_SURFACE_SET_PARENT_SINCE_VERSION) {
+    zaura_surface_set_parent(window->aura_surface, parent->aura_surface,
+                             (window->x - parent->x) / xwl->scale,
+                             (window->y - parent->y) / xwl->scale);
   }
 
   wl_surface_commit(host_surface->proxy);
@@ -1181,27 +1210,58 @@ static void xwl_output_done(void *data, struct wl_output *output) {
 
   // Send mode now that scale is known.
   wl_output_send_mode(host->resource, host->flags,
-                      (scale * host->width) / host->scale,
-                      (scale * host->height) / host->scale, host->refresh);
+                      (scale * host->scale * host->width) / host->max_scale,
+                      (scale * host->scale * host->height) / host->max_scale,
+                      host->refresh);
+  wl_output_send_scale(host->resource, 1);
   wl_output_send_done(host->resource);
+
+  host->max_scale = 1.0;
 }
 
 static void xwl_output_scale(void *data, struct wl_output *output,
-                             int32_t scale) {
-  struct xwl_host_output *host = wl_output_get_user_data(output);
-
-  host->scale = scale;
-
-  // Always 1 as device scale factor is emulated.
-  wl_output_send_scale(host->resource, 1);
-}
+                             int32_t scale) {}
 
 static const struct wl_output_listener xwl_output_listener = {
     xwl_output_geometry, xwl_output_mode, xwl_output_done, xwl_output_scale};
 
+static void xwl_aura_output_scale(void *data, struct zaura_output *output,
+                                  uint32_t flags, uint32_t scale) {
+  struct xwl_host_output *host = zaura_output_get_user_data(output);
+
+  switch (scale) {
+  case ZAURA_OUTPUT_SCALE_FACTOR_0500:
+  case ZAURA_OUTPUT_SCALE_FACTOR_0600:
+  case ZAURA_OUTPUT_SCALE_FACTOR_0625:
+  case ZAURA_OUTPUT_SCALE_FACTOR_0750:
+  case ZAURA_OUTPUT_SCALE_FACTOR_0800:
+  case ZAURA_OUTPUT_SCALE_FACTOR_1000:
+  case ZAURA_OUTPUT_SCALE_FACTOR_1125:
+  case ZAURA_OUTPUT_SCALE_FACTOR_1200:
+  case ZAURA_OUTPUT_SCALE_FACTOR_1250:
+  case ZAURA_OUTPUT_SCALE_FACTOR_1500:
+  case ZAURA_OUTPUT_SCALE_FACTOR_1600:
+  case ZAURA_OUTPUT_SCALE_FACTOR_2000:
+    break;
+  default:
+    fprintf(stderr, "Warning: Unknown scale factor: %d\n", scale);
+    break;
+  }
+
+  host->max_scale = MAX(host->max_scale, scale / 1000.0);
+
+  if (flags & ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT)
+    host->scale = scale / 1000.0;
+}
+
+static const struct zaura_output_listener xwl_aura_output_listener = {
+    xwl_aura_output_scale};
+
 static void xwl_destroy_host_output(struct wl_resource *resource) {
   struct xwl_host_output *host = wl_resource_get_user_data(resource);
 
+  if (host->aura_output)
+    zaura_output_destroy(host->aura_output);
   wl_output_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
@@ -1210,6 +1270,7 @@ static void xwl_destroy_host_output(struct wl_resource *resource) {
 static void xwl_bind_host_output(struct wl_client *client, void *data,
                                  uint32_t version, uint32_t id) {
   struct xwl_output *output = (struct xwl_output *)data;
+  struct xwl *xwl = output->xwl;
   struct xwl_host_output *host;
 
   host = malloc(sizeof(*host));
@@ -1219,16 +1280,26 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
                                       MIN(version, output->version), id);
   wl_resource_set_implementation(host->resource, NULL, host,
                                  xwl_destroy_host_output);
-  host->proxy = wl_registry_bind(wl_display_get_registry(output->xwl->display),
+  host->proxy = wl_registry_bind(wl_display_get_registry(xwl->display),
                                  output->id, &wl_output_interface,
                                  wl_resource_get_version(host->resource));
   wl_output_set_user_data(host->proxy, host);
   wl_output_add_listener(host->proxy, &xwl_output_listener, host);
+  host->aura_output = NULL;
   host->flags = 0;
   host->width = 1024;
   host->height = 768;
   host->refresh = 60000;
-  host->scale = 1;
+  host->scale = 1.0;
+  host->max_scale = 1.0;
+  if (xwl->aura_shell &&
+      (xwl->aura_shell->version >= ZAURA_SHELL_GET_AURA_OUTPUT_SINCE_VERSION)) {
+    host->aura_output =
+        zaura_shell_get_aura_output(xwl->aura_shell->internal, host->proxy);
+    zaura_output_set_user_data(host->aura_output, host);
+    zaura_output_add_listener(host->aura_output, &xwl_aura_output_listener,
+                              host);
+  }
 }
 
 static void xwl_host_pointer_set_cursor(struct wl_client *client,
@@ -1797,8 +1868,9 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     assert(aura_shell);
     aura_shell->xwl = xwl;
     aura_shell->id = id;
-    aura_shell->internal =
-        wl_registry_bind(registry, id, &zaura_shell_interface, 1);
+    aura_shell->version = MIN(2, version);
+    aura_shell->internal = wl_registry_bind(
+        registry, id, &zaura_shell_interface, aura_shell->version);
     assert(!xwl->aura_shell);
     xwl->aura_shell = aura_shell;
   } else if (strcmp(interface, "wp_viewporter") == 0) {
@@ -1921,6 +1993,7 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
   window->decorated = 0;
   window->name = NULL;
   window->clazz = NULL;
+  window->size_flags = P_POSITION;
   window->xdg_surface = NULL;
   window->xdg_toplevel = NULL;
   window->xdg_popup = NULL;
@@ -2061,11 +2134,26 @@ static void xwl_handle_map_request(struct xwl *xwl,
       {PROPERTY_WM_NAME, XCB_ATOM_WM_NAME},
       {PROPERTY_WM_CLASS, XCB_ATOM_WM_CLASS},
       {PROPERTY_WM_TRANSIENT_FOR, XCB_ATOM_WM_TRANSIENT_FOR},
+      {PROPERTY_WM_NORMAL_HINTS, XCB_ATOM_WM_NORMAL_HINTS},
       {PROPERTY_MOTIF_WM_HINTS, xwl->atoms[ATOM_MOTIF_WM_HINTS].value},
   };
   xcb_get_geometry_cookie_t geometry_cookie;
-  xcb_get_geometry_reply_t *geometry_reply;
   xcb_get_property_cookie_t property_cookies[ARRAY_SIZE(properties)];
+  int depth = xwl->screen->root_depth;
+  struct xwl_wm_size_hints {
+    uint32_t flags;
+    int32_t x, y;
+    int32_t width, height;
+    int32_t min_width, min_height;
+    int32_t max_width, max_height;
+    int32_t width_inc, height_inc;
+    struct {
+      int32_t x;
+      int32_t y;
+    } min_aspect, max_aspect;
+    int32_t base_width, base_height;
+    int32_t win_gravity;
+  } size_hints = {0};
   struct xwl_mwm_hints {
     uint32_t flags;
     uint32_t functions;
@@ -2073,7 +2161,6 @@ static void xwl_handle_map_request(struct xwl *xwl,
     int32_t input_mode;
     uint32_t status;
   } mwm_hints = {0};
-  int depth = xwl->screen->root_depth;
   uint32_t values[4];
   int i;
 
@@ -2087,7 +2174,8 @@ static void xwl_handle_map_request(struct xwl *xwl,
   xcb_change_window_attributes(xwl->connection, window->id, XCB_CW_EVENT_MASK,
                                values);
 
-  geometry_cookie = xcb_get_geometry(xwl->connection, window->id);
+  if (window->frame_id == XCB_WINDOW_NONE)
+    geometry_cookie = xcb_get_geometry(xwl->connection, window->id);
 
   for (i = 0; i < ARRAY_SIZE(properties); ++i) {
     property_cookies[i] =
@@ -2095,16 +2183,18 @@ static void xwl_handle_map_request(struct xwl *xwl,
                          XCB_ATOM_ANY, 0, 2048);
   }
 
-  geometry_reply =
-      xcb_get_geometry_reply(xwl->connection, geometry_cookie, NULL);
-  if (geometry_reply) {
-    window->width = geometry_reply->width;
-    window->height = geometry_reply->height;
-    depth = geometry_reply->depth;
-    free(geometry_reply);
+  if (window->frame_id == XCB_WINDOW_NONE) {
+    xcb_get_geometry_reply_t *geometry_reply =
+        xcb_get_geometry_reply(xwl->connection, geometry_cookie, NULL);
+    if (geometry_reply) {
+      window->x = geometry_reply->x;
+      window->y = geometry_reply->y;
+      window->width = geometry_reply->width;
+      window->height = geometry_reply->height;
+      depth = geometry_reply->depth;
+      free(geometry_reply);
+    }
   }
-
-  xwl_adjust_window_geometry_for_screen_size(window);
 
   if (window->name) {
     free(window->name);
@@ -2116,6 +2206,7 @@ static void xwl_handle_map_request(struct xwl *xwl,
   }
   window->transient_for = XCB_WINDOW_NONE;
   window->decorated = 1;
+  window->size_flags = 0;
 
   for (i = 0; i < ARRAY_SIZE(properties); ++i) {
     xcb_get_property_reply_t *reply =
@@ -2150,6 +2241,10 @@ static void xwl_handle_map_request(struct xwl *xwl,
       if (xcb_get_property_value_length(reply) >= 4)
         window->transient_for = *((uint32_t *)xcb_get_property_value(reply));
       break;
+    case PROPERTY_WM_NORMAL_HINTS:
+      if (xcb_get_property_value_length(reply) >= sizeof(size_hints))
+        memcpy(&size_hints, xcb_get_property_value(reply), sizeof(size_hints));
+      break;
     case PROPERTY_MOTIF_WM_HINTS:
       if (xcb_get_property_value_length(reply) >= sizeof(mwm_hints)) {
         memcpy(&mwm_hints, xcb_get_property_value(reply), sizeof(mwm_hints));
@@ -2165,6 +2260,23 @@ static void xwl_handle_map_request(struct xwl *xwl,
       break;
     }
     free(reply);
+  }
+
+  // Allow user/program controlled position for transients.
+  if (window->transient_for)
+    window->size_flags |= size_hints.flags & (US_POSITION | P_POSITION);
+
+  window->border_width = 0;
+  xwl_adjust_window_size_for_screen_size(window);
+  if (window->size_flags & (US_POSITION | P_POSITION)) {
+    // x/y fields are obsolete but some clients still expect them to be
+    // honored so use them if greater than zero.
+    if (size_hints.x > 0)
+      window->x = size_hints.x;
+    if (size_hints.y > 0)
+      window->y = size_hints.y;
+  } else {
+    xwl_adjust_window_position_for_screen_size(window);
   }
 
   values[0] = window->width;
@@ -2299,12 +2411,20 @@ static void xwl_handle_configure_request(struct xwl *xwl,
     }
   }
 
+  if (event->value_mask & XCB_CONFIG_WINDOW_X)
+    window->x = event->x;
+  if (event->value_mask & XCB_CONFIG_WINDOW_Y)
+    window->y = event->y;
   if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH)
     window->width = event->width;
   if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
     window->height = event->height;
 
-  xwl_adjust_window_geometry_for_screen_size(window);
+  xwl_adjust_window_size_for_screen_size(window);
+  if (window->size_flags & (US_POSITION | P_POSITION))
+    xwl_window_update(window);
+  else
+    xwl_adjust_window_position_for_screen_size(window);
 
   values[0] = window->x;
   values[1] = window->y;
@@ -2337,6 +2457,50 @@ static void xwl_handle_configure_notify(struct xwl *xwl,
 
   if (xwl_is_our_window(xwl, event->window))
     return;
+
+  if (event->window == xwl->screen->root) {
+    xcb_get_geometry_reply_t *geometry_reply = xcb_get_geometry_reply(
+        xwl->connection, xcb_get_geometry(xwl->connection, event->window),
+        NULL);
+    int width = xwl->screen->width_in_pixels;
+    int height = xwl->screen->height_in_pixels;
+
+    if (geometry_reply) {
+      width = geometry_reply->width;
+      height = geometry_reply->height;
+      free(geometry_reply);
+    }
+
+    if (width == xwl->screen->width_in_pixels ||
+        height == xwl->screen->height_in_pixels) {
+      return;
+    }
+
+    xwl->screen->width_in_pixels = width;
+    xwl->screen->height_in_pixels = height;
+
+    // Re-center managed windows.
+    wl_list_for_each(window, &xwl->windows, link) {
+      int x, y;
+
+      if (window->size_flags & (US_POSITION | P_POSITION))
+        continue;
+
+      x = window->x;
+      y = window->y;
+      xwl_adjust_window_position_for_screen_size(window);
+      if (window->x != x || window->y != y) {
+        uint32_t values[2];
+
+        values[0] = window->x;
+        values[1] = window->y;
+        xcb_configure_window(xwl->connection, window->frame_id,
+                             XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
+        xwl_send_configure_notify(window);
+      }
+    }
+    return;
+  }
 
   window = xwl_lookup_window(xwl, event->window);
   if (!window)
@@ -2586,8 +2750,9 @@ static void xwl_connect(struct xwl *xwl) {
   xwl->screen = screen_iterator.data;
 
   // Select for substructure redirect.
-  values[0] =
-      XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY | XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
+  values[0] = XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+              XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
+              XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
   change_attributes_cookie = xcb_change_window_attributes(
       xwl->connection, xwl->screen->root, XCB_CW_EVENT_MASK, values);
 
