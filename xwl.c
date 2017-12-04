@@ -907,7 +907,6 @@ static void xwl_host_surface_set_buffer_scale(struct wl_client *client,
   wl_resource_post_no_memory(resource);
 }
 
-#ifdef WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION
 static void xwl_host_surface_damage_buffer(struct wl_client *client,
                                            struct wl_resource *resource,
                                            int32_t x, int32_t y, int32_t width,
@@ -915,16 +914,13 @@ static void xwl_host_surface_damage_buffer(struct wl_client *client,
   // Not implemented.
   wl_resource_post_no_memory(resource);
 }
-#endif
 
 static const struct wl_surface_interface xwl_surface_implementation = {
     xwl_host_surface_destroy, xwl_host_surface_attach, xwl_host_surface_damage,
     xwl_host_surface_frame, xwl_host_surface_set_opaque_region,
     xwl_host_surface_set_input_region, xwl_host_surface_commit,
     xwl_host_surface_set_buffer_transform, xwl_host_surface_set_buffer_scale,
-#ifdef WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION
     xwl_host_surface_damage_buffer
-#endif
 };
 
 static void xwl_destroy_host_surface(struct wl_resource *resource) {
@@ -1406,56 +1402,40 @@ static void xwl_pointer_axis(void *data, struct wl_pointer *pointer,
   wl_pointer_send_axis(host->resource, time, axis, value * scale);
 }
 
-#ifdef WL_POINTER_FRAME_SINCE_VERSION
 static void xwl_pointer_frame(void *data, struct wl_pointer *pointer) {
   struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
 
   wl_pointer_send_frame(host->resource);
 }
-#endif
 
-#ifdef WL_POINTER_AXIS_SOURCE_SINCE_VERSION
 void xwl_pointer_axis_source(void *data, struct wl_pointer *pointer,
                              uint32_t axis_source) {
   struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
 
   wl_pointer_send_axis_source(host->resource, axis_source);
 }
-#endif
 
-#ifdef WL_POINTER_AXIS_STOP_SINCE_VERSION
 static void xwl_pointer_axis_stop(void *data, struct wl_pointer *pointer,
                                   uint32_t time, uint32_t axis) {
   struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
 
   wl_pointer_send_axis_stop(host->resource, time, axis);
 }
-#endif
 
-#ifdef WL_POINTER_AXIS_DISCRETE_SINCE_VERSION
 static void xwl_pointer_axis_discrete(void *data, struct wl_pointer *pointer,
                                       uint32_t axis, int32_t discrete) {
   struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
 
   wl_pointer_send_axis_discrete(host->resource, axis, discrete);
 }
-#endif
 
 static const struct wl_pointer_listener xwl_pointer_listener = {
     xwl_pointer_enter,        xwl_pointer_leave, xwl_pointer_motion,
     xwl_pointer_button,       xwl_pointer_axis,
-#ifdef WL_POINTER_FRAME_SINCE_VERSION
     xwl_pointer_frame,
-#endif
-#ifdef WL_POINTER_AXIS_SOURCE_SINCE_VERSION
     xwl_pointer_axis_source,
-#endif
-#ifdef WL_POINTER_AXIS_DISCRETE_SINCE_VERSION
     xwl_pointer_axis_stop,
-#endif
-#ifdef WL_POINTER_AXIS_DISCRETE_SINCE_VERSION
     xwl_pointer_axis_discrete
-#endif
 };
 
 static void xwl_host_keyboard_release(struct wl_client *client,
@@ -1538,21 +1518,17 @@ static void xwl_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
                              mods_latched, mods_locked, group);
 }
 
-#ifdef WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION
 static void xwl_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
                                      int32_t rate, int32_t delay) {
   struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
 
   wl_keyboard_send_repeat_info(host->resource, rate, delay);
 }
-#endif
 
 static const struct wl_keyboard_listener xwl_keyboard_listener = {
     xwl_keyboard_keymap,     xwl_keyboard_enter,     xwl_keyboard_leave,
     xwl_keyboard_key,        xwl_keyboard_modifiers,
-#ifdef WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION
     xwl_keyboard_repeat_info
-#endif
 };
 
 static void xwl_host_touch_release(struct wl_client *client,
@@ -1725,21 +1701,17 @@ static void xwl_host_seat_get_host_touch(struct wl_client *client,
   wl_touch_add_listener(host_touch->proxy, &xwl_touch_listener, host_touch);
 }
 
-#ifdef WL_SEAT_RELEASE_SINCE_VERSION
 static void xwl_host_seat_release(struct wl_client *client,
                                   struct wl_resource *resource) {
   struct xwl_host_seat *host = wl_resource_get_user_data(resource);
 
   wl_seat_release(host->proxy);
 }
-#endif
 
 static const struct wl_seat_interface xwl_seat_implementation = {
     xwl_host_seat_get_host_pointer, xwl_host_seat_get_host_keyboard,
     xwl_host_seat_get_host_touch,
-#ifdef WL_SEAT_RELEASE_SINCE_VERSION
     xwl_host_seat_release
-#endif
 };
 
 static void xwl_seat_capabilities(void *data, struct wl_seat *seat,
@@ -1842,11 +1814,7 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     assert(seat);
     seat->xwl = xwl;
     seat->id = id;
-#ifdef WL_POINTER_FRAME_SINCE_VERSION
     seat->version = MIN(5, version);
-#else
-    seat->version = MIN(3, version);
-#endif
     seat->host_global =
         wl_global_create(xwl->host_display, &wl_seat_interface, seat->version,
                          seat, xwl_bind_host_seat);
