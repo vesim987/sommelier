@@ -325,6 +325,9 @@ enum {
 
 #define CAPTION_HEIGHT 32
 
+#define MIN_SCALE 0.1
+#define MAX_SCALE 10.0
+
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
@@ -2931,6 +2934,7 @@ int main(int argc, char **argv) {
           },
       .visual_ids = {0},
       .colormaps = {0}};
+  const char* scale = getenv("XWL_SCALE");
   struct wl_event_loop *event_loop;
   int sv[2], ds[2], wm[2];
   pid_t pid;
@@ -2952,8 +2956,7 @@ int main(int argc, char **argv) {
     if (strstr(arg, "--scale=") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
-      xwl.scale = atof(s);
-      assert(xwl.scale > 0.0);
+      scale = s;
     } else if (strstr(arg, "--app-id=") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -2981,6 +2984,9 @@ int main(int argc, char **argv) {
     xwl_usage();
     return 1;
   }
+
+  if (scale)
+    xwl.scale = MIN(MAX_SCALE, MAX(MIN_SCALE, atof(scale)));
 
   xwl.display = wl_display_connect(NULL);
   assert(xwl.display);
