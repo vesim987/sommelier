@@ -919,12 +919,16 @@ static void xwl_host_surface_damage_buffer(struct wl_client *client,
 }
 
 static const struct wl_surface_interface xwl_surface_implementation = {
-    xwl_host_surface_destroy, xwl_host_surface_attach, xwl_host_surface_damage,
-    xwl_host_surface_frame, xwl_host_surface_set_opaque_region,
-    xwl_host_surface_set_input_region, xwl_host_surface_commit,
-    xwl_host_surface_set_buffer_transform, xwl_host_surface_set_buffer_scale,
-    xwl_host_surface_damage_buffer
-};
+    xwl_host_surface_destroy,
+    xwl_host_surface_attach,
+    xwl_host_surface_damage,
+    xwl_host_surface_frame,
+    xwl_host_surface_set_opaque_region,
+    xwl_host_surface_set_input_region,
+    xwl_host_surface_commit,
+    xwl_host_surface_set_buffer_transform,
+    xwl_host_surface_set_buffer_scale,
+    xwl_host_surface_damage_buffer};
 
 static void xwl_destroy_host_surface(struct wl_resource *resource) {
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
@@ -1433,13 +1437,9 @@ static void xwl_pointer_axis_discrete(void *data, struct wl_pointer *pointer,
 }
 
 static const struct wl_pointer_listener xwl_pointer_listener = {
-    xwl_pointer_enter,        xwl_pointer_leave, xwl_pointer_motion,
-    xwl_pointer_button,       xwl_pointer_axis,
-    xwl_pointer_frame,
-    xwl_pointer_axis_source,
-    xwl_pointer_axis_stop,
-    xwl_pointer_axis_discrete
-};
+    xwl_pointer_enter,       xwl_pointer_leave,     xwl_pointer_motion,
+    xwl_pointer_button,      xwl_pointer_axis,      xwl_pointer_frame,
+    xwl_pointer_axis_source, xwl_pointer_axis_stop, xwl_pointer_axis_discrete};
 
 static void xwl_host_keyboard_release(struct wl_client *client,
                                       struct wl_resource *resource) {
@@ -1529,10 +1529,8 @@ static void xwl_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
 }
 
 static const struct wl_keyboard_listener xwl_keyboard_listener = {
-    xwl_keyboard_keymap,     xwl_keyboard_enter,     xwl_keyboard_leave,
-    xwl_keyboard_key,        xwl_keyboard_modifiers,
-    xwl_keyboard_repeat_info
-};
+    xwl_keyboard_keymap, xwl_keyboard_enter,     xwl_keyboard_leave,
+    xwl_keyboard_key,    xwl_keyboard_modifiers, xwl_keyboard_repeat_info};
 
 static void xwl_host_touch_release(struct wl_client *client,
                                    struct wl_resource *resource) {
@@ -1713,9 +1711,7 @@ static void xwl_host_seat_release(struct wl_client *client,
 
 static const struct wl_seat_interface xwl_seat_implementation = {
     xwl_host_seat_get_host_pointer, xwl_host_seat_get_host_keyboard,
-    xwl_host_seat_get_host_touch,
-    xwl_host_seat_release
-};
+    xwl_host_seat_get_host_touch, xwl_host_seat_release};
 
 static void xwl_seat_capabilities(void *data, struct wl_seat *seat,
                                   uint32_t capabilities) {
@@ -2934,7 +2930,7 @@ int main(int argc, char **argv) {
           },
       .visual_ids = {0},
       .colormaps = {0}};
-  const char* scale = getenv("XWL_SCALE");
+  const char *scale = getenv("XWL_SCALE");
   struct wl_event_loop *event_loop;
   int sv[2], ds[2], wm[2];
   pid_t pid;
