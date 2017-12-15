@@ -221,6 +221,7 @@ struct xwl_window {
   int width;
   int height;
   int border_width;
+  int depth;
   int managed;
   int realized;
   int activated;
@@ -739,6 +740,15 @@ static void xwl_window_update(struct xwl_window *window) {
     }
   }
 
+  if (!window->depth) {
+    xcb_get_geometry_reply_t *geometry_reply = xcb_get_geometry_reply(
+        xwl->connection, xcb_get_geometry(xwl->connection, window->id), NULL);
+    if (geometry_reply) {
+      window->depth = geometry_reply->depth;
+      free(geometry_reply);
+    }
+  }
+
   if (!window->xdg_surface) {
     window->xdg_surface = zxdg_shell_v6_get_xdg_surface(
         xwl->xdg_shell->internal, host_surface->proxy);
@@ -755,7 +765,9 @@ static void xwl_window_update(struct xwl_window *window) {
     zaura_surface_set_frame(window->aura_surface,
                             window->decorated
                                 ? ZAURA_SURFACE_FRAME_TYPE_NORMAL
-                                : ZAURA_SURFACE_FRAME_TYPE_SHADOW);
+                                : window->depth == 32
+                                      ? ZAURA_SURFACE_FRAME_TYPE_NONE
+                                      : ZAURA_SURFACE_FRAME_TYPE_SHADOW);
   }
 
   if (window->managed || !parent) {
@@ -2138,6 +2150,7 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
   window->width = width;
   window->height = height;
   window->border_width = border_width;
+  window->depth = 0;
   window->managed = 0;
   window->realized = 0;
   window->activated = 0;
@@ -2294,7 +2307,6 @@ static void xwl_handle_map_request(struct xwl *xwl,
   };
   xcb_get_geometry_cookie_t geometry_cookie;
   xcb_get_property_cookie_t property_cookies[ARRAY_SIZE(properties)];
-  int depth = xwl->screen->root_depth;
   struct xwl_wm_size_hints {
     uint32_t flags;
     int32_t x, y;
@@ -2342,7 +2354,7 @@ static void xwl_handle_map_request(struct xwl *xwl,
       window->y = geometry_reply->y;
       window->width = geometry_reply->width;
       window->height = geometry_reply->height;
-      depth = geometry_reply->depth;
+      window->depth = geometry_reply->depth;
       free(geometry_reply);
     }
   }
@@ -2397,20 +2409,20 @@ static void xwl_handle_map_request(struct xwl *xwl,
         memcpy(&size_hints, xcb_get_property_value(reply), sizeof(size_hints));
       break;
     case PROPERTY_MOTIF_WM_HINTS:
-      if (xcb_get_property_value_length(reply) >= sizeof(mwm_hints)) {
+      if (xcb_get_property_value_length(reply) >= sizeof(mwm_hints))
         memcpy(&mwm_hints, xcb_get_property_value(reply), sizeof(mwm_hints));
-        if (mwm_hints.flags & MWM_HINTS_DECORATIONS) {
-          if (mwm_hints.decorations & MWM_DECOR_ALL)
-            window->decorated = ~mwm_hints.decorations & MWM_DECOR_TITLE;
-          else
-            window->decorated = mwm_hints.decorations & MWM_DECOR_TITLE;
-        }
-      }
       break;
     default:
       break;
     }
     free(reply);
+  }
+
+  if (mwm_hints.flags & MWM_HINTS_DECORATIONS) {
+    if (mwm_hints.decorations & MWM_DECOR_ALL)
+      window->decorated = ~mwm_hints.decorations & MWM_DECOR_TITLE;
+    else
+      window->decorated = mwm_hints.decorations & MWM_DECOR_TITLE;
   }
 
   // Allow user/program controlled position for transients.
@@ -2446,6 +2458,8 @@ static void xwl_handle_map_request(struct xwl *xwl,
                       XCB_ATOM_CARDINAL, 32, 4, values);
 
   if (window->frame_id == XCB_WINDOW_NONE) {
+    int depth = window->depth ? window->depth : xwl->screen->root_depth;
+
     values[0] = xwl->screen->black_pixel;
     values[1] = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
                 XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
