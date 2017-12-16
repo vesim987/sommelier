@@ -489,7 +489,6 @@ static void xwl_set_input_focus(struct xwl *xwl, struct xwl_window *window) {
                 xwl->atoms[ATOM_WM_TAKE_FOCUS].value, XCB_CURRENT_TIME,
             },
     };
-    uint32_t values[1];
 
     if (!window->managed)
       return;
@@ -499,14 +498,32 @@ static void xwl_set_input_focus(struct xwl *xwl, struct xwl_window *window) {
 
     xcb_set_input_focus(xwl->connection, XCB_INPUT_FOCUS_NONE, window->id,
                         XCB_CURRENT_TIME);
-
-    values[0] = XCB_STACK_MODE_ABOVE;
-    xcb_configure_window(xwl->connection, window->frame_id,
-                         XCB_CONFIG_WINDOW_STACK_MODE, values);
   } else {
     xcb_set_input_focus(xwl->connection, XCB_INPUT_FOCUS_NONE, XCB_NONE,
                         XCB_CURRENT_TIME);
   }
+}
+
+static void xwl_restack_windows(struct xwl *xwl, uint32_t focus_resource_id) {
+  struct xwl_window *sibling;
+  uint32_t values[1];
+
+  wl_list_for_each(sibling, &xwl->windows, link) {
+    if (!sibling->managed)
+      continue;
+
+    // Move focus window to the top and all other windows to the bottom.
+    values[0] = sibling->host_surface_id == focus_resource_id
+                    ? XCB_STACK_MODE_ABOVE
+                    : XCB_STACK_MODE_BELOW;
+    xcb_configure_window(xwl->connection, sibling->frame_id,
+                         XCB_CONFIG_WINDOW_STACK_MODE, values);
+  }
+}
+
+static void xwl_roundtrip(struct xwl *xwl) {
+  free(xcb_get_input_focus_reply(xwl->connection,
+                                 xcb_get_input_focus(xwl->connection), NULL));
 }
 
 static int
@@ -1512,6 +1529,10 @@ static void xwl_pointer_set_focus(struct xwl_host_pointer *host,
   if (surface_resource) {
     double scale = host->seat->xwl->scale;
 
+    // Make sure focus surface is on top before sending enter event.
+    xwl_restack_windows(host->seat->xwl, wl_resource_get_id(surface_resource));
+    xwl_roundtrip(host->seat->xwl);
+
     wl_resource_add_destroy_listener(surface_resource,
                                      &host->focus_resource_listener);
 
@@ -1718,6 +1739,11 @@ static void xwl_host_touch_down(void *data, struct wl_touch *touch,
 
   if (!host_surface)
     return;
+
+  // Make sure focus surface is on top before sending down event.
+  xwl_restack_windows(host->seat->xwl,
+                      wl_resource_get_id(host_surface->resource));
+  xwl_roundtrip(host->seat->xwl);
 
   wl_touch_send_down(host->resource, serial, time, host_surface->resource, id,
                      x * scale, y * scale);
@@ -2328,7 +2354,7 @@ static void xwl_handle_map_request(struct xwl *xwl,
     int32_t input_mode;
     uint32_t status;
   } mwm_hints = {0};
-  uint32_t values[4];
+  uint32_t values[5];
   int i;
 
   if (!window)
@@ -2471,18 +2497,21 @@ static void xwl_handle_map_request(struct xwl *xwl,
         window->y, window->width, window->height, 0,
         XCB_WINDOW_CLASS_INPUT_OUTPUT, xwl->visual_ids[depth],
         XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, values);
+    values[0] = XCB_STACK_MODE_BELOW;
+    xcb_configure_window(xwl->connection, window->frame_id,
+                         XCB_CONFIG_WINDOW_STACK_MODE, values);
     xcb_reparent_window(xwl->connection, window->id, window->frame_id, 0, 0);
   } else {
-    uint32_t values[2];
-
     values[0] = window->x;
     values[1] = window->y;
     values[2] = window->width;
     values[3] = window->height;
-    xcb_configure_window(xwl->connection, window->frame_id,
-                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
-                             XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
-                         values);
+    values[4] = XCB_STACK_MODE_BELOW;
+    xcb_configure_window(
+        xwl->connection, window->frame_id,
+        XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH |
+            XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_STACK_MODE,
+        values);
   }
 
   xwl_window_set_wm_state(window, WM_STATE_NORMAL);
