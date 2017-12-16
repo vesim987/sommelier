@@ -61,6 +61,7 @@ struct xwl_host_surface {
   uint32_t contents_width;
   uint32_t contents_height;
   int is_cursor;
+  uint32_t last_event_serial;
 };
 
 struct xwl_host_compositor {
@@ -291,7 +292,6 @@ struct xwl {
   xcb_window_t window;
   struct wl_list windows, unpaired_windows;
   struct xwl_window *host_focus_window;
-  xcb_window_t focus_window;
   int needs_set_input_focus;
   double scale;
   const char *app_id;
@@ -746,14 +746,27 @@ static void xwl_window_update(struct xwl_window *window) {
     }
   } else {
     struct xwl_window *sibling;
+    uint32_t parent_last_event_serial = 0;
 
     wl_list_for_each(sibling, &xwl->windows, link) {
-      if (sibling->realized)
-        parent = sibling;
+      struct wl_resource *sibling_host_resource;
+      struct xwl_host_surface *sibling_host_surface;
 
-      // Any parent will do but prefer focus window when possible.
-      if (parent && sibling->id == xwl->focus_window)
-        break;
+      if (!sibling->realized)
+        continue;
+
+      sibling_host_resource =
+          wl_client_get_object(xwl->client, sibling->host_surface_id);
+      if (!sibling_host_resource)
+        continue;
+
+      // Any parent will do but prefer last event window.
+      sibling_host_surface = wl_resource_get_user_data(sibling_host_resource);
+      if (parent_last_event_serial > sibling_host_surface->last_event_serial)
+        continue;
+
+      parent = sibling;
+      parent_last_event_serial = sibling_host_surface->last_event_serial;
     }
   }
 
@@ -1046,6 +1059,7 @@ static void xwl_compositor_create_host_surface(struct wl_client *client,
   host_surface->contents_width = 0;
   host_surface->contents_height = 0;
   host_surface->is_cursor = 0;
+  host_surface->last_event_serial = 0;
   host_surface->resource = wl_resource_create(
       client, &wl_surface_interface, wl_resource_get_version(resource), id);
   wl_resource_set_implementation(host_surface->resource,
@@ -1508,6 +1522,11 @@ static void xwl_host_pointer_release(struct wl_client *client,
 static const struct wl_pointer_interface xwl_pointer_implementation = {
     xwl_host_pointer_set_cursor, xwl_host_pointer_release};
 
+static void xwl_set_last_event_serial(struct xwl_host_surface *host_surface) {
+  host_surface->last_event_serial =
+      wl_display_next_serial(host_surface->xwl->display);
+}
+
 static void xwl_pointer_set_focus(struct xwl_host_pointer *host,
                                   uint32_t serial,
                                   struct xwl_host_surface *host_surface,
@@ -1591,6 +1610,9 @@ static void xwl_pointer_axis(void *data, struct wl_pointer *pointer,
 
 static void xwl_pointer_frame(void *data, struct wl_pointer *pointer) {
   struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
+
+  if (host->focus_resource)
+    xwl_set_last_event_serial(wl_resource_get_user_data(host->focus_resource));
 
   wl_pointer_send_frame(host->resource);
 }
@@ -1691,6 +1713,9 @@ static void xwl_keyboard_key(void *data, struct wl_keyboard *keyboard,
                              uint32_t serial, uint32_t time, uint32_t key,
                              uint32_t state) {
   struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
+
+  if (host->focus_resource)
+    xwl_set_last_event_serial(wl_resource_get_user_data(host->focus_resource));
 
   wl_keyboard_send_key(host->resource, serial, time, key, state);
 
@@ -2209,8 +2234,6 @@ static void xwl_destroy_window(struct xwl_window *window) {
     window->xwl->host_focus_window = NULL;
     window->xwl->needs_set_input_focus = 1;
   }
-  if (window->xwl->focus_window == window->id)
-    window->xwl->focus_window = 0;
 
   if (window->xdg_popup)
     zxdg_popup_v6_destroy(window->xdg_popup);
@@ -2806,8 +2829,6 @@ static void xwl_handle_client_message(struct xwl *xwl,
 }
 
 static void xwl_handle_focus_in(struct xwl *xwl, xcb_focus_in_event_t *event) {
-  xwl->focus_window = event->event;
-
   if (event->mode == XCB_NOTIFY_MODE_GRAB ||
       event->mode == XCB_NOTIFY_MODE_UNGRAB) {
     return;
@@ -3582,7 +3603,6 @@ int main(int argc, char **argv) {
       .screen = NULL,
       .window = 0,
       .host_focus_window = NULL,
-      .focus_window = 0,
       .needs_set_input_focus = 0,
       .scale = 1.0,
       .app_id = NULL,
