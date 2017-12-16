@@ -298,6 +298,7 @@ struct xwl {
   double scale;
   const char *app_id;
   int exit_with_child;
+  int clipboard_manager;
   struct xwl_host_seat *default_seat;
   xcb_window_t selection_window;
   xcb_window_t selection_owner;
@@ -1413,16 +1414,18 @@ static void xwl_set_selection(struct xwl *xwl,
     xwl->selection_data_offer = NULL;
   }
 
-  if (!data_offer) {
-    if (xwl->selection_owner == xwl->selection_window)
-      xcb_set_selection_owner(xwl->connection, XCB_ATOM_NONE,
-                              xwl->atoms[ATOM_CLIPBOARD].value,
-                              xwl->selection_timestamp);
-    return;
-  }
+  if (xwl->clipboard_manager) {
+    if (!data_offer) {
+      if (xwl->selection_owner == xwl->selection_window)
+        xcb_set_selection_owner(xwl->connection, XCB_ATOM_NONE,
+                                xwl->atoms[ATOM_CLIPBOARD].value,
+                                xwl->selection_timestamp);
+      return;
+    }
 
-  xcb_set_selection_owner(xwl->connection, xwl->selection_window,
-                          xwl->atoms[ATOM_CLIPBOARD].value, XCB_CURRENT_TIME);
+    xcb_set_selection_owner(xwl->connection, xwl->selection_window,
+                            xwl->atoms[ATOM_CLIPBOARD].value, XCB_CURRENT_TIME);
+  }
 
   xwl->selection_data_offer = data_offer;
 }
@@ -3489,21 +3492,24 @@ static void xwl_connect(struct xwl *xwl) {
   }
   assert(xwl->visual_ids[xwl->screen->root_depth]);
 
-  values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE;
-  xwl->selection_window = xcb_generate_id(xwl->connection);
-  xcb_create_window(xwl->connection, XCB_COPY_FROM_PARENT,
-                    xwl->selection_window, xwl->screen->root, 0, 0, 1, 1, 0,
-                    XCB_WINDOW_CLASS_INPUT_OUTPUT, xwl->screen->root_visual,
-                    XCB_CW_EVENT_MASK, values);
-  xcb_set_selection_owner(xwl->connection, xwl->selection_window,
-                          xwl->atoms[ATOM_CLIPBOARD_MANAGER].value,
-                          XCB_CURRENT_TIME);
-  xcb_xfixes_select_selection_input(
-      xwl->connection, xwl->selection_window, xwl->atoms[ATOM_CLIPBOARD].value,
-      XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER |
-          XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
-          XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE);
-  xwl_set_selection(xwl, NULL);
+  if (xwl->clipboard_manager) {
+    values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE;
+    xwl->selection_window = xcb_generate_id(xwl->connection);
+    xcb_create_window(xwl->connection, XCB_COPY_FROM_PARENT,
+                      xwl->selection_window, xwl->screen->root, 0, 0, 1, 1, 0,
+                      XCB_WINDOW_CLASS_INPUT_OUTPUT, xwl->screen->root_visual,
+                      XCB_CW_EVENT_MASK, values);
+    xcb_set_selection_owner(xwl->connection, xwl->selection_window,
+                            xwl->atoms[ATOM_CLIPBOARD_MANAGER].value,
+                            XCB_CURRENT_TIME);
+    xcb_xfixes_select_selection_input(
+        xwl->connection, xwl->selection_window,
+        xwl->atoms[ATOM_CLIPBOARD].value,
+        XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER |
+            XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
+            XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE);
+    xwl_set_selection(xwl, NULL);
+  }
 
   xcb_change_property(xwl->connection, XCB_PROP_MODE_REPLACE, xwl->window,
                       xwl->atoms[ATOM_NET_SUPPORTING_WM_CHECK].value,
@@ -3608,6 +3614,7 @@ static void xwl_usage() {
          "[--app-id=ID] "
          "[--display=DISPLAY] "
          "[--no-exit-with-child] "
+         "[--no-clipboard-manager] "
          "PROGRAM [ARGS...]\n");
 }
 
@@ -3638,6 +3645,7 @@ int main(int argc, char **argv) {
       .scale = 1.0,
       .app_id = NULL,
       .exit_with_child = 1,
+      .clipboard_manager = 1,
       .default_seat = NULL,
       .selection_window = XCB_WINDOW_NONE,
       .selection_owner = XCB_WINDOW_NONE,
@@ -3684,6 +3692,7 @@ int main(int argc, char **argv) {
       .visual_ids = {0},
       .colormaps = {0}};
   const char *scale = getenv("XWL_SCALE");
+  const char *clipboard_manager = getenv("XWL_CLIPBOARD_MANAGER");
   struct wl_event_loop *event_loop;
   int sv[2], ds[2], wm[2];
   pid_t pid;
@@ -3716,6 +3725,8 @@ int main(int argc, char **argv) {
       display = atoi(s);
     } else if (strstr(arg, "--no-exit-with-child") == arg) {
       xwl.exit_with_child = 0;
+    } else if (strstr(arg, "--no-clipboard-manager") == arg) {
+      clipboard_manager = "0";
     } else if (arg[0] == '-') {
       if (strcmp(arg, "--") != 0) {
         fprintf(stderr, "Option `%s' is unknown.\n", arg);
@@ -3736,6 +3747,9 @@ int main(int argc, char **argv) {
 
   if (scale)
     xwl.scale = MIN(MAX_SCALE, MAX(MIN_SCALE, atof(scale)));
+
+  if (clipboard_manager)
+    xwl.clipboard_manager = !!strcmp(clipboard_manager, "0");
 
   xwl.display = wl_display_connect(NULL);
   assert(xwl.display);
