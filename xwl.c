@@ -158,6 +158,8 @@ struct xwl_host_touch {
   struct xwl_seat *seat;
   struct wl_resource *resource;
   struct wl_touch *proxy;
+  struct wl_resource *focus_resource;
+  struct wl_listener focus_resource_listener;
 };
 
 struct xwl_host_seat {
@@ -1765,6 +1767,14 @@ static void xwl_host_touch_down(void *data, struct wl_touch *touch,
   if (!host_surface)
     return;
 
+  if (host_surface->resource != host->focus_resource) {
+    wl_list_remove(&host->focus_resource_listener.link);
+    wl_list_init(&host->focus_resource_listener.link);
+    host->focus_resource = host_surface->resource;
+    wl_resource_add_destroy_listener(host_surface->resource,
+                                     &host->focus_resource_listener);
+  }
+
   // Make sure focus surface is on top before sending down event.
   xwl_restack_windows(host->seat->xwl,
                       wl_resource_get_id(host_surface->resource));
@@ -1779,6 +1789,10 @@ static void xwl_host_touch_down(void *data, struct wl_touch *touch,
 static void xwl_host_touch_up(void *data, struct wl_touch *touch,
                               uint32_t serial, uint32_t time, int32_t id) {
   struct xwl_host_touch *host = wl_touch_get_user_data(touch);
+
+  wl_list_remove(&host->focus_resource_listener.link);
+  wl_list_init(&host->focus_resource_listener.link);
+  host->focus_resource = NULL;
 
   wl_touch_send_up(host->resource, serial, time, id);
 
@@ -1796,6 +1810,9 @@ static void xwl_host_touch_motion(void *data, struct wl_touch *touch,
 
 static void xwl_host_touch_frame(void *data, struct wl_touch *touch) {
   struct xwl_host_touch *host = wl_touch_get_user_data(touch);
+
+  if (host->focus_resource)
+    xwl_set_last_event_serial(wl_resource_get_user_data(host->focus_resource));
 
   wl_touch_send_frame(host->resource);
 }
@@ -1904,6 +1921,16 @@ static void xwl_destroy_host_touch(struct wl_resource *resource) {
   free(host);
 }
 
+static void xwl_touch_focus_resource_destroyed(struct wl_listener *listener,
+                                               void *data) {
+  struct xwl_host_touch *host;
+
+  host = wl_container_of(listener, host, focus_resource_listener);
+  wl_list_remove(&host->focus_resource_listener.link);
+  wl_list_init(&host->focus_resource_listener.link);
+  host->focus_resource = NULL;
+}
+
 static void xwl_host_seat_get_host_touch(struct wl_client *client,
                                          struct wl_resource *resource,
                                          uint32_t id) {
@@ -1922,6 +1949,10 @@ static void xwl_host_seat_get_host_touch(struct wl_client *client,
   host_touch->proxy = wl_seat_get_touch(host->proxy);
   wl_touch_set_user_data(host_touch->proxy, host_touch);
   wl_touch_add_listener(host_touch->proxy, &xwl_touch_listener, host_touch);
+  wl_list_init(&host_touch->focus_resource_listener.link);
+  host_touch->focus_resource_listener.notify =
+      xwl_touch_focus_resource_destroyed;
+  host_touch->focus_resource = NULL;
 }
 
 static void xwl_host_seat_release(struct wl_client *client,
