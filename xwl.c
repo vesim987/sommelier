@@ -2862,16 +2862,7 @@ static void xwl_handle_client_message(struct xwl *xwl,
   }
 }
 
-static void xwl_handle_focus_in(struct xwl *xwl, xcb_focus_in_event_t *event) {
-  if (event->mode == XCB_NOTIFY_MODE_GRAB ||
-      event->mode == XCB_NOTIFY_MODE_UNGRAB) {
-    return;
-  }
-
-  // Reset the focus to the current focus window if it changed.
-  if (!xwl->host_focus_window || event->event != xwl->host_focus_window->id)
-    xwl->needs_set_input_focus = 1;
-}
+static void xwl_handle_focus_in(struct xwl *xwl, xcb_focus_in_event_t *event) {}
 
 static void xwl_handle_focus_out(struct xwl *xwl,
                                  xcb_focus_out_event_t *event) {}
