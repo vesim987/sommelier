@@ -299,6 +299,8 @@ struct xwl {
   const char *app_id;
   int exit_with_child;
   int clipboard_manager;
+  uint32_t frame_color;
+  int has_frame_color;
   struct xwl_host_seat *default_seat;
   xcb_window_t selection_window;
   xcb_window_t selection_owner;
@@ -801,6 +803,13 @@ static void xwl_window_update(struct xwl_window *window) {
                                 : window->depth == 32
                                       ? ZAURA_SURFACE_FRAME_TYPE_NONE
                                       : ZAURA_SURFACE_FRAME_TYPE_SHADOW);
+
+    if (xwl->has_frame_color &&
+        xwl->aura_shell->version >=
+            ZAURA_SURFACE_SET_FRAME_COLORS_SINCE_VERSION) {
+      zaura_surface_set_frame_colors(window->aura_surface, xwl->frame_color,
+                                     xwl->frame_color);
+    }
   }
 
   if (window->managed || !parent) {
@@ -2110,7 +2119,7 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     assert(aura_shell);
     aura_shell->xwl = xwl;
     aura_shell->id = id;
-    aura_shell->version = MIN(2, version);
+    aura_shell->version = MIN(3, version);
     aura_shell->internal = wl_registry_bind(
         registry, id, &zaura_shell_interface, aura_shell->version);
     assert(!xwl->aura_shell);
@@ -3606,6 +3615,7 @@ static void xwl_usage() {
          "[--display=DISPLAY] "
          "[--no-exit-with-child] "
          "[--no-clipboard-manager] "
+         "[--frame-color=COLOR] "
          "PROGRAM [ARGS...]\n");
 }
 
@@ -3637,6 +3647,8 @@ int main(int argc, char **argv) {
       .app_id = NULL,
       .exit_with_child = 1,
       .clipboard_manager = 1,
+      .frame_color = 0,
+      .has_frame_color = 0,
       .default_seat = NULL,
       .selection_window = XCB_WINDOW_NONE,
       .selection_owner = XCB_WINDOW_NONE,
@@ -3684,6 +3696,7 @@ int main(int argc, char **argv) {
       .colormaps = {0}};
   const char *scale = getenv("XWL_SCALE");
   const char *clipboard_manager = getenv("XWL_CLIPBOARD_MANAGER");
+  const char *frame_color = getenv("XWL_FRAME_COLOR");
   struct wl_event_loop *event_loop;
   int sv[2], ds[2], wm[2];
   pid_t pid;
@@ -3718,6 +3731,10 @@ int main(int argc, char **argv) {
       xwl.exit_with_child = 0;
     } else if (strstr(arg, "--no-clipboard-manager") == arg) {
       clipboard_manager = "0";
+    } else if (strstr(arg, "--frame-color") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      frame_color = s;
     } else if (arg[0] == '-') {
       if (strcmp(arg, "--") != 0) {
         fprintf(stderr, "Option `%s' is unknown.\n", arg);
@@ -3741,6 +3758,14 @@ int main(int argc, char **argv) {
 
   if (clipboard_manager)
     xwl.clipboard_manager = !!strcmp(clipboard_manager, "0");
+
+  if (frame_color) {
+    int r, g, b;
+    if (sscanf(frame_color, "#%02x%02x%02x", &r, &g, &b) == 3) {
+      xwl.frame_color = 0xff000000 | (r << 16) | (g << 8) | (b << 0);
+      xwl.has_frame_color = 1;
+    }
+  }
 
   xwl.display = wl_display_connect(NULL);
   assert(xwl.display);
