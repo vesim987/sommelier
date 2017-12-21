@@ -301,6 +301,7 @@ struct xwl {
   int clipboard_manager;
   uint32_t frame_color;
   int has_frame_color;
+  int show_window_title;
   struct xwl_host_seat *default_seat;
   xcb_window_t selection_window;
   xcb_window_t selection_owner;
@@ -821,7 +822,7 @@ static void xwl_window_update(struct xwl_window *window) {
     }
     if (parent)
       zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
-    if (window->name)
+    if (window->name && xwl->show_window_title)
       zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
     if (app_id)
       zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
@@ -3033,7 +3034,7 @@ static void xwl_handle_property_notify(struct xwl *xwl,
       }
     }
 
-    if (!window->xdg_toplevel)
+    if (!window->xdg_toplevel || !xwl->show_window_title)
       return;
 
     if (window->name) {
@@ -3649,6 +3650,7 @@ int main(int argc, char **argv) {
       .clipboard_manager = 1,
       .frame_color = 0,
       .has_frame_color = 0,
+      .show_window_title = 0,
       .default_seat = NULL,
       .selection_window = XCB_WINDOW_NONE,
       .selection_owner = XCB_WINDOW_NONE,
@@ -3697,6 +3699,7 @@ int main(int argc, char **argv) {
   const char *scale = getenv("XWL_SCALE");
   const char *clipboard_manager = getenv("XWL_CLIPBOARD_MANAGER");
   const char *frame_color = getenv("XWL_FRAME_COLOR");
+  const char *show_window_title = getenv("XWL_SHOW_WINDOW_TITLE");
   struct wl_event_loop *event_loop;
   int sv[2], ds[2], wm[2];
   pid_t pid;
@@ -3735,6 +3738,8 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       frame_color = s;
+    } else if (strstr(arg, "--show-window-title") == arg) {
+      show_window_title = "1";
     } else if (arg[0] == '-') {
       if (strcmp(arg, "--") != 0) {
         fprintf(stderr, "Option `%s' is unknown.\n", arg);
@@ -3766,6 +3771,9 @@ int main(int argc, char **argv) {
       xwl.has_frame_color = 1;
     }
   }
+
+  if (show_window_title)
+    xwl.show_window_title = !!strcmp(show_window_title, "0");
 
   xwl.display = wl_display_connect(NULL);
   assert(xwl.display);
