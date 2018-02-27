@@ -10,6 +10,7 @@ Package: xwl
 Architecture: any
 Multi-Arch: foreign
 Depends: ${misc:Depends}, ${shlibs:Depends}
+Recommends: x11-xserver-utils
 Description: X11 to Wayland translator
  Xwl is a minimal X window manager and nested Wayland compositor that uses
  Xwayland to allow unmodified X clients to run as Wayland clients.
