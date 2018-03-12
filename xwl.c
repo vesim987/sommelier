@@ -30,6 +30,8 @@
 #include <xcb/xfixes.h>
 
 #include "aura-shell-client-protocol.h"
+#include "drm-server-protocol.h"
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "version.h"
 #include "viewporter-client-protocol.h"
 #include "xdg-shell-unstable-v6-client-protocol.h"
@@ -205,6 +207,20 @@ struct xwl_viewporter {
   struct wp_viewporter *internal;
 };
 
+struct xwl_linux_dmabuf {
+  struct xwl *xwl;
+  uint32_t id;
+  uint32_t version;
+  struct wl_global *host_drm_global;
+  struct zwp_linux_dmabuf_v1 *internal;
+};
+
+struct xwl_host_drm {
+  struct xwl_linux_dmabuf *linux_dmabuf;
+  uint32_t version;
+  struct wl_resource *resource;
+};
+
 struct xwl_config {
   uint32_t serial;
   uint32_t mask;
@@ -281,11 +297,13 @@ struct xwl {
   struct xwl_xdg_shell *xdg_shell;
   struct xwl_aura_shell *aura_shell;
   struct xwl_viewporter *viewporter;
+  struct xwl_linux_dmabuf *linux_dmabuf;
   struct wl_list outputs;
   struct wl_list seats;
   struct wl_event_source *display_event_source;
   struct wl_event_source *sigchld_event_source;
   int wm_fd;
+  const char *drm_device;
   pid_t xwayland_pid;
   pid_t child_pid;
   xcb_connection_t *connection;
@@ -2035,6 +2053,94 @@ static void xwl_bind_host_seat(struct wl_client *client, void *data,
   }
 }
 
+static void xwl_drm_authenticate(struct wl_client *client,
+                                 struct wl_resource *resource, uint32_t id) {}
+
+static void xwl_drm_create_buffer(struct wl_client *client,
+                                  struct wl_resource *resource, uint32_t id,
+                                  uint32_t name, int32_t width, int32_t height,
+                                  uint32_t stride, uint32_t format) {
+  assert(0);
+}
+
+static void xwl_drm_create_planar_buffer(
+    struct wl_client *client, struct wl_resource *resource, uint32_t id,
+    uint32_t name, int32_t width, int32_t height, uint32_t format,
+    int32_t offset0, int32_t stride0, int32_t offset1, int32_t stride1,
+    int32_t offset2, int32_t stride2) {
+  assert(0);
+}
+
+static void xwl_drm_create_prime_buffer(
+    struct wl_client *client, struct wl_resource *resource, uint32_t id,
+    int32_t name, int32_t width, int32_t height, uint32_t format,
+    int32_t offset0, int32_t stride0, int32_t offset1, int32_t stride1,
+    int32_t offset2, int32_t stride2) {
+  struct xwl_host_drm *host = wl_resource_get_user_data(resource);
+  struct xwl_host_buffer *host_buffer;
+  struct zwp_linux_buffer_params_v1 *buffer_params;
+
+  assert(name >= 0);
+  assert(!offset1);
+  assert(!stride1);
+  assert(!offset2);
+  assert(!stride2);
+
+  host_buffer = malloc(sizeof(*host_buffer));
+  assert(host_buffer);
+
+  host_buffer->width = width;
+  host_buffer->height = height;
+  host_buffer->resource =
+      wl_resource_create(client, &wl_buffer_interface, 1, id);
+  wl_resource_set_implementation(host_buffer->resource,
+                                 &xwl_buffer_implementation, host_buffer,
+                                 xwl_destroy_host_buffer);
+  buffer_params =
+      zwp_linux_dmabuf_v1_create_params(host->linux_dmabuf->internal);
+  zwp_linux_buffer_params_v1_add(buffer_params, name, 0, offset0, stride0, 0,
+                                 0);
+  host_buffer->proxy = zwp_linux_buffer_params_v1_create_immed(
+      buffer_params, width, height, format, 0);
+  zwp_linux_buffer_params_v1_destroy(buffer_params);
+  close(name);
+  wl_buffer_set_user_data(host_buffer->proxy, host_buffer);
+  wl_buffer_add_listener(host_buffer->proxy, &xwl_buffer_listener, host_buffer);
+}
+
+static const struct wl_drm_interface xwl_drm_implementation = {
+    xwl_drm_authenticate, xwl_drm_create_buffer, xwl_drm_create_planar_buffer,
+    xwl_drm_create_prime_buffer};
+
+static void xwl_destroy_host_drm(struct wl_resource *resource) {
+  struct xwl_host_drm *host = wl_resource_get_user_data(resource);
+
+  wl_resource_set_user_data(resource, NULL);
+  free(host);
+}
+
+static void xwl_bind_host_drm(struct wl_client *client, void *data,
+                              uint32_t version, uint32_t id) {
+  struct xwl_linux_dmabuf *linux_dmabuf = (struct xwl_linux_dmabuf *)data;
+  struct xwl_host_drm *host;
+
+  host = malloc(sizeof(*host));
+  assert(host);
+  host->linux_dmabuf = linux_dmabuf;
+  host->version = MIN(version, 2);
+  host->resource =
+      wl_resource_create(client, &wl_drm_interface, host->version, id);
+  wl_resource_set_implementation(host->resource, &xwl_drm_implementation, host,
+                                 xwl_destroy_host_drm);
+
+  wl_drm_send_device(host->resource, linux_dmabuf->xwl->drm_device);
+  wl_drm_send_format(host->resource, WL_DRM_FORMAT_ARGB8888);
+  wl_drm_send_format(host->resource, WL_DRM_FORMAT_XRGB8888);
+  wl_drm_send_format(host->resource, WL_DRM_FORMAT_RGB565);
+  if (host->version >= WL_DRM_CREATE_PRIME_BUFFER_SINCE_VERSION)
+    wl_drm_send_capabilities(host->resource, WL_DRM_CAPABILITY_PRIME);
+}
+
 static void xwl_registry_handler(void *data, struct wl_registry *registry,
                                  uint32_t id, const char *interface,
                                  uint32_t version) {
@@ -2134,6 +2240,26 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
         wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
     assert(!xwl->viewporter);
     xwl->viewporter = viewporter;
+  } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
+    struct xwl_linux_dmabuf *linux_dmabuf =
+        malloc(sizeof(struct xwl_linux_dmabuf));
+    assert(linux_dmabuf);
+    linux_dmabuf->xwl = xwl;
+    linux_dmabuf->id = id;
+    linux_dmabuf->version = MIN(2, version);
+    linux_dmabuf->host_drm_global = NULL;
+    linux_dmabuf->internal = wl_registry_bind(
+        registry, id, &zwp_linux_dmabuf_v1_interface, linux_dmabuf->version);
+    assert(!xwl->linux_dmabuf);
+    xwl->linux_dmabuf = linux_dmabuf;
+
+    // Register wl_drm global if DRM device is available and DMABuf interface
+    // version is sufficient.
+    if (xwl->drm_device && linux_dmabuf->version >= 2) {
+      linux_dmabuf->host_drm_global =
+          wl_global_create(xwl->host_display, &wl_drm_interface, 2,
+                           linux_dmabuf, xwl_bind_host_drm);
+    }
   }
 }
 
@@ -2184,6 +2310,14 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
     wp_viewporter_destroy(xwl->viewporter->internal);
     free(xwl->viewporter);
     xwl->viewporter = NULL;
+    return;
+  }
+  if (xwl->linux_dmabuf && xwl->linux_dmabuf->id == id) {
+    if (xwl->linux_dmabuf->host_drm_global)
+      wl_global_destroy(xwl->linux_dmabuf->host_drm_global);
+    zwp_linux_dmabuf_v1_destroy(xwl->linux_dmabuf->internal);
+    free(xwl->linux_dmabuf);
+    xwl->linux_dmabuf = NULL;
     return;
   }
   wl_list_for_each(output, &xwl->outputs, link) {
@@ -3617,6 +3751,8 @@ static void xwl_usage() {
          "[--no-exit-with-child] "
          "[--no-clipboard-manager] "
          "[--frame-color=COLOR] "
+         "[--drm-device=DEVICE] "
+         "[--glamor] "
          "PROGRAM [ARGS...]\n");
 }
 
@@ -3633,9 +3769,11 @@ int main(int argc, char **argv) {
       .xdg_shell = NULL,
       .aura_shell = NULL,
       .viewporter = NULL,
+      .linux_dmabuf = NULL,
       .display_event_source = NULL,
       .sigchld_event_source = NULL,
       .wm_fd = -1,
+      .drm_device = NULL,
       .xwayland_pid = -1,
       .child_pid = -1,
       .connection = NULL,
@@ -3700,6 +3838,8 @@ int main(int argc, char **argv) {
   const char *clipboard_manager = getenv("XWL_CLIPBOARD_MANAGER");
   const char *frame_color = getenv("XWL_FRAME_COLOR");
   const char *show_window_title = getenv("XWL_SHOW_WINDOW_TITLE");
+  const char *drm_device = getenv("XWL_DRM_DEVICE");
+  const char *glamor = getenv("XWL_GLAMOR");
   struct wl_event_loop *event_loop;
   int sv[2], ds[2], wm[2];
   pid_t pid;
@@ -3740,6 +3880,12 @@ int main(int argc, char **argv) {
       frame_color = s;
     } else if (strstr(arg, "--show-window-title") == arg) {
       show_window_title = "1";
+    } else if (strstr(arg, "--drm-device") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      drm_device = s;
+    } else if (strstr(arg, "--glamor") == arg) {
+      glamor = "1";
     } else if (arg[0] == '-') {
       if (strcmp(arg, "--") != 0) {
         fprintf(stderr, "Option `%s' is unknown.\n", arg);
@@ -3774,6 +3920,9 @@ int main(int argc, char **argv) {
 
   if (show_window_title)
     xwl.show_window_title = !!strcmp(show_window_title, "0");
+
+  if (drm_device && !access(drm_device, 0))
+    xwl.drm_device = drm_device;
 
   xwl.display = wl_display_connect(NULL);
   assert(xwl.display);
@@ -3847,7 +3996,13 @@ int main(int argc, char **argv) {
     args[i++] = "-nolisten";
     args[i++] = "tcp";
     args[i++] = "-rootless";
-    args[i++] = "-shm";
+    if (xwl.drm_device) {
+      // Use DRM and software rendering unless glamor is enabled.
+      if (!glamor || !strcmp(glamor, "0"))
+        args[i++] = "-drm";
+    } else {
+      args[i++] = "-shm";
+    }
     args[i++] = "-displayfd";
     args[i++] = display_fd_str;
     args[i++] = "-wm";
