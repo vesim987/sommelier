@@ -1,5 +1,5 @@
-xwl (0.12-1) UNRELEASED; urgency=low
+xwl (0.13-1) UNRELEASED; urgency=low
 
   * Initial release.
 
- -- David Reveman <reveman@chromium.org>  Thu, 21 Dec 2017 01:29:36 +0000
+ -- David Reveman <reveman@chromium.org>  Mon, 12 Mar 2018 18:08:16 -0400
