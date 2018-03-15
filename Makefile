@@ -56,13 +56,13 @@ install: all
 		$(DESTDIR)$(PREFIX)/bin/xwl-run
 	install -D xwlrc $(DESTDIR)$(SYSCONFDIR)/xwlrc
 	install -m 644 -D xwl@.service \
-		$(DESTDIR)$(SYSCONFDIR)/systemd/user/xwl@.service
+		$(DESTDIR)$(PREFIX)/lib/systemd/user/xwl@.service
 	install -m 644 -D xwl.sh $(DESTDIR)$(SYSCONFDIR)/profile.d/xwl.sh
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/xwl-run
 	rm -f $(DESTDIR)$(SYSCONFDIR)/xwlrc
-	rm -f $(DESTDIR)$(SYSCONFDIR)/systemd/user/xwl@.service
+	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/user/xwl@.service
 	rm -f $(DESTDIR)$(SYSCONFDIR)/profile.d/xwl.sh
 
 update-version: version-clean
