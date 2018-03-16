@@ -1281,6 +1281,9 @@ static void xwl_bind_host_shm(struct wl_client *client, void *data,
                                  wl_resource_get_version(host->resource));
   wl_shm_set_user_data(host->proxy, host);
   wl_shm_add_listener(host->proxy, &xwl_shm_listener, host);
+
+  // Need roundtrip for formats.
+  wl_display_roundtrip(shm->xwl->display);
 }
 
 static void
@@ -1437,6 +1440,9 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
     zaura_output_add_listener(host->aura_output, &xwl_aura_output_listener,
                               host);
   }
+
+  // Need roundtrip for geometry, mode and scale.
+  wl_display_roundtrip(xwl->display);
 }
 
 static void xwl_data_offer_destroy(struct xwl_data_offer *host) {
@@ -2061,6 +2067,9 @@ static void xwl_bind_host_seat(struct wl_client *client, void *data,
                                   &xwl_data_device_listener, seat->xwl);
     }
   }
+
+  // Need roundtrip for capabilities and name.
+  wl_display_roundtrip(seat->xwl->display);
 }
 
 static void xwl_drm_authenticate(struct wl_client *client,
