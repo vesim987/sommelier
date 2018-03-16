@@ -1249,6 +1249,14 @@ static void xwl_shm_create_host_pool(struct wl_client *client,
 static const struct wl_shm_interface xwl_shm_implementation = {
     xwl_shm_create_host_pool};
 
+static void xwl_shm_format(void *data, struct wl_shm *shm, uint32_t format) {
+  struct xwl_host_shm *host = wl_shm_get_user_data(shm);
+
+  wl_shm_send_format(host->resource, format);
+}
+
+static const struct wl_shm_listener xwl_shm_listener = {xwl_shm_format};
+
 static void xwl_destroy_host_shm(struct wl_resource *resource) {
   struct xwl_host_shm *host = wl_resource_get_user_data(resource);
 
@@ -1272,6 +1280,7 @@ static void xwl_bind_host_shm(struct wl_client *client, void *data,
                                  shm->id, &wl_shm_interface,
                                  wl_resource_get_version(host->resource));
   wl_shm_set_user_data(host->proxy, host);
+  wl_shm_add_listener(host->proxy, &xwl_shm_listener, host);
 }
 
 static void
