@@ -2,13 +2,14 @@
 
 set -ex
 
-install_deps() {
-    sudo apt-get install debhelper \
-                         libsystemd-dev \
-                         libwayland-dev \
-                         libwayland-bin \
-                         libxcb-composite0-dev \
-                         pkg-config
+# Move docker on kokoro to use the scratch /tmpfs space.
+setup_docker() {
+    sudo stop docker
+
+    sudo mv /var/lib/docker /tmpfs/
+    sudo ln -s /tmpfs/docker /var/lib/docker
+
+    sudo start docker
 }
 
 main() {
@@ -23,10 +24,15 @@ main() {
 
     cd "${src_root}"
 
-    install_deps
+    setup_docker
 
-    # Build all targets.
-    make deb
+    local image_name=xwl-build-stretch
+
+    docker build "${src_root}/kokoro" -t "${image_name}"
+
+    docker run --volume "${src_root}:/src:rw" \
+               --user="$(id -u)" \
+               "${image_name}"
 
     # Copy resulting debs to results directory.
     cp *.deb "${result_dir}"
