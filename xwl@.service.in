@@ -3,7 +3,7 @@ Description=Xwayland server at display %i
 
 [Service]
 Type=notify
-ExecStart=@bindir@/xwl-run --display=%i --no-exit-with-child /bin/sh -c "systemctl --user import-environment DISPLAY XWL_VERSION; @sysconfdir@/xwlrc"
+ExecStart=@bindir@/xwl-run --x-display=%i --no-exit-with-child /bin/sh -c "systemctl --user import-environment DISPLAY XWL_VERSION; @sysconfdir@/xwlrc"
 Restart=always
 
 [Install]
