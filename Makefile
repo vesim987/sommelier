@@ -17,7 +17,7 @@ DIST_VERSION_MINOR := $(word 2,$(DIST_VERSION_BITS))
 DIST_VERSION_MINOR_NEXT := $(shell expr $(DIST_VERSION_MINOR) + 1)
 CFLAGS=-g -Wall `pkg-config --cflags xcb xcb-composite xcb-xfixes wayland-server wayland-client libsystemd` -I. -DXWAYLAND_PATH=\"$(PREFIX)/bin\"
 LDFLAGS=-lpthread -lm `pkg-config --libs xcb xcb-composite xcb-xfixes wayland-server wayland-client libsystemd`
-DEPS = xdg-shell-unstable-v6-client-protocol.h aura-shell-client-protocol.h viewporter-client-protocol.h linux-dmabuf-unstable-v1-client-protocol.h drm-server-protocol.h version.h
+DEPS = xdg-shell-unstable-v6-client-protocol.h xdg-shell-unstable-v6-server-protocol.h aura-shell-client-protocol.h viewporter-client-protocol.h linux-dmabuf-unstable-v1-client-protocol.h drm-server-protocol.h version.h
 OBJECTS = xwl.o xdg-shell-unstable-v6-protocol.o aura-shell-protocol.o viewporter-protocol.o linux-dmabuf-unstable-v1-protocol.o drm-protocol.o
 
 all: xwl-run xwl@.service
