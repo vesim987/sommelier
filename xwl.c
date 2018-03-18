@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5131,6 +5132,7 @@ static void xwl_usage() {
          "[-X] "
          "[--master] "
          "[--socket=SOCKET] "
+         "[--display=DISPLAY] "
          "[--scale=SCALE] "
          "[--app-id=ID] "
          "[--x-display=DISPLAY] "
@@ -5226,6 +5228,7 @@ int main(int argc, char **argv) {
           },
       .visual_ids = {0},
       .colormaps = {0}};
+  const char *display = getenv("XWL_DISPLAY");
   const char *scale = getenv("XWL_SCALE");
   const char *clipboard_manager = getenv("XWL_CLIPBOARD_MANAGER");
   const char *frame_color = getenv("XWL_FRAME_COLOR");
@@ -5233,6 +5236,7 @@ int main(int argc, char **argv) {
   const char *drm_device = getenv("XWL_DRM_DEVICE");
   const char *glamor = getenv("XWL_GLAMOR");
   const char *socket_name = "wayland-0";
+  const char *runtime_dir;
   struct wl_event_loop *event_loop;
   struct wl_listener client_destroy_listener = {.notify =
                                                     xwl_client_destroy_notify};
@@ -5261,6 +5265,10 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       socket_name = s;
+    } else if (strstr(arg, "--display") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      display = s;
     } else if (strstr(arg, "--peer-pid") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -5314,19 +5322,19 @@ int main(int argc, char **argv) {
     }
   }
 
+  runtime_dir = getenv("XDG_RUNTIME_DIR");
+  if (!runtime_dir) {
+    fprintf(stderr, "XDG_RUNTIME_DIR not set in the environment\n");
+    exit(1);
+  }
+
   if (master) {
-    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     char lock_addr[UNIX_PATH_MAX + LOCK_SUFFIXLEN];
     struct sockaddr_un addr;
     struct sigaction sa;
     struct stat sock_stat;
     int lock_fd;
     int sock_fd;
-
-    if (!runtime_dir) {
-      fprintf(stderr, "XDG_RUNTIME_DIR not set in the environment\n");
-      exit(1);
-    }
 
     addr.sun_family = AF_LOCAL;
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", runtime_dir,
@@ -5406,7 +5414,8 @@ int main(int argc, char **argv) {
         // forward some flags.
         for (j = 1; j < argc; ++j) {
           char *arg = argv[j];
-          if (strstr(arg, "--scale") == arg ||
+          if (strstr(arg, "--display") == arg ||
+              strstr(arg, "--scale") == arg ||
               strstr(arg, "--drm-device") == arg) {
             args[i++] = arg;
           }
@@ -5463,8 +5472,29 @@ int main(int argc, char **argv) {
     client_fd = sv[0];
   }
 
-  xwl.display = wl_display_connect(NULL);
-  assert(xwl.display);
+  if (display == NULL)
+    display = getenv("WAYLAND_DISPLAY");
+  if (display == NULL)
+    display = "wayland-0";
+
+  if (display[0] == '/') {
+    char *saved_runtime_dir = strdup(runtime_dir);
+    char *dir_display = strdup(display);
+    char *base_display = strdup(display);
+
+    setenv("XDG_RUNTIME_DIR", dirname(dir_display), 1);
+    xwl.display = wl_display_connect(basename(base_display));
+    setenv("XDG_RUNTIME_DIR", saved_runtime_dir, 1);
+    free(dir_display);
+    free(base_display);
+  } else {
+    xwl.display = wl_display_connect(display);
+  }
+
+  if (!xwl.display) {
+    fprintf(stderr, "failed to connect to %s\n", display);
+    exit(1);
+  }
 
   wl_list_init(&xwl.registries);
   wl_list_init(&xwl.globals);
