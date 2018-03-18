@@ -4950,9 +4950,6 @@ static int xwl_handle_sigchld(int signal_number, void *data) {
     }
   }
 
-  if (xwl->child_pid < 0 && xwl->xwayland_pid < 0)
-    exit(0);
-
   return 1;
 }
 
@@ -5567,9 +5564,9 @@ int main(int argc, char **argv) {
       xwl.child_pid = pid;
     }
     close(sv[1]);
-  } else {
-    wl_client_add_destroy_listener(xwl.client, &client_destroy_listener);
   }
+
+  wl_client_add_destroy_listener(xwl.client, &client_destroy_listener);
 
   do {
     wl_display_flush_clients(xwl.host_display);
