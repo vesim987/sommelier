@@ -1784,9 +1784,12 @@ static void xwl_host_pointer_release(struct wl_client *client,
 static const struct wl_pointer_interface xwl_pointer_implementation = {
     xwl_host_pointer_set_cursor, xwl_host_pointer_release};
 
-static void xwl_set_last_event_serial(struct xwl_host_surface *host_surface) {
-  host_surface->last_event_serial =
-      wl_display_next_serial(host_surface->xwl->display);
+static void xwl_set_last_event_serial(struct wl_resource *surface_resource,
+                                      uint32_t serial) {
+  struct xwl_host_surface *host_surface =
+      wl_resource_get_user_data(surface_resource);
+
+  host_surface->last_event_serial = serial;
 }
 
 static void xwl_pointer_set_focus(struct xwl_host_pointer *host,
@@ -1837,6 +1840,8 @@ static void xwl_pointer_enter(void *data, struct wl_pointer *pointer,
 
   xwl_pointer_set_focus(host, serial, host_surface, x, y);
 
+  if (host->focus_resource)
+    xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
 }
 
@@ -1862,6 +1867,8 @@ static void xwl_pointer_button(void *data, struct wl_pointer *pointer,
 
   wl_pointer_send_button(host->resource, serial, time, button, state);
 
+  if (host->focus_resource)
+    xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
 }
 
@@ -1875,9 +1882,6 @@ static void xwl_pointer_axis(void *data, struct wl_pointer *pointer,
 
 static void xwl_pointer_frame(void *data, struct wl_pointer *pointer) {
   struct xwl_host_pointer *host = wl_pointer_get_user_data(pointer);
-
-  if (host->focus_resource)
-    xwl_set_last_event_serial(wl_resource_get_user_data(host->focus_resource));
 
   wl_pointer_send_frame(host->resource);
 }
@@ -1979,11 +1983,10 @@ static void xwl_keyboard_key(void *data, struct wl_keyboard *keyboard,
                              uint32_t state) {
   struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
 
-  if (host->focus_resource)
-    xwl_set_last_event_serial(wl_resource_get_user_data(host->focus_resource));
-
   wl_keyboard_send_key(host->resource, serial, time, key, state);
 
+  if (host->focus_resource)
+    xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
 }
 
@@ -1996,6 +1999,8 @@ static void xwl_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
   wl_keyboard_send_modifiers(host->resource, serial, mods_depressed,
                              mods_latched, mods_locked, group);
 
+  if (host->focus_resource)
+    xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
 }
 
@@ -2048,6 +2053,8 @@ static void xwl_host_touch_down(void *data, struct wl_touch *touch,
   wl_touch_send_down(host->resource, serial, time, host_surface->resource, id,
                      x * scale, y * scale);
 
+  if (host->focus_resource)
+    xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
 }
 
@@ -2061,6 +2068,8 @@ static void xwl_host_touch_up(void *data, struct wl_touch *touch,
 
   wl_touch_send_up(host->resource, serial, time, id);
 
+  if (host->focus_resource)
+    xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
 }
 
@@ -2075,9 +2084,6 @@ static void xwl_host_touch_motion(void *data, struct wl_touch *touch,
 
 static void xwl_host_touch_frame(void *data, struct wl_touch *touch) {
   struct xwl_host_touch *host = wl_touch_get_user_data(touch);
-
-  if (host->focus_resource)
-    xwl_set_last_event_serial(wl_resource_get_user_data(host->focus_resource));
 
   wl_touch_send_frame(host->resource);
 }
