@@ -47,6 +47,22 @@
 
 struct xwl;
 
+struct xwl_global {
+  struct xwl *xwl;
+  const struct wl_interface *interface;
+  uint32_t name;
+  uint32_t version;
+  void *data;
+  wl_global_bind_func_t bind;
+  struct wl_list link;
+};
+
+struct xwl_host_registry {
+  struct xwl *xwl;
+  struct wl_resource *resource;
+  struct wl_list link;
+};
+
 struct xwl_host_callback {
   struct wl_resource *resource;
   struct wl_callback *proxy;
@@ -56,7 +72,7 @@ struct xwl_compositor {
   struct xwl *xwl;
   uint32_t id;
   uint32_t version;
-  struct wl_global *host_global;
+  struct xwl_global *host_global;
   struct wl_compositor *internal;
 };
 
@@ -105,7 +121,7 @@ struct xwl_host_shm {
 struct xwl_shm {
   struct xwl *xwl;
   uint32_t id;
-  struct wl_global *host_global;
+  struct xwl_global *host_global;
 };
 
 struct xwl_host_shell {
@@ -117,7 +133,7 @@ struct xwl_host_shell {
 struct xwl_shell {
   struct xwl *xwl;
   uint32_t id;
-  struct wl_global *host_global;
+  struct xwl_global *host_global;
 };
 
 struct xwl_host_output {
@@ -138,7 +154,7 @@ struct xwl_output {
   struct xwl *xwl;
   uint32_t id;
   uint32_t version;
-  struct wl_global *host_global;
+  struct xwl_global *host_global;
   struct wl_list link;
 };
 
@@ -146,7 +162,7 @@ struct xwl_seat {
   struct xwl *xwl;
   uint32_t id;
   uint32_t version;
-  struct wl_global *host_global;
+  struct xwl_global *host_global;
   uint32_t last_serial;
   struct wl_list link;
 };
@@ -187,7 +203,7 @@ struct xwl_data_device_manager {
   struct xwl *xwl;
   uint32_t id;
   uint32_t version;
-  struct wl_global *host_global;
+  struct xwl_global *host_global;
   struct wl_data_device_manager *internal;
 };
 
@@ -227,7 +243,7 @@ struct xwl_data_source {
 struct xwl_xdg_shell {
   struct xwl *xwl;
   uint32_t id;
-  struct wl_global *host_global;
+  struct xwl_global *host_global;
   struct zxdg_shell_v6 *internal;
 };
 
@@ -264,7 +280,7 @@ struct xwl_host_xdg_positioner {
 struct xwl_subcompositor {
   struct xwl *xwl;
   uint32_t id;
-  struct wl_global *host_global;
+  struct xwl_global *host_global;
 };
 
 struct xwl_host_subcompositor {
@@ -296,7 +312,7 @@ struct xwl_linux_dmabuf {
   struct xwl *xwl;
   uint32_t id;
   uint32_t version;
-  struct wl_global *host_drm_global;
+  struct xwl_global *host_drm_global;
   struct zwp_linux_dmabuf_v1 *internal;
 };
 
@@ -393,6 +409,9 @@ struct xwl {
   pid_t xwayland_pid;
   pid_t child_pid;
   pid_t peer_pid;
+  struct wl_list registries;
+  struct wl_list globals;
+  int next_global_id;
   xcb_connection_t *connection;
   const xcb_query_extension_reply_t *xfixes_extension;
   xcb_screen_t *screen;
@@ -1050,6 +1069,7 @@ static void xwl_frame_callback_done(void *data, struct wl_callback *callback,
   struct xwl_host_callback *host = wl_callback_get_user_data(callback);
 
   wl_callback_send_done(host->resource, time);
+  wl_resource_destroy(host->resource);
 }
 
 static const struct wl_callback_listener xwl_frame_callback_listener = {
@@ -1454,9 +1474,6 @@ static void xwl_bind_host_shm(struct wl_client *client, void *data,
                                  wl_resource_get_version(host->resource));
   wl_shm_set_user_data(host->proxy, host);
   wl_shm_add_listener(host->proxy, &xwl_shm_listener, host);
-
-  // Need roundtrip for formats.
-  wl_display_roundtrip(shm->xwl->display);
 }
 
 static void
@@ -1583,7 +1600,11 @@ static void xwl_destroy_host_output(struct wl_resource *resource) {
 
   if (host->aura_output)
     zaura_output_destroy(host->aura_output);
-  wl_output_destroy(host->proxy);
+  if (wl_output_get_version(host->proxy) >= WL_OUTPUT_RELEASE_SINCE_VERSION) {
+    wl_output_release(host->proxy);
+  } else {
+    wl_output_destroy(host->proxy);
+  }
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
@@ -1623,9 +1644,6 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
     zaura_output_add_listener(host->aura_output, &xwl_aura_output_listener,
                               host);
   }
-
-  // Need roundtrip for geometry, mode and scale.
-  wl_display_roundtrip(xwl->display);
 }
 
 static void xwl_internal_data_offer_destroy(struct xwl_data_offer *host) {
@@ -2073,7 +2091,11 @@ static const struct wl_touch_listener xwl_touch_listener = {
 static void xwl_destroy_host_pointer(struct wl_resource *resource) {
   struct xwl_host_pointer *host = wl_resource_get_user_data(resource);
 
-  wl_pointer_destroy(host->proxy);
+  if (wl_pointer_get_version(host->proxy) >= WL_POINTER_RELEASE_SINCE_VERSION) {
+    wl_pointer_release(host->proxy);
+  } else {
+    wl_pointer_destroy(host->proxy);
+  }
   wl_list_remove(&host->focus_resource_listener.link);
   wl_resource_set_user_data(resource, NULL);
   free(host);
@@ -2116,7 +2138,12 @@ static void xwl_host_seat_get_host_pointer(struct wl_client *client,
 static void xwl_destroy_host_keyboard(struct wl_resource *resource) {
   struct xwl_host_keyboard *host = wl_resource_get_user_data(resource);
 
-  wl_keyboard_destroy(host->proxy);
+  if (wl_keyboard_get_version(host->proxy) >=
+      WL_KEYBOARD_RELEASE_SINCE_VERSION) {
+    wl_keyboard_release(host->proxy);
+  } else {
+    wl_keyboard_destroy(host->proxy);
+  }
   wl_list_remove(&host->focus_resource_listener.link);
   wl_resource_set_user_data(resource, NULL);
   free(host);
@@ -2154,15 +2181,17 @@ static void xwl_host_seat_get_host_keyboard(struct wl_client *client,
       xwl_keyboard_focus_resource_destroyed;
   host_keyboard->focus_resource = NULL;
   host_keyboard->focus_serial = 0;
-
-  // Need roundtrip for keymap.
-  wl_display_roundtrip(host->seat->xwl->display);
 }
 
 static void xwl_destroy_host_touch(struct wl_resource *resource) {
   struct xwl_host_touch *host = wl_resource_get_user_data(resource);
 
-  wl_touch_destroy(host->proxy);
+  if (wl_touch_get_version(host->proxy) >=
+      WL_TOUCH_RELEASE_SINCE_VERSION) {
+    wl_touch_release(host->proxy);
+  } else {
+    wl_touch_destroy(host->proxy);
+  }
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
@@ -2222,7 +2251,8 @@ static void xwl_seat_capabilities(void *data, struct wl_seat *seat,
 static void xwl_seat_name(void *data, struct wl_seat *seat, const char *name) {
   struct xwl_host_seat *host = wl_seat_get_user_data(seat);
 
-  wl_seat_send_name(host->resource, name);
+  if (wl_resource_get_version(host->resource) >= WL_SEAT_NAME_SINCE_VERSION)
+    wl_seat_send_name(host->resource, name);
 }
 
 static const struct wl_seat_listener xwl_seat_listener = {xwl_seat_capabilities,
@@ -2234,7 +2264,10 @@ static void xwl_destroy_host_seat(struct wl_resource *resource) {
   if (host->seat->xwl->default_seat == host)
     host->seat->xwl->default_seat = NULL;
 
-  wl_seat_destroy(host->proxy);
+  if (wl_seat_get_version(host->proxy) >= WL_SEAT_RELEASE_SINCE_VERSION)
+    wl_seat_release(host->proxy);
+  else
+    wl_seat_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
@@ -2259,7 +2292,8 @@ static void xwl_bind_host_seat(struct wl_client *client, void *data,
 
   if (!seat->xwl->default_seat) {
     seat->xwl->default_seat = host;
-    if (seat->xwl->data_device_manager) {
+    if (seat->xwl->data_device_manager &&
+        seat->xwl->data_device_manager->internal) {
       seat->xwl->selection_data_device = wl_data_device_manager_get_data_device(
           seat->xwl->data_device_manager->internal, host->proxy);
       wl_data_device_add_listener(seat->xwl->selection_data_device,
@@ -2267,9 +2301,6 @@ static void xwl_bind_host_seat(struct wl_client *client, void *data,
                                   seat->xwl);
     }
   }
-
-  // Need roundtrip for capabilities and name.
-  wl_display_roundtrip(seat->xwl->display);
 }
 
 static void xwl_drm_authenticate(struct wl_client *client,
@@ -3024,9 +3055,6 @@ static void xwl_data_device_data_offer(void *data,
                              host_data_offer);
 
   wl_data_device_send_data_offer(host->resource, host_data_offer->resource);
-
-  // Need roundtrip for mime-types.
-  wl_display_roundtrip(host->xwl->display);
 }
 
 static void xwl_data_device_enter(void *data,
@@ -3089,7 +3117,12 @@ static const struct wl_data_device_listener xwl_data_device_listener = {
 static void xwl_destroy_host_data_device(struct wl_resource *resource) {
   struct xwl_host_data_device *host = wl_resource_get_user_data(resource);
 
-  wl_data_device_destroy(host->proxy);
+  if (wl_data_device_get_version(host->proxy) >=
+      WL_DATA_DEVICE_RELEASE_SINCE_VERSION) {
+    wl_data_device_release(host->proxy);
+  } else {
+    wl_data_device_destroy(host->proxy);
+  }
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
@@ -3295,6 +3328,44 @@ static void xwl_bind_host_subcompositor(struct wl_client *client, void *data,
   wl_subcompositor_set_user_data(host->proxy, host);
 }
 
+static struct xwl_global *
+xwl_global_create(struct xwl *xwl, const struct wl_interface *interface,
+                  int version, void *data, wl_global_bind_func_t bind) {
+  struct xwl_host_registry *registry;
+  struct xwl_global *global;
+
+  assert(version > 0);
+  assert(version <= interface->version);
+
+  global = malloc(sizeof *global);
+  assert(global);
+
+  global->xwl = xwl;
+  global->name = xwl->next_global_id++;
+  global->interface = interface;
+  global->version = version;
+  global->data = data;
+  global->bind = bind;
+  wl_list_insert(xwl->globals.prev, &global->link);
+
+  wl_list_for_each(registry, &xwl->registries, link) {
+    wl_resource_post_event(registry->resource, WL_REGISTRY_GLOBAL, global->name,
+                           global->interface->name, global->version);
+  }
+
+  return global;
+}
+
+static void xwl_global_destroy(struct xwl_global *global) {
+  struct xwl_host_registry *registry;
+
+  wl_list_for_each(registry, &global->xwl->registries, link)
+      wl_resource_post_event(registry->resource, WL_REGISTRY_GLOBAL_REMOVE,
+                             global->name);
+  wl_list_remove(&global->link);
+  free(global);
+}
+
 static void xwl_registry_handler(void *data, struct wl_registry *registry,
                                  uint32_t id, const char *interface,
                                  uint32_t version) {
@@ -3307,9 +3378,9 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     compositor->id = id;
     assert(version >= 3);
     compositor->version = 3;
-    compositor->host_global = wl_global_create(
-        xwl->host_display, &wl_compositor_interface, compositor->version,
-        compositor, xwl_bind_host_compositor);
+    compositor->host_global =
+        xwl_global_create(xwl, &wl_compositor_interface, compositor->version,
+                          compositor, xwl_bind_host_compositor);
     compositor->internal = wl_registry_bind(
         registry, id, &wl_compositor_interface, compositor->version);
     assert(!xwl->compositor);
@@ -3321,15 +3392,15 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     subcompositor->xwl = xwl;
     subcompositor->id = id;
     subcompositor->host_global =
-        wl_global_create(xwl->host_display, &wl_subcompositor_interface, 1,
-                         subcompositor, xwl_bind_host_subcompositor);
+        xwl_global_create(xwl, &wl_subcompositor_interface, 1, subcompositor,
+                          xwl_bind_host_subcompositor);
   } else if (strcmp(interface, "wl_shm") == 0) {
     struct xwl_shm *shm = malloc(sizeof(struct xwl_shm));
     assert(shm);
     shm->xwl = xwl;
     shm->id = id;
-    shm->host_global = wl_global_create(xwl->host_display, &wl_shm_interface, 1,
-                                        shm, xwl_bind_host_shm);
+    shm->host_global =
+        xwl_global_create(xwl, &wl_shm_interface, 1, shm, xwl_bind_host_shm);
     assert(!xwl->shm);
     xwl->shm = shm;
   } else if (strcmp(interface, "wl_shell") == 0) {
@@ -3337,8 +3408,8 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     assert(shell);
     shell->xwl = xwl;
     shell->id = id;
-    shell->host_global = wl_global_create(
-        xwl->host_display, &wl_shell_interface, 1, shell, xwl_bind_host_shell);
+    shell->host_global = xwl_global_create(xwl, &wl_shell_interface, 1, shell,
+                                           xwl_bind_host_shell);
     assert(!xwl->shell);
     xwl->shell = shell;
   } else if (strcmp(interface, "wl_output") == 0) {
@@ -3348,8 +3419,8 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     output->id = id;
     output->version = MIN(2, version);
     output->host_global =
-        wl_global_create(xwl->host_display, &wl_output_interface,
-                         output->version, output, xwl_bind_host_output);
+        xwl_global_create(xwl, &wl_output_interface, output->version, output,
+                          xwl_bind_host_output);
     wl_list_insert(&xwl->outputs, &output->link);
   } else if (strcmp(interface, "wl_seat") == 0) {
     struct xwl_seat *seat = malloc(sizeof(struct xwl_seat));
@@ -3357,9 +3428,8 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     seat->xwl = xwl;
     seat->id = id;
     seat->version = MIN(5, version);
-    seat->host_global =
-        wl_global_create(xwl->host_display, &wl_seat_interface, seat->version,
-                         seat, xwl_bind_host_seat);
+    seat->host_global = xwl_global_create(
+        xwl, &wl_seat_interface, seat->version, seat, xwl_bind_host_seat);
     seat->last_serial = 0;
     wl_list_insert(&xwl->seats, &seat->link);
   } else if (strcmp(interface, "wl_data_device_manager") == 0) {
@@ -3369,26 +3439,34 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     data_device_manager->xwl = xwl;
     data_device_manager->id = id;
     data_device_manager->version = MIN(3, version);
-    data_device_manager->host_global =
-        wl_global_create(xwl->host_display, &wl_data_device_manager_interface,
-                         data_device_manager->version, data_device_manager,
-                         xwl_bind_host_data_device_manager);
-    data_device_manager->internal =
-        wl_registry_bind(registry, id, &wl_data_device_manager_interface,
-                         data_device_manager->version);
+    if (xwl->xwayland) {
+      data_device_manager->host_global = NULL;
+      data_device_manager->internal =
+          wl_registry_bind(registry, id, &wl_data_device_manager_interface,
+                           data_device_manager->version);
+    } else {
+      data_device_manager->internal = NULL;
+      data_device_manager->host_global = xwl_global_create(
+          xwl, &wl_data_device_manager_interface, data_device_manager->version,
+          data_device_manager, xwl_bind_host_data_device_manager);
+    }
     xwl->data_device_manager = data_device_manager;
   } else if (strcmp(interface, "zxdg_shell_v6") == 0) {
     struct xwl_xdg_shell *xdg_shell = malloc(sizeof(struct xwl_xdg_shell));
     assert(xdg_shell);
     xdg_shell->xwl = xwl;
     xdg_shell->id = id;
-    xdg_shell->host_global =
-        wl_global_create(xwl->host_display, &zxdg_shell_v6_interface, 1,
-                         xdg_shell, xwl_bind_host_xdg_shell);
-    xdg_shell->internal =
-        wl_registry_bind(registry, id, &zxdg_shell_v6_interface, 1);
-    zxdg_shell_v6_add_listener(xdg_shell->internal,
-                               &xwl_internal_xdg_shell_listener, NULL);
+    if (xwl->xwayland) {
+      xdg_shell->host_global = NULL;
+      xdg_shell->internal =
+          wl_registry_bind(registry, id, &zxdg_shell_v6_interface, 1);
+      zxdg_shell_v6_add_listener(xdg_shell->internal,
+                                 &xwl_internal_xdg_shell_listener, NULL);
+    } else {
+      xdg_shell->internal = NULL;
+      xdg_shell->host_global = xwl_global_create(
+          xwl, &zxdg_shell_v6_interface, 1, xdg_shell, xwl_bind_host_xdg_shell);
+    }
     assert(!xwl->xdg_shell);
     xwl->xdg_shell = xdg_shell;
   } else if (strcmp(interface, "zaura_shell") == 0) {
@@ -3426,9 +3504,8 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     // Register wl_drm global if DRM device is available and DMABuf interface
     // version is sufficient.
     if (xwl->drm_device && linux_dmabuf->version >= 2) {
-      linux_dmabuf->host_drm_global =
-          wl_global_create(xwl->host_display, &wl_drm_interface, 2,
-                           linux_dmabuf, xwl_bind_host_drm);
+      linux_dmabuf->host_drm_global = xwl_global_create(
+          xwl, &wl_drm_interface, 2, linux_dmabuf, xwl_bind_host_drm);
     }
   }
 }
@@ -3440,33 +3517,38 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
   struct xwl_seat *seat;
 
   if (xwl->compositor && xwl->compositor->id == id) {
-    wl_global_destroy(xwl->compositor->host_global);
+    xwl_global_destroy(xwl->compositor->host_global);
     wl_compositor_destroy(xwl->compositor->internal);
     free(xwl->compositor);
     xwl->compositor = NULL;
     return;
   }
   if (xwl->shm && xwl->shm->id == id) {
-    wl_global_destroy(xwl->shm->host_global);
+    xwl_global_destroy(xwl->shm->host_global);
     free(xwl->shm);
     xwl->shm = NULL;
     return;
   }
   if (xwl->shell && xwl->shell->id == id) {
-    wl_global_destroy(xwl->shell->host_global);
+    xwl_global_destroy(xwl->shell->host_global);
     free(xwl->shell);
     xwl->shell = NULL;
     return;
   }
   if (xwl->data_device_manager && xwl->data_device_manager->id == id) {
-    wl_data_device_manager_destroy(xwl->data_device_manager->internal);
+    if (xwl->data_device_manager->host_global)
+      xwl_global_destroy(xwl->data_device_manager->host_global);
+    if (xwl->data_device_manager->internal)
+      wl_data_device_manager_destroy(xwl->data_device_manager->internal);
     free(xwl->data_device_manager);
     xwl->data_device_manager = NULL;
     return;
   }
   if (xwl->xdg_shell && xwl->xdg_shell->id == id) {
-    wl_global_destroy(xwl->xdg_shell->host_global);
-    zxdg_shell_v6_destroy(xwl->xdg_shell->internal);
+    if (xwl->xdg_shell->host_global)
+      xwl_global_destroy(xwl->xdg_shell->host_global);
+    if (xwl->xdg_shell->internal)
+      zxdg_shell_v6_destroy(xwl->xdg_shell->internal);
     free(xwl->xdg_shell);
     xwl->xdg_shell = NULL;
     return;
@@ -3485,7 +3567,7 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
   }
   if (xwl->linux_dmabuf && xwl->linux_dmabuf->id == id) {
     if (xwl->linux_dmabuf->host_drm_global)
-      wl_global_destroy(xwl->linux_dmabuf->host_drm_global);
+      xwl_global_destroy(xwl->linux_dmabuf->host_drm_global);
     zwp_linux_dmabuf_v1_destroy(xwl->linux_dmabuf->internal);
     free(xwl->linux_dmabuf);
     xwl->linux_dmabuf = NULL;
@@ -3493,7 +3575,7 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
   }
   wl_list_for_each(output, &xwl->outputs, link) {
     if (output->id == id) {
-      wl_global_destroy(output->host_global);
+      xwl_global_destroy(output->host_global);
       wl_list_remove(&output->link);
       free(output);
       return;
@@ -3501,7 +3583,7 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
   }
   wl_list_for_each(seat, &xwl->seats, link) {
     if (seat->id == id) {
-      wl_global_destroy(seat->host_global);
+      xwl_global_destroy(seat->host_global);
       wl_list_remove(&seat->link);
       free(seat);
       return;
@@ -4952,6 +5034,105 @@ static void xwl_client_destroy_notify(struct wl_listener *listener,
   exit(0);
 }
 
+static void xwl_registry_bind(struct wl_client *client,
+                              struct wl_resource *resource, uint32_t name,
+                              const char *interface, uint32_t version,
+                              uint32_t id) {
+  struct xwl_host_registry *host = wl_resource_get_user_data(resource);
+  struct xwl_global *global;
+
+  wl_list_for_each(global, &host->xwl->globals, link) {
+    if (global->name == name)
+      break;
+  }
+
+  assert(&global->link != &host->xwl->globals);
+  assert(version != 0);
+  assert(global->version >= version);
+
+  global->bind(client, global->data, version, id);
+}
+
+static const struct wl_registry_interface xwl_registry_implementation = {
+    xwl_registry_bind};
+
+static void xwl_sync_callback_done(void *data, struct wl_callback *callback,
+                                   uint32_t serial) {
+  struct xwl_host_callback *host = wl_callback_get_user_data(callback);
+
+  wl_callback_send_done(host->resource, serial);
+  wl_resource_destroy(host->resource);
+}
+
+static const struct wl_callback_listener xwl_sync_callback_listener = {
+    xwl_sync_callback_done};
+
+static void xwl_display_sync(struct wl_client *client,
+                             struct wl_resource *resource, uint32_t id) {
+  struct xwl *xwl = wl_resource_get_user_data(resource);
+  struct xwl_host_callback *host_callback;
+
+  host_callback = malloc(sizeof(*host_callback));
+  assert(host_callback);
+
+  host_callback->resource =
+      wl_resource_create(client, &wl_callback_interface, 1, id);
+  wl_resource_set_implementation(host_callback->resource, NULL, host_callback,
+                                 xwl_host_callback_destroy);
+  host_callback->proxy = wl_display_sync(xwl->display);
+  wl_callback_set_user_data(host_callback->proxy, host_callback);
+  wl_callback_add_listener(host_callback->proxy, &xwl_sync_callback_listener,
+                           host_callback);
+}
+
+static void xwl_destroy_host_registry(struct wl_resource *resource) {
+  struct xwl_host_registry *host = wl_resource_get_user_data(resource);
+
+  wl_list_remove(&host->link);
+  free(host);
+}
+
+static void xwl_display_get_registry(struct wl_client *client,
+                                     struct wl_resource *resource,
+                                     uint32_t id) {
+  struct xwl *xwl = wl_resource_get_user_data(resource);
+  struct xwl_host_registry *host_registry;
+  struct xwl_global *global;
+
+  host_registry = malloc(sizeof(*host_registry));
+  assert(host_registry);
+
+  host_registry->xwl = xwl;
+  host_registry->resource =
+      wl_resource_create(client, &wl_registry_interface, 1, id);
+  wl_list_insert(&xwl->registries, &host_registry->link);
+  wl_resource_set_implementation(host_registry->resource,
+                                 &xwl_registry_implementation, host_registry,
+                                 xwl_destroy_host_registry);
+
+  wl_list_for_each(global, &xwl->globals, link) {
+    wl_resource_post_event(host_registry->resource, WL_REGISTRY_GLOBAL,
+                           global->name, global->interface->name,
+                           global->version);
+  }
+}
+
+static const struct wl_display_interface xwl_display_implementation = {
+    xwl_display_sync, xwl_display_get_registry};
+
+static enum wl_iterator_result
+xwl_set_display_implementation(struct wl_resource *resource, void *user_data) {
+  struct xwl *xwl = (struct xwl *)user_data;
+
+  if (strcmp(wl_resource_get_class(resource), "wl_display") == 0) {
+    wl_resource_set_implementation(resource, &xwl_display_implementation, xwl,
+                                   NULL);
+    return WL_ITERATOR_STOP;
+  }
+
+  return WL_ITERATOR_CONTINUE;
+}
+
 int main(int argc, char **argv) {
   struct xwl xwl = {
       .runprog = NULL,
@@ -4974,6 +5155,7 @@ int main(int argc, char **argv) {
       .xwayland_pid = -1,
       .child_pid = -1,
       .peer_pid = -1,
+      .next_global_id = 1,
       .connection = NULL,
       .xfixes_extension = NULL,
       .screen = NULL,
@@ -5272,6 +5454,8 @@ int main(int argc, char **argv) {
   xwl.display = wl_display_connect(NULL);
   assert(xwl.display);
 
+  wl_list_init(&xwl.registries);
+  wl_list_init(&xwl.globals);
   wl_list_init(&xwl.outputs);
   wl_list_init(&xwl.seats);
   wl_list_init(&xwl.windows);
@@ -5294,6 +5478,10 @@ int main(int argc, char **argv) {
     xwl.scale = ceil(xwl.scale);
 
   xwl.client = wl_client_create(xwl.host_display, client_fd);
+
+  // Replace the core display implementation. This is needed in order to
+  // implement sync handler properly.
+  wl_client_for_each_resource(xwl.client, xwl_set_display_implementation, &xwl);
 
   if (xwl.runprog || xwl.xwayland) {
     xwl.sigchld_event_source =
