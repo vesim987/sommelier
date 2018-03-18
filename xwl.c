@@ -5017,20 +5017,6 @@ static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   return 1;
 }
 
-static void xwl_usage() {
-  printf("xwl-run "
-         "[-X] "
-         "[--scale=SCALE] "
-         "[--app-id=ID] "
-         "[--x-display=DISPLAY] "
-         "[--no-exit-with-child] "
-         "[--no-clipboard-manager] "
-         "[--frame-color=COLOR] "
-         "[--drm-device=DEVICE] "
-         "[--glamor] "
-         "PROGRAM [ARGS...]\n");
-}
-
 static void xwl_sigchld_handler(int signal) {
   while (waitpid(-1, NULL, WNOHANG) > 0)
     continue;
@@ -5138,6 +5124,22 @@ xwl_set_display_implementation(struct wl_resource *resource, void *user_data) {
   }
 
   return WL_ITERATOR_CONTINUE;
+}
+
+static void xwl_usage() {
+  printf("xwl-run "
+         "[-X] "
+         "[--master] "
+         "[--socket=SOCKET] "
+         "[--scale=SCALE] "
+         "[--app-id=ID] "
+         "[--x-display=DISPLAY] "
+         "[--no-exit-with-child] "
+         "[--no-clipboard-manager] "
+         "[--frame-color=COLOR] "
+         "[--drm-device=DEVICE] "
+         "[--glamor] "
+         "[PROGRAM] [ARGS...]\n");
 }
 
 int main(int argc, char **argv) {
