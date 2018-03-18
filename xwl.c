@@ -392,6 +392,7 @@ struct xwl {
   struct wl_display *host_display;
   struct wl_client *client;
   struct xwl_compositor *compositor;
+  struct xwl_subcompositor *subcompositor;
   struct xwl_shm *shm;
   struct xwl_shell *shell;
   struct xwl_data_device_manager *data_device_manager;
@@ -402,6 +403,7 @@ struct xwl {
   struct wl_list outputs;
   struct wl_list seats;
   struct wl_event_source *display_event_source;
+  struct wl_event_source *display_ready_event_source;
   struct wl_event_source *sigchld_event_source;
   int wm_fd;
   const char *drm_device;
@@ -413,6 +415,7 @@ struct xwl {
   struct wl_list globals;
   int next_global_id;
   xcb_connection_t *connection;
+  struct wl_event_source *connection_event_source;
   const xcb_query_extension_reply_t *xfixes_extension;
   xcb_screen_t *screen;
   xcb_window_t window;
@@ -2186,8 +2189,7 @@ static void xwl_host_seat_get_host_keyboard(struct wl_client *client,
 static void xwl_destroy_host_touch(struct wl_resource *resource) {
   struct xwl_host_touch *host = wl_resource_get_user_data(resource);
 
-  if (wl_touch_get_version(host->proxy) >=
-      WL_TOUCH_RELEASE_SINCE_VERSION) {
+  if (wl_touch_get_version(host->proxy) >= WL_TOUCH_RELEASE_SINCE_VERSION) {
     wl_touch_release(host->proxy);
   } else {
     wl_touch_destroy(host->proxy);
@@ -3394,6 +3396,7 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     subcompositor->host_global =
         xwl_global_create(xwl, &wl_subcompositor_interface, 1, subcompositor,
                           xwl_bind_host_subcompositor);
+    xwl->subcompositor = subcompositor;
   } else if (strcmp(interface, "wl_shm") == 0) {
     struct xwl_shm *shm = malloc(sizeof(struct xwl_shm));
     assert(shm);
@@ -3521,6 +3524,12 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
     wl_compositor_destroy(xwl->compositor->internal);
     free(xwl->compositor);
     xwl->compositor = NULL;
+    return;
+  }
+  if (xwl->subcompositor && xwl->subcompositor->id == id) {
+    xwl_global_destroy(xwl->subcompositor->host_global);
+    free(xwl->subcompositor);
+    xwl->subcompositor = NULL;
     return;
   }
   if (xwl->shm && xwl->shm->id == id) {
@@ -4815,9 +4824,10 @@ static void xwl_connect(struct xwl *xwl) {
   change_attributes_cookie = xcb_change_window_attributes(
       xwl->connection, xwl->screen->root, XCB_CW_EVENT_MASK, values);
 
-  wl_event_loop_add_fd(wl_display_get_event_loop(xwl->host_display),
-                       xcb_get_file_descriptor(xwl->connection),
-                       WL_EVENT_READABLE, &xwl_handle_x_connection_event, xwl);
+  xwl->connection_event_source = wl_event_loop_add_fd(
+      wl_display_get_event_loop(xwl->host_display),
+      xcb_get_file_descriptor(xwl->connection), WL_EVENT_READABLE,
+      &xwl_handle_x_connection_event, xwl);
 
   xwl->xfixes_extension =
       xcb_get_extension_data(xwl->connection, &xcb_xfixes_id);
@@ -4963,7 +4973,7 @@ static void xwl_execvp(const char *file, char *const argv[],
   perror(file);
 }
 
-static int xwl_handle_display_event(int fd, uint32_t mask, void *data) {
+static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   struct xwl *xwl = (struct xwl *)data;
   char display_name[9];
   int bytes_read = 0;
@@ -4992,8 +5002,8 @@ static int xwl_handle_display_event(int fd, uint32_t mask, void *data) {
 
   xwl_connect(xwl);
 
-  wl_event_source_remove(xwl->display_event_source);
-  xwl->display_event_source = NULL;
+  wl_event_source_remove(xwl->display_ready_event_source);
+  xwl->display_ready_event_source = NULL;
   close(fd);
 
   sd_notify(0, "READY=1");
@@ -5140,6 +5150,7 @@ int main(int argc, char **argv) {
       .host_display = NULL,
       .client = NULL,
       .compositor = NULL,
+      .subcompositor = NULL,
       .shm = NULL,
       .shell = NULL,
       .data_device_manager = NULL,
@@ -5148,6 +5159,7 @@ int main(int argc, char **argv) {
       .viewporter = NULL,
       .linux_dmabuf = NULL,
       .display_event_source = NULL,
+      .display_ready_event_source = NULL,
       .sigchld_event_source = NULL,
       .wm_fd = -1,
       .drm_device = NULL,
@@ -5157,6 +5169,7 @@ int main(int argc, char **argv) {
       .peer_pid = -1,
       .next_global_id = 1,
       .connection = NULL,
+      .connection_event_source = NULL,
       .xfixes_extension = NULL,
       .screen = NULL,
       .window = 0,
@@ -5466,8 +5479,9 @@ int main(int argc, char **argv) {
 
   event_loop = wl_display_get_event_loop(xwl.host_display);
 
-  wl_event_loop_add_fd(event_loop, wl_display_get_fd(xwl.display),
-                       WL_EVENT_READABLE, xwl_handle_event, &xwl);
+  xwl.display_event_source =
+      wl_event_loop_add_fd(event_loop, wl_display_get_fd(xwl.display),
+                           WL_EVENT_READABLE, xwl_handle_event, &xwl);
 
   wl_registry_add_listener(wl_display_get_registry(xwl.display),
                            &xwl_registry_listener, &xwl);
@@ -5494,8 +5508,9 @@ int main(int argc, char **argv) {
       rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ds);
       assert(!rv);
 
-      xwl.display_event_source = wl_event_loop_add_fd(
-          event_loop, ds[0], WL_EVENT_READABLE, xwl_handle_display_event, &xwl);
+      xwl.display_ready_event_source =
+          wl_event_loop_add_fd(event_loop, ds[0], WL_EVENT_READABLE,
+                               xwl_handle_display_ready_event, &xwl);
 
       // X connection to Xwayland.
       rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wm);
