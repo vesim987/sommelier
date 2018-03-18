@@ -13,12 +13,16 @@
 #endif
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <systemd/sd-daemon.h>
 #include <unistd.h>
@@ -388,6 +392,7 @@ struct xwl {
   int xwayland;
   pid_t xwayland_pid;
   pid_t child_pid;
+  pid_t peer_pid;
   xcb_connection_t *connection;
   const xcb_query_extension_reply_t *xfixes_extension;
   xcb_screen_t *screen;
@@ -488,6 +493,13 @@ enum {
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
+
+#ifndef UNIX_PATH_MAX
+#define UNIX_PATH_MAX 108
+#endif
+
+#define LOCK_SUFFIX ".lock"
+#define LOCK_SUFFIXLEN 5
 
 static void xwl_internal_xdg_shell_ping(void *data,
                                         struct zxdg_shell_v6 *xdg_shell,
@@ -4918,6 +4930,7 @@ static int xwl_handle_display_event(int fd, uint32_t mask, void *data) {
 
 static void xwl_usage() {
   printf("xwl-run "
+         "[-X] "
          "[--scale=SCALE] "
          "[--app-id=ID] "
          "[--x-display=DISPLAY] "
@@ -4927,6 +4940,16 @@ static void xwl_usage() {
          "[--drm-device=DEVICE] "
          "[--glamor] "
          "PROGRAM [ARGS...]\n");
+}
+
+static void xwl_sigchld_handler(int signal) {
+  while (waitpid(-1, NULL, WNOHANG) > 0)
+    continue;
+}
+
+static void xwl_client_destroy_notify(struct wl_listener *listener,
+                                      void *data) {
+  exit(0);
 }
 
 int main(int argc, char **argv) {
@@ -4950,6 +4973,7 @@ int main(int argc, char **argv) {
       .xwayland = 0,
       .xwayland_pid = -1,
       .child_pid = -1,
+      .peer_pid = -1,
       .connection = NULL,
       .xfixes_extension = NULL,
       .screen = NULL,
@@ -5008,17 +5032,21 @@ int main(int argc, char **argv) {
           },
       .visual_ids = {0},
       .colormaps = {0}};
-  const char *x = getenv("XWL_X");
   const char *scale = getenv("XWL_SCALE");
   const char *clipboard_manager = getenv("XWL_CLIPBOARD_MANAGER");
   const char *frame_color = getenv("XWL_FRAME_COLOR");
   const char *show_window_title = getenv("XWL_SHOW_WINDOW_TITLE");
   const char *drm_device = getenv("XWL_DRM_DEVICE");
   const char *glamor = getenv("XWL_GLAMOR");
+  const char *socket_name = "wayland-0";
   struct wl_event_loop *event_loop;
-  int sv[2], ds[2], wm[2];
+  struct wl_listener client_destroy_listener = {.notify =
+                                                    xwl_client_destroy_notify};
+  int sv[2];
   pid_t pid;
   int xdisplay = -1;
+  int master = 0;
+  int client_fd = -1;
   int rv;
   int i;
 
@@ -5033,22 +5061,36 @@ int main(int argc, char **argv) {
       printf("Version: %s\n", VERSION);
       return 0;
     }
-    if (strstr(arg, "-X") == arg) {
-      x = "1";
-    } else if (strstr(arg, "--scale=") == arg) {
+    if (strstr(arg, "--master") == arg) {
+      master = 1;
+    } else if (strstr(arg, "--socket") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      socket_name = s;
+    } else if (strstr(arg, "--peer-pid") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      xwl.peer_pid = atoi(s);
+    } else if (strstr(arg, "--client-fd") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      client_fd = atoi(s);
+    } else if (strstr(arg, "--scale") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
       scale = s;
-    } else if (strstr(arg, "--app-id=") == arg) {
+    } else if (strstr(arg, "--app-id") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
       xwl.app_id = s;
-    } else if (strstr(arg, "--x-display=") == arg) {
+    } else if (strstr(arg, "-X") == arg) {
+      xwl.xwayland = 1;
+    } else if (strstr(arg, "--x-display") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
       xdisplay = atoi(s);
       // Automatically enable X forwarding if X display is specified.
-      x = "1";
+      xwl.xwayland = 1;
     } else if (strstr(arg, "--no-exit-with-child") == arg) {
       xwl.exit_with_child = 0;
     } else if (strstr(arg, "--no-clipboard-manager") == arg) {
@@ -5078,22 +5120,132 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!xwl.runprog || !xwl.runprog[0]) {
-    xwl_usage();
-    return 1;
+  if (master) {
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    char lock_addr[UNIX_PATH_MAX + LOCK_SUFFIXLEN];
+    struct sockaddr_un addr;
+    struct sigaction sa;
+    struct stat sock_stat;
+    int lock_fd;
+    int sock_fd;
+
+    if (!runtime_dir) {
+      fprintf(stderr, "XDG_RUNTIME_DIR not set in the environment\n");
+      exit(1);
+    }
+
+    addr.sun_family = AF_LOCAL;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", runtime_dir,
+             socket_name);
+
+    snprintf(lock_addr, sizeof(lock_addr), "%s%s", addr.sun_path, LOCK_SUFFIX);
+
+    lock_fd = open(lock_addr, O_CREAT | O_CLOEXEC,
+                   (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP));
+    assert(lock_fd >= 0);
+
+    rv = flock(lock_fd, LOCK_EX | LOCK_NB);
+    if (rv < 0) {
+      fprintf(stderr, "unable to lock %s, is another compositor running?\n",
+              lock_addr);
+      exit(1);
+    }
+
+    rv = stat(addr.sun_path, &sock_stat);
+    if (rv >= 0) {
+      if (sock_stat.st_mode & (S_IWUSR | S_IWGRP))
+        unlink(addr.sun_path);
+    } else {
+      assert(errno == ENOENT);
+    }
+
+    sock_fd = socket(PF_LOCAL, SOCK_STREAM, 0);
+    assert(sock_fd >= 0);
+
+    rv = bind(sock_fd, (struct sockaddr *)&addr,
+              offsetof(struct sockaddr_un, sun_path) + strlen(addr.sun_path));
+    assert(rv >= 0);
+
+    rv = listen(sock_fd, 128);
+    assert(rv >= 0);
+
+    sa.sa_handler = xwl_sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    rv = sigaction(SIGCHLD, &sa, NULL);
+    assert(rv >= 0);
+
+    sd_notify(0, "READY=1");
+
+    do {
+      struct ucred ucred;
+      socklen_t length = sizeof(addr);
+
+      client_fd = accept(sock_fd, (struct sockaddr *)&addr, &length);
+      if (client_fd < 0) {
+        fprintf(stderr, "failed to accept: %m\n");
+        continue;
+      }
+
+      ucred.pid = -1;
+      length = sizeof(ucred);
+      rv = getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &ucred, &length);
+
+      pid = fork();
+      assert(pid != -1);
+      if (pid == 0) {
+        char client_fd_str[64], peer_pid_str[64];
+        char *args[32];
+        int i = 0, j;
+
+        close(sock_fd);
+        close(lock_fd);
+
+        args[i++] = argv[0];
+        snprintf(peer_pid_str, sizeof(peer_pid_str), "--peer-pid=%d",
+                 ucred.pid);
+        args[i++] = peer_pid_str;
+        snprintf(client_fd_str, sizeof(client_fd_str), "--client-fd=%d",
+                 client_fd);
+        args[i++] = client_fd_str;
+
+        // forward some flags.
+        for (j = 1; j < argc; ++j) {
+          char *arg = argv[j];
+          if (strstr(arg, "--scale") == arg ||
+              strstr(arg, "--drm-device") == arg) {
+            args[i++] = arg;
+          }
+        }
+
+        args[i++] = NULL;
+
+        execvp(argv[0], args);
+        _exit(EXIT_FAILURE);
+      }
+      close(client_fd);
+    } while (1);
+
+    _exit(EXIT_FAILURE);
   }
 
-  if (x)
-    xwl.xwayland = !!strcmp(x, "0");
-
-  if (scale)
-    xwl.scale = MIN(MAX_SCALE, MAX(MIN_SCALE, atof(scale)));
+  if (client_fd == -1) {
+    if (!xwl.runprog || !xwl.runprog[0]) {
+      xwl_usage();
+      return 1;
+    }
+  }
 
   if (xwl.xwayland) {
+    assert(client_fd == -1);
+
     xwl.clipboard_manager = 1;
     if (clipboard_manager)
       xwl.clipboard_manager = !!strcmp(clipboard_manager, "0");
   }
+
+  if (scale)
+    xwl.scale = MIN(MAX_SCALE, MAX(MIN_SCALE, atof(scale)));
 
   if (frame_color) {
     int r, g, b;
@@ -5108,6 +5260,14 @@ int main(int argc, char **argv) {
 
   if (drm_device && !access(drm_device, 0))
     xwl.drm_device = drm_device;
+
+  if (xwl.runprog || xwl.xwayland) {
+    // Wayland connection from client.
+    rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
+    assert(!rv);
+
+    client_fd = sv[0];
+  }
 
   xwl.display = wl_display_connect(NULL);
   assert(xwl.display);
@@ -5133,80 +5293,80 @@ int main(int argc, char **argv) {
   if (!xwl.viewporter)
     xwl.scale = ceil(xwl.scale);
 
-  xwl.sigchld_event_source =
-      wl_event_loop_add_signal(event_loop, SIGCHLD, xwl_handle_sigchld, &xwl);
+  xwl.client = wl_client_create(xwl.host_display, client_fd);
 
-  // Wayland connection from client.
-  rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
-  assert(!rv);
+  if (xwl.runprog || xwl.xwayland) {
+    xwl.sigchld_event_source =
+        wl_event_loop_add_signal(event_loop, SIGCHLD, xwl_handle_sigchld, &xwl);
 
-  xwl.client = wl_client_create(xwl.host_display, sv[0]);
-
-  if (xwl.xwayland) {
-    // Xwayland display ready socket.
-    rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ds);
-    assert(!rv);
-
-    xwl.display_event_source = wl_event_loop_add_fd(
-        event_loop, ds[0], WL_EVENT_READABLE, xwl_handle_display_event, &xwl);
-
-    // X connection to Xwayland.
-    rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wm);
-    assert(!rv);
-
-    xwl.wm_fd = wm[0];
-  }
-
-  pid = fork();
-  assert(pid != -1);
-  if (pid == 0) {
     if (xwl.xwayland) {
-      char display_str[8], display_fd_str[8], wm_fd_str[8];
-      char *args[32];
-      int i = 0;
-      int fd;
+      int ds[2], wm[2];
 
-      fd = dup(ds[1]);
-      snprintf(display_fd_str, sizeof(display_fd_str), "%d", fd);
-      fd = dup(wm[1]);
-      snprintf(wm_fd_str, sizeof(wm_fd_str), "%d", fd);
+      // Xwayland display ready socket.
+      rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ds);
+      assert(!rv);
 
-      args[i++] = XWAYLAND_PATH "/Xwayland";
-      if (xdisplay > 0) {
-        snprintf(display_str, sizeof(display_str), ":%d", xdisplay);
-        args[i++] = display_str;
+      xwl.display_event_source = wl_event_loop_add_fd(
+          event_loop, ds[0], WL_EVENT_READABLE, xwl_handle_display_event, &xwl);
+
+      // X connection to Xwayland.
+      rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wm);
+      assert(!rv);
+
+      xwl.wm_fd = wm[0];
+
+      pid = fork();
+      assert(pid != -1);
+      if (pid == 0) {
+        char display_str[8], display_fd_str[8], wm_fd_str[8];
+        char *args[32];
+        int i = 0;
+        int fd;
+
+        fd = dup(ds[1]);
+        snprintf(display_fd_str, sizeof(display_fd_str), "%d", fd);
+        fd = dup(wm[1]);
+        snprintf(wm_fd_str, sizeof(wm_fd_str), "%d", fd);
+
+        args[i++] = XWAYLAND_PATH "/Xwayland";
+        if (xdisplay > 0) {
+          snprintf(display_str, sizeof(display_str), ":%d", xdisplay);
+          args[i++] = display_str;
+        }
+        args[i++] = "-nolisten";
+        args[i++] = "tcp";
+        args[i++] = "-rootless";
+        if (xwl.drm_device) {
+          // Use DRM and software rendering unless glamor is enabled.
+          if (!glamor || !strcmp(glamor, "0"))
+            args[i++] = "-drm";
+        } else {
+          args[i++] = "-shm";
+        }
+        args[i++] = "-displayfd";
+        args[i++] = display_fd_str;
+        args[i++] = "-wm";
+        args[i++] = wm_fd_str;
+        args[i++] = NULL;
+
+        xwl_execvp(XWAYLAND_PATH "/Xwayland", args, sv[1]);
+        _exit(EXIT_FAILURE);
       }
-      args[i++] = "-nolisten";
-      args[i++] = "tcp";
-      args[i++] = "-rootless";
-      if (xwl.drm_device) {
-        // Use DRM and software rendering unless glamor is enabled.
-        if (!glamor || !strcmp(glamor, "0"))
-          args[i++] = "-drm";
-      } else {
-        args[i++] = "-shm";
-      }
-      args[i++] = "-displayfd";
-      args[i++] = display_fd_str;
-      args[i++] = "-wm";
-      args[i++] = wm_fd_str;
-      args[i++] = NULL;
-
-      xwl_execvp(XWAYLAND_PATH "/Xwayland", args, sv[1]);
+      close(wm[1]);
+      xwl.xwayland_pid = pid;
     } else {
-      xwl_execvp(xwl.runprog[0], xwl.runprog, sv[1]);
+      pid = fork();
+      assert(pid != -1);
+      if (pid == 0) {
+        xwl_execvp(xwl.runprog[0], xwl.runprog, sv[1]);
+        _exit(EXIT_FAILURE);
+      }
+      xwl.child_pid = pid;
     }
-    _exit(EXIT_FAILURE);
-  }
-
-  if (xwl.xwayland) {
-    close(wm[1]);
-    xwl.xwayland_pid = pid;
+    close(sv[1]);
   } else {
-    xwl.child_pid = pid;
+    wl_client_add_destroy_listener(xwl.client, &client_destroy_listener);
   }
-
-  close(sv[1]);
 
   do {
     wl_display_flush_clients(xwl.host_display);
