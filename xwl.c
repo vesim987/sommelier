@@ -16,11 +16,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <linux/virtwl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -77,6 +80,23 @@ struct xwl_compositor {
   struct wl_compositor *internal;
 };
 
+struct xwl_mmap {
+  int refcount;
+  void *addr;
+  size_t size;
+  size_t offset;
+  size_t stride;
+  int dirty;
+};
+
+struct xwl_damage_rect {
+  int x;
+  int y;
+  int width;
+  int height;
+  struct wl_list link;
+};
+
 struct xwl_host_surface {
   struct xwl *xwl;
   struct wl_resource *resource;
@@ -87,6 +107,9 @@ struct xwl_host_surface {
   int32_t contents_scale;
   int is_cursor;
   uint32_t last_event_serial;
+  struct xwl_mmap *client_mmap;
+  struct xwl_mmap *host_mmap;
+  struct wl_list damage_rects;
 };
 
 struct xwl_host_region {
@@ -106,11 +129,18 @@ struct xwl_host_buffer {
   struct wl_buffer *proxy;
   uint32_t width;
   uint32_t height;
+  uint32_t stride;
+  uint32_t size;
+  int32_t offset;
+  struct xwl_mmap *client_mmap;
+  struct xwl_mmap *host_mmap;
 };
 
 struct xwl_host_shm_pool {
+  struct xwl_shm *shm;
   struct wl_resource *resource;
   struct wl_shm_pool *proxy;
+  int fd;
 };
 
 struct xwl_host_shm {
@@ -123,6 +153,7 @@ struct xwl_shm {
   struct xwl *xwl;
   uint32_t id;
   struct xwl_global *host_global;
+  struct wl_shm *internal;
 };
 
 struct xwl_host_shell {
@@ -406,6 +437,7 @@ struct xwl {
   struct wl_event_source *display_event_source;
   struct wl_event_source *display_ready_event_source;
   struct wl_event_source *sigchld_event_source;
+  int shm_driver;
   int wm_fd;
   const char *drm_device;
   int xwayland;
@@ -462,6 +494,12 @@ enum {
   PROPERTY_WM_TRANSIENT_FOR,
   PROPERTY_WM_NORMAL_HINTS,
   PROPERTY_MOTIF_WM_HINTS,
+};
+
+enum {
+  SHM_DRIVER_NOOP,
+  SHM_DRIVER_DMABUF,
+  SHM_DRIVER_VIRTWL,
 };
 
 #define US_POSITION (1L << 0)
@@ -523,6 +561,35 @@ enum {
 
 #define LOCK_SUFFIX ".lock"
 #define LOCK_SUFFIXLEN 5
+
+static struct xwl_mmap *xwl_mmap_create(int fd, size_t size, size_t offset,
+                                        size_t stride) {
+  struct xwl_mmap *map;
+
+  map = malloc(sizeof(*map));
+  map->refcount = 1;
+  map->size = size;
+  map->offset = offset;
+  map->stride = stride;
+  map->dirty = 1;
+  map->addr =
+      mmap(NULL, size + offset, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  assert(map->addr != MAP_FAILED);
+
+  return map;
+}
+
+static struct xwl_mmap *xwl_mmap_ref(struct xwl_mmap *map) {
+  map->refcount++;
+  return map;
+}
+
+static void xwl_mmap_unref(struct xwl_mmap *map) {
+  if (map->refcount-- == 1) {
+    munmap(map->addr, map->size);
+    free(map);
+  }
+}
 
 static void xwl_internal_xdg_shell_ping(void *data,
                                         struct zxdg_shell_v6 *xdg_shell,
@@ -1031,10 +1098,23 @@ static void xwl_host_surface_attach(struct wl_client *client,
   struct xwl_window *window;
   double scale = host->xwl->scale;
 
+  if (host->client_mmap) {
+    xwl_mmap_unref(host->client_mmap);
+    host->client_mmap = NULL;
+  }
+  if (host->host_mmap) {
+    xwl_mmap_unref(host->host_mmap);
+    host->host_mmap = NULL;
+  }
+
   if (host_buffer) {
     host->contents_width = host_buffer->width;
     host->contents_height = host_buffer->height;
     buffer_proxy = host_buffer->proxy;
+    if (host_buffer->client_mmap)
+      host->client_mmap = xwl_mmap_ref(host_buffer->client_mmap);
+    if (host_buffer->host_mmap)
+      host->host_mmap = xwl_mmap_ref(host_buffer->host_mmap);
   }
 
   wl_surface_attach(host->proxy, buffer_proxy, x / scale, y / scale);
@@ -1064,6 +1144,18 @@ static void xwl_host_surface_damage(struct wl_client *client,
   y1 = (y - 1) / scale;
   x2 = ceil((x + width + 1) / scale);
   y2 = ceil((y + height + 1) / scale);
+
+  if (host->xwl->shm_driver != SHM_DRIVER_NOOP) {
+    struct xwl_damage_rect *damage;
+
+    damage = malloc(sizeof(*damage));
+    damage->x = x;
+    damage->y = y;
+    damage->width = width;
+    damage->height = height;
+
+    wl_list_insert(&host->damage_rects, &damage->link);
+  }
 
   wl_surface_damage(host->proxy, x1, y1, x2 - x1, y2 - y1);
 }
@@ -1135,6 +1227,48 @@ static void xwl_host_surface_commit(struct wl_client *client,
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   struct xwl_window *window;
 
+  if (host->host_mmap) {
+    struct xwl_damage_rect *r, *next;
+
+    if (host->host_mmap->dirty) {
+      struct xwl_damage_rect *damage;
+
+      damage = malloc(sizeof(*damage));
+      damage->x = 0;
+      damage->y = 0;
+      damage->width = host->contents_width;
+      damage->height = host->contents_height;
+      wl_list_insert(&host->damage_rects, &damage->link);
+
+      host->host_mmap->dirty = 0;
+    }
+
+    assert(host->client_mmap);
+    wl_list_for_each_safe(r, next, &host->damage_rects, link) {
+      uint8_t *dst = host->host_mmap->addr + host->host_mmap->offset;
+      uint8_t *src = host->client_mmap->addr + host->client_mmap->offset;
+      size_t dst_stride = host->host_mmap->stride;
+      size_t src_stride = host->client_mmap->stride;
+      int x1 = MIN(r->x, host->contents_width);
+      int y1 = MIN(r->y, host->contents_height);
+      int x2 = MIN(r->x + r->width, host->contents_width);
+      int y2 = MIN(r->y + r->height, host->contents_height);
+      int width = x2 - x1;
+      int height = y2 - y1;
+
+      dst += dst_stride * y1;
+      src += src_stride * y1;
+
+      while (height--) {
+        memcpy(dst + x1 * 4, src + x1 * 4, width * 4);
+        dst += dst_stride;
+        src += src_stride;
+      }
+      wl_list_remove(&r->link);
+      free(r);
+    }
+  }
+
   // No need to defer cursor or non-xwayland client commits.
   if (host->is_cursor || !host->xwl->xwayland) {
     wl_surface_commit(host->proxy);
@@ -1195,6 +1329,7 @@ static const struct wl_surface_interface xwl_surface_implementation = {
 static void xwl_destroy_host_surface(struct wl_resource *resource) {
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   struct xwl_window *window, *surface_window = NULL;
+  struct xwl_damage_rect *r, *next;
 
   wl_list_for_each(window, &host->xwl->windows, link) {
     if (window->host_surface_id == wl_resource_get_id(resource)) {
@@ -1206,6 +1341,16 @@ static void xwl_destroy_host_surface(struct wl_resource *resource) {
   if (surface_window) {
     surface_window->host_surface_id = 0;
     xwl_window_update(surface_window);
+  }
+
+  if (host->client_mmap)
+    xwl_mmap_unref(host->client_mmap);
+  if (host->host_mmap)
+    xwl_mmap_unref(host->host_mmap);
+
+  wl_list_for_each_safe(r, next, &host->damage_rects, link) {
+    wl_list_remove(&r->link);
+    free(r);
   }
 
   if (host->viewport)
@@ -1277,6 +1422,9 @@ static void xwl_compositor_create_host_surface(struct wl_client *client,
   host_surface->contents_scale = 1;
   host_surface->is_cursor = 0;
   host_surface->last_event_serial = 0;
+  host_surface->client_mmap = NULL;
+  host_surface->host_mmap = NULL;
+  wl_list_init(&host_surface->damage_rects);
   host_surface->resource = wl_resource_create(
       client, &wl_surface_interface, wl_resource_get_version(resource), id);
   wl_resource_set_implementation(host_surface->resource,
@@ -1369,6 +1517,10 @@ static void xwl_destroy_host_buffer(struct wl_resource *resource) {
   struct xwl_host_buffer *host = wl_resource_get_user_data(resource);
 
   wl_buffer_destroy(host->proxy);
+  if (host->client_mmap)
+    xwl_mmap_unref(host->client_mmap);
+  if (host->host_mmap)
+    xwl_mmap_unref(host->host_mmap);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
@@ -1381,19 +1533,58 @@ static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
                                                  uint32_t format) {
   struct xwl_host_shm_pool *host = wl_resource_get_user_data(resource);
   struct xwl_host_buffer *host_buffer;
+  size_t size = height * stride;
 
   host_buffer = malloc(sizeof(*host_buffer));
   assert(host_buffer);
 
   host_buffer->width = width;
   host_buffer->height = height;
+  host_buffer->stride = stride;
+  host_buffer->size = size;
+  host_buffer->offset = offset;
+  host_buffer->client_mmap = NULL;
+  host_buffer->host_mmap = NULL;
   host_buffer->resource =
       wl_resource_create(client, &wl_buffer_interface, 1, id);
   wl_resource_set_implementation(host_buffer->resource,
                                  &xwl_buffer_implementation, host_buffer,
                                  xwl_destroy_host_buffer);
-  host_buffer->proxy = wl_shm_pool_create_buffer(host->proxy, offset, width,
-                                                 height, stride, format);
+
+  switch (host->shm->xwl->shm_driver) {
+  case SHM_DRIVER_NOOP:
+    assert(host->proxy);
+    host_buffer->proxy = wl_shm_pool_create_buffer(host->proxy, offset, width,
+                                                   height, stride, format);
+    break;
+  case SHM_DRIVER_DMABUF:
+    assert(0);
+    break;
+  case SHM_DRIVER_VIRTWL: {
+    struct virtwl_ioctl_new virtwl_ioctl_new = {
+        .type = VIRTWL_IOCTL_NEW_ALLOC, .fd = -1, .flags = 0, .size = size};
+    struct wl_shm_pool *pool;
+    int wl_fd;
+    int rv;
+
+    host_buffer->client_mmap = xwl_mmap_create(host->fd, size, offset, stride);
+
+    wl_fd = open("/dev/wl0", O_RDWR);
+    rv = ioctl(wl_fd, VIRTWL_IOCTL_NEW, &virtwl_ioctl_new);
+    assert(rv == 0);
+    close(wl_fd);
+
+    host_buffer->host_mmap =
+        xwl_mmap_create(virtwl_ioctl_new.fd, size, 0, stride);
+
+    pool = wl_shm_create_pool(host->shm->internal, virtwl_ioctl_new.fd, size);
+    host_buffer->proxy =
+        wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
+    wl_shm_pool_destroy(pool);
+    close(virtwl_ioctl_new.fd);
+  } break;
+  }
+
   wl_buffer_set_user_data(host_buffer->proxy, host_buffer);
   wl_buffer_add_listener(host_buffer->proxy, &xwl_buffer_listener, host_buffer);
 }
@@ -1408,7 +1599,8 @@ static void xwl_host_shm_pool_resize(struct wl_client *client,
                                      int32_t size) {
   struct xwl_host_shm_pool *host = wl_resource_get_user_data(resource);
 
-  wl_shm_pool_resize(host->proxy, size);
+  if (host->proxy)
+    wl_shm_pool_resize(host->proxy, size);
 }
 
 static const struct wl_shm_pool_interface xwl_shm_pool_implementation = {
@@ -1418,7 +1610,10 @@ static const struct wl_shm_pool_interface xwl_shm_pool_implementation = {
 static void xwl_destroy_host_shm_pool(struct wl_resource *resource) {
   struct xwl_host_shm_pool *host = wl_resource_get_user_data(resource);
 
-  wl_shm_pool_destroy(host->proxy);
+  if (host->fd >= 0)
+    close(host->fd);
+  if (host->proxy)
+    wl_shm_pool_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
@@ -1432,15 +1627,26 @@ static void xwl_shm_create_host_pool(struct wl_client *client,
   host_shm_pool = malloc(sizeof(*host_shm_pool));
   assert(host_shm_pool);
 
+  host_shm_pool->shm = host->shm;
+  host_shm_pool->fd = -1;
+  host_shm_pool->proxy = NULL;
   host_shm_pool->resource =
       wl_resource_create(client, &wl_shm_pool_interface, 1, id);
   wl_resource_set_implementation(host_shm_pool->resource,
                                  &xwl_shm_pool_implementation, host_shm_pool,
                                  xwl_destroy_host_shm_pool);
-  host_shm_pool->proxy = wl_shm_create_pool(host->proxy, fd, size);
-  wl_shm_pool_set_user_data(host_shm_pool->proxy, host_shm_pool);
 
-  close(fd);
+  switch (host->shm->xwl->shm_driver) {
+  case SHM_DRIVER_NOOP:
+    host_shm_pool->proxy = wl_shm_create_pool(host->proxy, fd, size);
+    wl_shm_pool_set_user_data(host_shm_pool->proxy, host_shm_pool);
+    close(fd);
+    break;
+  case SHM_DRIVER_DMABUF:
+  case SHM_DRIVER_VIRTWL:
+    host_shm_pool->fd = fd;
+    break;
+  }
 }
 
 static const struct wl_shm_interface xwl_shm_implementation = {
@@ -2350,6 +2556,11 @@ static void xwl_drm_create_prime_buffer(
 
   host_buffer->width = width;
   host_buffer->height = height;
+  host_buffer->stride = stride0;
+  host_buffer->size = stride0 * height;
+  host_buffer->offset = offset0;
+  host_buffer->client_mmap = NULL;
+  host_buffer->host_mmap = NULL;
   host_buffer->resource =
       wl_resource_create(client, &wl_buffer_interface, 1, id);
   wl_resource_set_implementation(host_buffer->resource,
@@ -3411,6 +3622,7 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     shm->id = id;
     shm->host_global =
         xwl_global_create(xwl, &wl_shm_interface, 1, shm, xwl_bind_host_shm);
+    shm->internal = wl_registry_bind(registry, id, &wl_shm_interface, 1);
     assert(!xwl->shm);
     xwl->shm = shm;
   } else if (strcmp(interface, "wl_shell") == 0) {
@@ -3535,6 +3747,7 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
   }
   if (xwl->subcompositor && xwl->subcompositor->id == id) {
     xwl_global_destroy(xwl->subcompositor->host_global);
+    wl_shm_destroy(xwl->shm->internal);
     free(xwl->subcompositor);
     xwl->subcompositor = NULL;
     return;
@@ -5139,6 +5352,7 @@ static void xwl_usage() {
          "[--master] "
          "[--socket=SOCKET] "
          "[--display=DISPLAY] "
+         "[--shm-driver=noop|dmabuf|virtwl] "
          "[--scale=SCALE] "
          "[--app-id=ID] "
          "[--x-display=DISPLAY] "
@@ -5168,6 +5382,7 @@ int main(int argc, char **argv) {
       .display_event_source = NULL,
       .display_ready_event_source = NULL,
       .sigchld_event_source = NULL,
+      .shm_driver = SHM_DRIVER_NOOP,
       .wm_fd = -1,
       .drm_device = NULL,
       .xwayland = 0,
@@ -5241,6 +5456,7 @@ int main(int argc, char **argv) {
   const char *show_window_title = getenv("XWL_SHOW_WINDOW_TITLE");
   const char *drm_device = getenv("XWL_DRM_DEVICE");
   const char *glamor = getenv("XWL_GLAMOR");
+  const char *shm_driver = getenv("XWL_SHM_DRIVER");
   const char *socket_name = "wayland-0";
   const char *runtime_dir;
   struct wl_event_loop *event_loop;
@@ -5275,6 +5491,10 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       display = s;
+    } else if (strstr(arg, "--shm-driver") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      shm_driver = s;
     } else if (strstr(arg, "--peer-pid") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -5469,6 +5689,19 @@ int main(int argc, char **argv) {
 
   if (drm_device && !access(drm_device, 0))
     xwl.drm_device = drm_device;
+
+  if (!shm_driver && xwl.drm_device)
+    shm_driver = "dmabuf";
+
+  if (!shm_driver && access("dev/wl0", 0))
+    shm_driver = "virtwl";
+
+  if (shm_driver) {
+    if (strcmp(shm_driver, "dmabuf") == 0)
+      xwl.shm_driver = SHM_DRIVER_DMABUF;
+    else if (strcmp(shm_driver, "virtwl") == 0)
+      xwl.shm_driver = SHM_DRIVER_VIRTWL;
+  }
 
   if (xwl.runprog || xwl.xwayland) {
     // Wayland connection from client.
