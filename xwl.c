@@ -15,8 +15,8 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <gbm.h>
 #include <libgen.h>
-#include <linux/virtwl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +42,7 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "version.h"
 #include "viewporter-client-protocol.h"
+#include "virtwl.h"
 #include "xdg-shell-unstable-v6-client-protocol.h"
 #include "xdg-shell-unstable-v6-server-protocol.h"
 
@@ -80,13 +81,19 @@ struct xwl_compositor {
   struct wl_compositor *internal;
 };
 
+typedef void (*xwl_begin_end_access_func_t)(int fd);
+
 struct xwl_mmap {
   int refcount;
+  int fd;
   void *addr;
   size_t size;
   size_t offset;
   size_t stride;
+  size_t bpp;
   int dirty;
+  xwl_begin_end_access_func_t begin_access;
+  xwl_begin_end_access_func_t end_access;
 };
 
 struct xwl_damage_rect {
@@ -439,7 +446,9 @@ struct xwl {
   struct wl_event_source *sigchld_event_source;
   int shm_driver;
   int wm_fd;
+  int virtwl_fd;
   const char *drm_device;
+  struct gbm_device *gbm;
   int xwayland;
   pid_t xwayland_pid;
   pid_t child_pid;
@@ -562,16 +571,51 @@ enum {
 #define LOCK_SUFFIX ".lock"
 #define LOCK_SUFFIXLEN 5
 
+struct dma_buf_sync {
+  __u64 flags;
+};
+
+#define DMA_BUF_SYNC_READ (1 << 0)
+#define DMA_BUF_SYNC_WRITE (2 << 0)
+#define DMA_BUF_SYNC_RW (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
+#define DMA_BUF_SYNC_START (0 << 2)
+#define DMA_BUF_SYNC_END (1 << 2)
+
+#define DMA_BUF_BASE 'b'
+#define DMA_BUF_IOCTL_SYNC _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+
+static void xwl_dmabuf_sync(int fd, __u64 flags) {
+  struct dma_buf_sync sync = {0};
+  int rv;
+
+  sync.flags = flags;
+  do {
+    rv = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+  } while (rv == -1 && errno == EINTR);
+}
+
+static void xwl_dmabuf_begin_access(int fd) {
+  xwl_dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW);
+}
+
+static void xwl_dmabuf_end_access(int fd) {
+  xwl_dmabuf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
+}
+
 static struct xwl_mmap *xwl_mmap_create(int fd, size_t size, size_t offset,
-                                        size_t stride) {
+                                        size_t stride, size_t bpp) {
   struct xwl_mmap *map;
 
   map = malloc(sizeof(*map));
   map->refcount = 1;
+  map->fd = fd;
   map->size = size;
   map->offset = offset;
   map->stride = stride;
+  map->bpp = bpp;
   map->dirty = 1;
+  map->begin_access = NULL;
+  map->end_access = NULL;
   map->addr =
       mmap(NULL, size + offset, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   assert(map->addr != MAP_FAILED);
@@ -587,6 +631,7 @@ static struct xwl_mmap *xwl_mmap_ref(struct xwl_mmap *map) {
 static void xwl_mmap_unref(struct xwl_mmap *map) {
   if (map->refcount-- == 1) {
     munmap(map->addr, map->size);
+    close(map->fd);
     free(map);
   }
 }
@@ -1227,8 +1272,13 @@ static void xwl_host_surface_commit(struct wl_client *client,
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   struct xwl_window *window;
 
-  if (host->host_mmap) {
+  if (host->host_mmap && host->client_mmap) {
+    size_t dst_stride = host->host_mmap->stride;
+    size_t src_stride = host->client_mmap->stride;
+    size_t bpp = host->host_mmap->bpp;
     struct xwl_damage_rect *r, *next;
+
+    assert(host->client_mmap->bpp == host->host_mmap->bpp);
 
     if (host->host_mmap->dirty) {
       struct xwl_damage_rect *damage;
@@ -1243,30 +1293,35 @@ static void xwl_host_surface_commit(struct wl_client *client,
       host->host_mmap->dirty = 0;
     }
 
-    assert(host->client_mmap);
+    if (host->host_mmap->begin_access)
+      host->host_mmap->begin_access(host->host_mmap->fd);
+
     wl_list_for_each_safe(r, next, &host->damage_rects, link) {
       uint8_t *dst = host->host_mmap->addr + host->host_mmap->offset;
       uint8_t *src = host->client_mmap->addr + host->client_mmap->offset;
-      size_t dst_stride = host->host_mmap->stride;
-      size_t src_stride = host->client_mmap->stride;
-      int x1 = MIN(r->x, host->contents_width);
-      int y1 = MIN(r->y, host->contents_height);
-      int x2 = MIN(r->x + r->width, host->contents_width);
-      int y2 = MIN(r->y + r->height, host->contents_height);
+      int x1 = MAX(0, MIN(r->x, host->contents_width));
+      int y1 = MAX(0, MIN(r->y, host->contents_height));
+      int x2 = MAX(0, MIN(r->x + r->width, host->contents_width));
+      int y2 = MAX(0, MIN(r->y + r->height, host->contents_height));
       int width = x2 - x1;
       int height = y2 - y1;
+      int bytes = width * bpp;
 
-      dst += dst_stride * y1;
-      src += src_stride * y1;
+      dst += y1 * dst_stride + x1 * bpp;
+      src += y1 * src_stride + x1 * bpp;
 
       while (height--) {
-        memcpy(dst + x1 * 4, src + x1 * 4, width * 4);
+        memcpy(dst, src, bytes);
         dst += dst_stride;
         src += src_stride;
       }
+
       wl_list_remove(&r->link);
       free(r);
     }
+
+    if (host->host_mmap->end_access)
+      host->host_mmap->end_access(host->host_mmap->fd);
   }
 
   // No need to defer cursor or non-xwayland client commits.
@@ -1525,6 +1580,64 @@ static void xwl_destroy_host_buffer(struct wl_resource *resource) {
   free(host);
 }
 
+static int xwl_supported_shm_format(uint32_t format) {
+  switch (format) {
+  case WL_SHM_FORMAT_RGB565:
+  case WL_SHM_FORMAT_ARGB8888:
+  case WL_SHM_FORMAT_XRGB8888:
+    return 1;
+  }
+  return 0;
+}
+
+static size_t xwl_bpp_for_shm_format(uint32_t format) {
+  switch (format) {
+  case WL_SHM_FORMAT_RGB565:
+    return 2;
+  case WL_SHM_FORMAT_ARGB8888:
+  case WL_SHM_FORMAT_ABGR8888:
+  case WL_SHM_FORMAT_XRGB8888:
+  case WL_SHM_FORMAT_XBGR8888:
+    return 4;
+  }
+  assert(0);
+  return 0;
+}
+
+static uint32_t xwl_gbm_format_for_shm_format(uint32_t format) {
+  switch (format) {
+  case WL_SHM_FORMAT_RGB565:
+    return GBM_FORMAT_RGB565;
+  case WL_SHM_FORMAT_ARGB8888:
+    return GBM_FORMAT_ARGB8888;
+  case WL_SHM_FORMAT_ABGR8888:
+    return GBM_FORMAT_ABGR8888;
+  case WL_SHM_FORMAT_XRGB8888:
+    return GBM_FORMAT_XRGB8888;
+  case WL_SHM_FORMAT_XBGR8888:
+    return GBM_FORMAT_XBGR8888;
+  }
+  assert(0);
+  return 0;
+}
+
+static uint32_t xwl_drm_format_for_shm_format(int format) {
+  switch (format) {
+  case WL_SHM_FORMAT_RGB565:
+    return WL_DRM_FORMAT_RGB565;
+  case WL_SHM_FORMAT_ARGB8888:
+    return WL_DRM_FORMAT_ARGB8888;
+  case WL_SHM_FORMAT_ABGR8888:
+    return WL_DRM_FORMAT_ABGR8888;
+  case WL_SHM_FORMAT_XRGB8888:
+    return WL_DRM_FORMAT_XRGB8888;
+  case WL_SHM_FORMAT_XBGR8888:
+    return WL_DRM_FORMAT_XBGR8888;
+  }
+  assert(0);
+  return 0;
+}
+
 static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
                                                  struct wl_resource *resource,
                                                  uint32_t id, int32_t offset,
@@ -1534,6 +1647,7 @@ static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
   struct xwl_host_shm_pool *host = wl_resource_get_user_data(resource);
   struct xwl_host_buffer *host_buffer;
   size_t size = height * stride;
+  size_t bpp = xwl_bpp_for_shm_format(format);
 
   host_buffer = malloc(sizeof(*host_buffer));
   assert(host_buffer);
@@ -1557,31 +1671,55 @@ static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
     host_buffer->proxy = wl_shm_pool_create_buffer(host->proxy, offset, width,
                                                    height, stride, format);
     break;
-  case SHM_DRIVER_DMABUF:
-    assert(0);
-    break;
+  case SHM_DRIVER_DMABUF: {
+    struct zwp_linux_buffer_params_v1 *buffer_params;
+    struct gbm_bo *bo;
+    int stride0;
+    int fd;
+
+    host_buffer->client_mmap =
+        xwl_mmap_create(host->fd, size, offset, stride, bpp);
+
+    bo = gbm_bo_create(host->shm->xwl->gbm, width, height,
+                       xwl_gbm_format_for_shm_format(format),
+                       GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
+    stride0 = gbm_bo_get_stride(bo);
+    fd = gbm_bo_get_fd(bo);
+
+    buffer_params = zwp_linux_dmabuf_v1_create_params(
+        host->shm->xwl->linux_dmabuf->internal);
+    zwp_linux_buffer_params_v1_add(buffer_params, fd, 0, 0, stride0, 0, 0);
+    host_buffer->proxy = zwp_linux_buffer_params_v1_create_immed(
+        buffer_params, width, height, xwl_drm_format_for_shm_format(format), 0);
+    zwp_linux_buffer_params_v1_destroy(buffer_params);
+
+    host_buffer->host_mmap =
+        xwl_mmap_create(fd, height * stride0, 0, stride0, bpp);
+    host_buffer->host_mmap->begin_access = xwl_dmabuf_begin_access;
+    host_buffer->host_mmap->end_access = xwl_dmabuf_end_access;
+
+    gbm_bo_destroy(bo);
+  } break;
   case SHM_DRIVER_VIRTWL: {
     struct virtwl_ioctl_new virtwl_ioctl_new = {
         .type = VIRTWL_IOCTL_NEW_ALLOC, .fd = -1, .flags = 0, .size = size};
     struct wl_shm_pool *pool;
-    int wl_fd;
     int rv;
 
-    host_buffer->client_mmap = xwl_mmap_create(host->fd, size, offset, stride);
+    host_buffer->client_mmap =
+        xwl_mmap_create(host->fd, size, offset, stride, bpp);
 
-    wl_fd = open("/dev/wl0", O_RDWR);
-    rv = ioctl(wl_fd, VIRTWL_IOCTL_NEW, &virtwl_ioctl_new);
+    rv = ioctl(host->shm->xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &virtwl_ioctl_new);
     assert(rv == 0);
-    close(wl_fd);
-
-    host_buffer->host_mmap =
-        xwl_mmap_create(virtwl_ioctl_new.fd, size, 0, stride);
 
     pool = wl_shm_create_pool(host->shm->internal, virtwl_ioctl_new.fd, size);
     host_buffer->proxy =
         wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
+
+    host_buffer->host_mmap =
+        xwl_mmap_create(virtwl_ioctl_new.fd, size, 0, stride, bpp);
+
     wl_shm_pool_destroy(pool);
-    close(virtwl_ioctl_new.fd);
   } break;
   }
 
@@ -1655,7 +1793,8 @@ static const struct wl_shm_interface xwl_shm_implementation = {
 static void xwl_shm_format(void *data, struct wl_shm *shm, uint32_t format) {
   struct xwl_host_shm *host = wl_shm_get_user_data(shm);
 
-  wl_shm_send_format(host->resource, format);
+  if (xwl_supported_shm_format(format))
+    wl_shm_send_format(host->resource, format);
 }
 
 static const struct wl_shm_listener xwl_shm_listener = {xwl_shm_format};
@@ -5359,6 +5498,7 @@ static void xwl_usage() {
          "[--no-exit-with-child] "
          "[--no-clipboard-manager] "
          "[--frame-color=COLOR] "
+         "[--virtwl-device=DEVICE] "
          "[--drm-device=DEVICE] "
          "[--glamor] "
          "[PROGRAM] [ARGS...]\n");
@@ -5384,7 +5524,9 @@ int main(int argc, char **argv) {
       .sigchld_event_source = NULL,
       .shm_driver = SHM_DRIVER_NOOP,
       .wm_fd = -1,
+      .virtwl_fd = -1,
       .drm_device = NULL,
+      .gbm = NULL,
       .xwayland = 0,
       .xwayland_pid = -1,
       .child_pid = -1,
@@ -5454,6 +5596,7 @@ int main(int argc, char **argv) {
   const char *clipboard_manager = getenv("XWL_CLIPBOARD_MANAGER");
   const char *frame_color = getenv("XWL_FRAME_COLOR");
   const char *show_window_title = getenv("XWL_SHOW_WINDOW_TITLE");
+  const char *virtwl_device = getenv("XWL_VIRTWL_DEVICE");
   const char *drm_device = getenv("XWL_DRM_DEVICE");
   const char *glamor = getenv("XWL_GLAMOR");
   const char *shm_driver = getenv("XWL_SHM_DRIVER");
@@ -5529,6 +5672,10 @@ int main(int argc, char **argv) {
       frame_color = s;
     } else if (strstr(arg, "--show-window-title") == arg) {
       show_window_title = "1";
+    } else if (strstr(arg, "--virtwl-device") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      virtwl_device = s;
     } else if (strstr(arg, "--drm-device") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -5550,7 +5697,7 @@ int main(int argc, char **argv) {
 
   runtime_dir = getenv("XDG_RUNTIME_DIR");
   if (!runtime_dir) {
-    fprintf(stderr, "XDG_RUNTIME_DIR not set in the environment\n");
+    fprintf(stderr, "error: XDG_RUNTIME_DIR not set in the environment\n");
     exit(1);
   }
 
@@ -5574,7 +5721,8 @@ int main(int argc, char **argv) {
 
     rv = flock(lock_fd, LOCK_EX | LOCK_NB);
     if (rv < 0) {
-      fprintf(stderr, "unable to lock %s, is another compositor running?\n",
+      fprintf(stderr,
+              "error: unable to lock %s, is another compositor running?\n",
               lock_addr);
       exit(1);
     }
@@ -5611,7 +5759,7 @@ int main(int argc, char **argv) {
 
       client_fd = accept(sock_fd, (struct sockaddr *)&addr, &length);
       if (client_fd < 0) {
-        fprintf(stderr, "failed to accept: %m\n");
+        fprintf(stderr, "error: failed to accept: %m\n");
         continue;
       }
 
@@ -5642,7 +5790,9 @@ int main(int argc, char **argv) {
           char *arg = argv[j];
           if (strstr(arg, "--display") == arg ||
               strstr(arg, "--scale") == arg ||
-              strstr(arg, "--drm-device") == arg) {
+              strstr(arg, "--virtwl-device") == arg ||
+              strstr(arg, "--drm-device") == arg ||
+              strstr(arg, "--shm-driver") == arg) {
             args[i++] = arg;
           }
         }
@@ -5687,20 +5837,51 @@ int main(int argc, char **argv) {
   if (show_window_title)
     xwl.show_window_title = !!strcmp(show_window_title, "0");
 
-  if (drm_device && !access(drm_device, 0))
+  if (virtwl_device) {
+    xwl.virtwl_fd = open(virtwl_device, O_RDWR);
+    if (xwl.virtwl_fd == -1) {
+      fprintf(stderr, "error: could not open %s (%s)\n", virtwl_device,
+              strerror(errno));
+      exit(1);
+    }
+  }
+
+  if (drm_device) {
+    int drm_fd = open(drm_device, O_RDWR | O_CLOEXEC);
+    if (drm_fd == -1) {
+      fprintf(stderr, "error: could not open %s (%s)\n", drm_device,
+              strerror(errno));
+      exit(1);
+    }
+
+    xwl.gbm = gbm_create_device(drm_fd);
+    if (!xwl.gbm) {
+      fprintf(stderr, "error: couldn't get display device\n");
+      exit(1);
+    }
+
     xwl.drm_device = drm_device;
+  }
 
   if (!shm_driver && xwl.drm_device)
     shm_driver = "dmabuf";
-
-  if (!shm_driver && access("dev/wl0", 0))
+  if (!shm_driver && xwl.virtwl_fd != -1)
     shm_driver = "virtwl";
 
   if (shm_driver) {
-    if (strcmp(shm_driver, "dmabuf") == 0)
+    if (strcmp(shm_driver, "dmabuf") == 0) {
+      if (!xwl.drm_device) {
+        fprintf(stderr, "error: need drm device for dmabuf driver\n");
+        exit(1);
+      }
       xwl.shm_driver = SHM_DRIVER_DMABUF;
-    else if (strcmp(shm_driver, "virtwl") == 0)
+    } else if (strcmp(shm_driver, "virtwl") == 0) {
+      if (xwl.virtwl_fd == -1) {
+        fprintf(stderr, "error: need device for virtwl driver\n");
+        exit(1);
+      }
       xwl.shm_driver = SHM_DRIVER_VIRTWL;
+    }
   }
 
   if (xwl.runprog || xwl.xwayland) {
@@ -5731,7 +5912,7 @@ int main(int argc, char **argv) {
   }
 
   if (!xwl.display) {
-    fprintf(stderr, "failed to connect to %s\n", display);
+    fprintf(stderr, "error: failed to connect to %s\n", display);
     exit(1);
   }
 
