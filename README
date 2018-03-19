@@ -1,2 +1,1 @@
-Xwl is a minimal X window manager and nested Wayland compositor that uses
-Xwayland to allow unmodified X clients to run as Wayland clients.
+Sommelier is a nested Wayland compositor with X11 forwarding support.

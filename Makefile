@@ -5,9 +5,9 @@ CLANG_TIDY=clang-tidy-3.9
 PREFIX = /usr
 SYSCONFDIR = /etc
 BINDIR = $(PREFIX)/bin
-SRCFILES := xwl.c virtwl.h
+SRCFILES := sommelier.c virtwl.h
 XMLFILES := aura-shell.xml viewporter.xml xdg-shell-unstable-v6.xml linux-dmabuf-unstable-v1.xml drm.xml
-AUXFILES := Makefile README LICENSE AUTHORS xwl@.service.in version.h.in xwlrc xwl.sh
+AUXFILES := Makefile README LICENSE AUTHORS sommelier@.service.in sommelier-x@.service.in version.h.in sommelierrc sommelier.sh
 ALLFILES := $(SRCFILES) $(XMLFILES) $(AUXFILES)
 GIT_VERSION := $(shell git describe --abbrev=4 --dirty --always --tags)
 DIST_VERSION := $(shell git describe --abbrev=0 --tags)
@@ -18,19 +18,19 @@ DIST_VERSION_MINOR_NEXT := $(shell expr $(DIST_VERSION_MINOR) + 1)
 CFLAGS=-g -Wall `pkg-config --cflags xcb xcb-composite xcb-xfixes wayland-server wayland-client libsystemd gbm` -I. -DXWAYLAND_PATH=\"$(PREFIX)/bin\"
 LDFLAGS=-lpthread -lm `pkg-config --libs xcb xcb-composite xcb-xfixes wayland-server wayland-client libsystemd gbm`
 DEPS = xdg-shell-unstable-v6-client-protocol.h xdg-shell-unstable-v6-server-protocol.h aura-shell-client-protocol.h viewporter-client-protocol.h linux-dmabuf-unstable-v1-client-protocol.h drm-server-protocol.h version.h
-OBJECTS = xwl.o xdg-shell-unstable-v6-protocol.o aura-shell-protocol.o viewporter-protocol.o linux-dmabuf-unstable-v1-protocol.o drm-protocol.o
+OBJECTS = sommelier.o xdg-shell-unstable-v6-protocol.o aura-shell-protocol.o viewporter-protocol.o linux-dmabuf-unstable-v1-protocol.o drm-protocol.o
 
-all: xwl-run xwl@.service
+all: sommelier sommelier@.service sommelier-x@.service
 
-xwl@.service: xwl@.service.in
+%.service: %.service.in
 	$(SED) \
 		-e 's|@bindir[@]|$(BINDIR)|g' \
 		-e 's|@sysconfdir[@]|$(SYSCONFDIR)|g' \
 		-e 's|@version[@]|$(DIST_VERSION)|g' \
 		$< > $@
 
-xwl-run: $(OBJECTS)
-	$(CC) $(OBJECTS) -o xwl-run $(LDFLAGS)
+sommelier: $(OBJECTS)
+	$(CC) $(OBJECTS) -o sommelier $(LDFLAGS)
 
 %-protocol.c: %.xml
 	wayland-scanner code < $< > $@
@@ -52,18 +52,21 @@ $(OBJECTS): $(DEPS)
 .PHONY: all install uninstall update-version dist deb version-clean clean style check-style tidy
 
 install: all
-	install -D xwl-run \
-		$(DESTDIR)$(PREFIX)/bin/xwl-run
-	install -D xwlrc $(DESTDIR)$(SYSCONFDIR)/xwlrc
-	install -m 644 -D xwl@.service \
-		$(DESTDIR)$(PREFIX)/lib/systemd/user/xwl@.service
-	install -m 644 -D xwl.sh $(DESTDIR)$(SYSCONFDIR)/profile.d/xwl.sh
+	install -D sommelier \
+		$(DESTDIR)$(PREFIX)/bin/sommelier
+	install -D sommelierrc $(DESTDIR)$(SYSCONFDIR)/sommelierrc
+	install -m 644 -D sommelier@.service \
+		$(DESTDIR)$(PREFIX)/lib/systemd/user/sommelier@.service
+	install -m 644 -D sommelier-x@.service \
+		$(DESTDIR)$(PREFIX)/lib/systemd/user/sommelier-x@.service
+	install -m 644 -D sommelier.sh $(DESTDIR)$(SYSCONFDIR)/profile.d/sommelier.sh
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/xwl-run
-	rm -f $(DESTDIR)$(SYSCONFDIR)/xwlrc
-	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/user/xwl@.service
-	rm -f $(DESTDIR)$(SYSCONFDIR)/profile.d/xwl.sh
+	rm -f $(DESTDIR)$(PREFIX)/bin/sommelier
+	rm -f $(DESTDIR)$(SYSCONFDIR)/sommelierrc
+	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/user/sommelier@.service
+	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/user/sommelier-x@.service
+	rm -f $(DESTDIR)$(SYSCONFDIR)/profile.d/sommelier.sh
 
 update-version: version-clean
 	dch -v $(DIST_VERSION_MAJOR).$(DIST_VERSION_MINOR_NEXT)-1
@@ -71,23 +74,24 @@ update-version: version-clean
 	git tag $(DIST_VERSION_MAJOR).$(DIST_VERSION_MINOR_NEXT)
 
 dist: version-clean $(DEPS)
-	mkdir -p xwl-$(DIST_VERSION)
-	cp -r $(ALLFILES) $(DEPS) debian xwl-$(DIST_VERSION)
-	tar czf xwl-$(DIST_VERSION).tar.gz xwl-$(DIST_VERSION)
-	rm -rf xwl-$(DIST_VERSION)
+	mkdir -p sommelier-$(DIST_VERSION)
+	cp -r $(ALLFILES) $(DEPS) debian sommelier-$(DIST_VERSION)
+	tar czf sommelier-$(DIST_VERSION).tar.gz sommelier-$(DIST_VERSION)
+	rm -rf sommelier-$(DIST_VERSION)
 
 deb: dist
-	ln -sf xwl-$(DIST_VERSION).tar.gz xwl_$(DIST_VERSION).orig.tar.gz
-	tar xzf xwl-$(DIST_VERSION).tar.gz
-	cd xwl-$(DIST_VERSION) && debuild -i -us -uc -b
-	rm -rf xwl-$(DIST_VERSION) xwl_$(DIST_VERSION).orig.tar.gz
+	ln -sf sommelier-$(DIST_VERSION).tar.gz sommelier_$(DIST_VERSION).orig.tar.gz
+	tar xzf sommelier-$(DIST_VERSION).tar.gz
+	cd sommelier-$(DIST_VERSION) && debuild -i -us -uc -b
+	rm -rf sommelier-$(DIST_VERSION) sommelier_$(DIST_VERSION).orig.tar.gz
 
 version-clean:
 	rm -f version.h
 
 clean: version-clean
-	rm -f *~ *-protocol.c *-protocol.h *.o xwl-run xwl@.service \
-		xwl-*.tar.gz xwl*.deb xwl_*.build xwl_*.buildinfo xwl_*.changes
+	rm -f *~ *-protocol.c *-protocol.h *.o sommelier sommelier@.service \
+		sommelier-x@.service sommelier-*.tar.gz sommelier*.deb \
+		sommelier_*.build sommelier_*.buildinfo sommelier_*.changes
 
 style: $(DEPS)
 	@for src in $(SRCFILES) ; do \

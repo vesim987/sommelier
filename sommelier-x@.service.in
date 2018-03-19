@@ -1,0 +1,11 @@
+[Unit]
+Description=X11 sommelier at display %i
+
+[Service]
+Type=notify
+ExecStart=@bindir@/sommelier -X --x-display=%i --no-exit-with-child /bin/sh -c "systemctl --user import-environment DISPLAY SOMMELIER_VERSION; @sysconfdir@/sommelierrc"
+Restart=always
+
+[Install]
+WantedBy=default.target
+DefaultInstance=0

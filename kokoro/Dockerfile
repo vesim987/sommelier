@@ -10,6 +10,7 @@ RUN apt-get update && \
                        libwayland-dev \
                        libwayland-bin \
                        libxcb-composite0-dev \
+                       libgbm-dev \
                        pkg-config
 
 VOLUME /src

@@ -1,0 +1,11 @@
+[Unit]
+Description=Master sommelier at display %i
+
+[Service]
+Type=notify
+ExecStart=@bindir@/sommelier --master --socket=wayland-%i
+Restart=always
+
+[Install]
+WantedBy=default.target
+DefaultInstance=0

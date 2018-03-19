@@ -18,7 +18,7 @@ main() {
         exit 1
     fi
 
-    local src_root="${KOKORO_ARTIFACTS_DIR}"/git/xwl
+    local src_root="${KOKORO_ARTIFACTS_DIR}"/git/sommelier
     local result_dir="${src_root}"/results
     mkdir -p "${result_dir}"
 
@@ -26,7 +26,7 @@ main() {
 
     setup_docker
 
-    local image_name=xwl-build-stretch
+    local image_name=sommelier-build-stretch
 
     docker build "${src_root}/kokoro" -t "${image_name}"
 

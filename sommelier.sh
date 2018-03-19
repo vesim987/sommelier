@@ -4,7 +4,7 @@
 # DISPLAY already set?
 [ -z "$DISPLAY" ] || return 0
 
-# Not running under xwl?
-[ $(systemctl --user show-environment | grep ^XWL_VERSION=) ] || return 0
+# Not running under sommelier?
+[ $(systemctl --user show-environment | grep ^SOMMELIER_VERSION=) ] || return 0
 
 export $(systemctl --user show-environment | grep ^DISPLAY=)

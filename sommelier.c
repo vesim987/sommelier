@@ -5175,7 +5175,7 @@ static int xwl_handle_x_connection_event(int fd, uint32_t mask, void *data) {
 }
 
 static void xwl_connect(struct xwl *xwl) {
-  const char wm_name[] = "WLWM";
+  const char wm_name[] = "Sommelier";
   const xcb_setup_t *setup;
   xcb_screen_iterator_t screen_iterator;
   uint32_t values[1];
@@ -5350,7 +5350,7 @@ static void xwl_execvp(const char *file, char *const argv[],
     setenv("WAYLAND_SOCKET", fd_str, 1);
   }
 
-  setenv("XWL_VERSION", VERSION, 1);
+  setenv("SOMMELIER_VERSION", VERSION, 1);
 
   execvp(file, argv);
   perror(file);
@@ -5513,7 +5513,7 @@ xwl_set_display_implementation(struct wl_resource *resource, void *user_data) {
 }
 
 static void xwl_print_usage(int retval) {
-  printf("usage: xwl-run [options] [program] [args...]\n\n"
+  printf("usage: sommelier [options] [program] [args...]\n\n"
          "options:\n"
          "  -h, --help\t\t\tPrint this help\n"
          "  -X\t\t\t\tEnable X11 forwarding\n"
@@ -5620,15 +5620,15 @@ int main(int argc, char **argv) {
           },
       .visual_ids = {0},
       .colormaps = {0}};
-  const char *display = getenv("XWL_DISPLAY");
-  const char *scale = getenv("XWL_SCALE");
-  const char *clipboard_manager = getenv("XWL_CLIPBOARD_MANAGER");
-  const char *frame_color = getenv("XWL_FRAME_COLOR");
-  const char *show_window_title = getenv("XWL_SHOW_WINDOW_TITLE");
-  const char *virtwl_device = getenv("XWL_VIRTWL_DEVICE");
-  const char *drm_device = getenv("XWL_DRM_DEVICE");
-  const char *glamor = getenv("XWL_GLAMOR");
-  const char *shm_driver = getenv("XWL_SHM_DRIVER");
+  const char *display = getenv("SOMMELIER_DISPLAY");
+  const char *scale = getenv("SOMMELIER_SCALE");
+  const char *clipboard_manager = getenv("SOMMELIER_CLIPBOARD_MANAGER");
+  const char *frame_color = getenv("SOMMELIER_FRAME_COLOR");
+  const char *show_window_title = getenv("SOMMELIER_SHOW_WINDOW_TITLE");
+  const char *virtwl_device = getenv("SOMMELIER_VIRTWL_DEVICE");
+  const char *drm_device = getenv("SOMMELIER_DRM_DEVICE");
+  const char *glamor = getenv("SOMMELIER_GLAMOR");
+  const char *shm_driver = getenv("SOMMELIER_SHM_DRIVER");
   const char *socket_name = "wayland-0";
   const char *runtime_dir;
   struct wl_event_loop *event_loop;
