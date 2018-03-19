@@ -81,9 +81,18 @@ struct xwl_compositor {
   struct wl_compositor *internal;
 };
 
+struct xwl_damage_tracker {
+  struct wl_list link;
+  int x1;
+  int y1;
+  int x2;
+  int y2;
+};
+
 typedef void (*xwl_begin_end_access_func_t)(int fd);
 
 struct xwl_mmap {
+  struct xwl_damage_tracker damage;
   int refcount;
   int fd;
   void *addr;
@@ -91,17 +100,8 @@ struct xwl_mmap {
   size_t offset;
   size_t stride;
   size_t bpp;
-  int dirty;
   xwl_begin_end_access_func_t begin_access;
   xwl_begin_end_access_func_t end_access;
-};
-
-struct xwl_damage_rect {
-  int x;
-  int y;
-  int width;
-  int height;
-  struct wl_list link;
 };
 
 struct xwl_host_surface {
@@ -116,7 +116,7 @@ struct xwl_host_surface {
   uint32_t last_event_serial;
   struct xwl_mmap *client_mmap;
   struct xwl_mmap *host_mmap;
-  struct wl_list damage_rects;
+  struct wl_list damage_trackers;
 };
 
 struct xwl_host_region {
@@ -607,13 +607,13 @@ static struct xwl_mmap *xwl_mmap_create(int fd, size_t size, size_t offset,
   struct xwl_mmap *map;
 
   map = malloc(sizeof(*map));
+  wl_list_init(&map->damage.link);
   map->refcount = 1;
   map->fd = fd;
   map->size = size;
   map->offset = offset;
   map->stride = stride;
   map->bpp = bpp;
-  map->dirty = 1;
   map->begin_access = NULL;
   map->end_access = NULL;
   map->addr =
@@ -632,6 +632,7 @@ static void xwl_mmap_unref(struct xwl_mmap *map) {
   if (map->refcount-- == 1) {
     munmap(map->addr, map->size);
     close(map->fd);
+    wl_list_remove(&map->damage.link);
     free(map);
   }
 }
@@ -1117,21 +1118,6 @@ static void xwl_host_surface_destroy(struct wl_client *client,
   wl_resource_destroy(resource);
 }
 
-static void xwl_set_host_surface_scale(struct xwl_host_surface *host) {
-  double scale = host->xwl->scale * host->contents_scale;
-
-  if (!host->contents_width || !host->contents_height)
-    return;
-
-  if (host->viewport) {
-    wp_viewport_set_destination(host->viewport,
-                                ceil(host->contents_width / scale),
-                                ceil(host->contents_height / scale));
-  } else {
-    wl_surface_set_buffer_scale(host->proxy, scale);
-  }
-}
-
 static void xwl_host_surface_attach(struct wl_client *client,
                                     struct wl_resource *resource,
                                     struct wl_resource *buffer_resource,
@@ -1164,8 +1150,6 @@ static void xwl_host_surface_attach(struct wl_client *client,
 
   wl_surface_attach(host->proxy, buffer_proxy, x / scale, y / scale);
 
-  xwl_set_host_surface_scale(host);
-
   wl_list_for_each(window, &host->xwl->windows, link) {
     if (window->host_surface_id == wl_resource_get_id(resource)) {
       while (xwl_process_pending_configure_acks(window, host))
@@ -1181,26 +1165,34 @@ static void xwl_host_surface_damage(struct wl_client *client,
                                     int32_t y, int32_t width, int32_t height) {
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   double scale = host->xwl->scale;
+  struct xwl_damage_tracker *t;
   int32_t x1, y1, x2, y2;
+
+  x1 = x;
+  y1 = y;
+  x2 = x + width;
+  y2 = y + height;
+
+  wl_list_for_each(t, &host->damage_trackers, link) {
+    if (t->x1 < t->x2 && t->y1 < t->y2) {
+      t->x1 = MIN(x1, t->x1);
+      t->y1 = MIN(y1, t->y1);
+      t->x2 = MAX(x2, t->x2);
+      t->y2 = MAX(y2, t->y2);
+    } else {
+      t->x1 = x1;
+      t->y1 = y1;
+      t->x2 = x2;
+      t->y2 = y2;
+    }
+  }
 
   // Enclosing rect after scaling and outset by one pixel to account for
   // potential filtering.
-  x1 = (x - 1) / scale;
-  y1 = (y - 1) / scale;
-  x2 = ceil((x + width + 1) / scale);
-  y2 = ceil((y + height + 1) / scale);
-
-  if (host->xwl->shm_driver != SHM_DRIVER_NOOP) {
-    struct xwl_damage_rect *damage;
-
-    damage = malloc(sizeof(*damage));
-    damage->x = x;
-    damage->y = y;
-    damage->width = width;
-    damage->height = height;
-
-    wl_list_insert(&host->damage_rects, &damage->link);
-  }
+  x1 = (x1 - 1) / scale;
+  y1 = (y1 - 1) / scale;
+  x2 = ceil((x2 + 1) / scale);
+  y2 = ceil((y2 + 1) / scale);
 
   wl_surface_damage(host->proxy, x1, y1, x2 - x1, y2 - y1);
 }
@@ -1273,55 +1265,90 @@ static void xwl_host_surface_commit(struct wl_client *client,
   struct xwl_window *window;
 
   if (host->host_mmap && host->client_mmap) {
+    uint8_t *dst = host->host_mmap->addr + host->host_mmap->offset;
+    uint8_t *src = host->client_mmap->addr + host->client_mmap->offset;
     size_t dst_stride = host->host_mmap->stride;
     size_t src_stride = host->client_mmap->stride;
     size_t bpp = host->host_mmap->bpp;
-    struct xwl_damage_rect *r, *next;
+    int x1 = 0;
+    int y1 = 0;
+    int x2 = host->contents_width / host->contents_scale;
+    int y2 = host->contents_height / host->contents_scale;
+    int width, height, bytes;
+
+    if (!wl_list_empty(&host->host_mmap->damage.link)) {
+      struct xwl_damage_tracker *t;
+
+      int x = 0;
+      wl_list_for_each(t, &host->damage_trackers, link) {
+        x++;
+        if (t == &host->host_mmap->damage) {
+          if (t->x1 > x1)
+            x1 = MIN(t->x1, x2);
+          if (t->y1 > y1)
+            y1 = MIN(t->y1, y2);
+          if (t->x2 < x2)
+            x2 = MAX(t->x2, x1);
+          if (t->y2 < y2)
+            y2 = MAX(t->y2, y1);
+          break;
+        }
+      }
+    }
+
+    x1 *= host->contents_scale;
+    y1 *= host->contents_scale;
+    x2 *= host->contents_scale;
+    y2 *= host->contents_scale;
 
     assert(host->client_mmap->bpp == host->host_mmap->bpp);
 
-    if (host->host_mmap->dirty) {
-      struct xwl_damage_rect *damage;
+    width = x2 - x1;
+    height = y2 - y1;
+    bytes = width * bpp;
 
-      damage = malloc(sizeof(*damage));
-      damage->x = 0;
-      damage->y = 0;
-      damage->width = host->contents_width;
-      damage->height = host->contents_height;
-      wl_list_insert(&host->damage_rects, &damage->link);
-
-      host->host_mmap->dirty = 0;
-    }
+    dst += y1 * dst_stride + x1 * bpp;
+    src += y1 * src_stride + x1 * bpp;
 
     if (host->host_mmap->begin_access)
       host->host_mmap->begin_access(host->host_mmap->fd);
 
-    wl_list_for_each_safe(r, next, &host->damage_rects, link) {
-      uint8_t *dst = host->host_mmap->addr + host->host_mmap->offset;
-      uint8_t *src = host->client_mmap->addr + host->client_mmap->offset;
-      int x1 = MAX(0, MIN(r->x, host->contents_width));
-      int y1 = MAX(0, MIN(r->y, host->contents_height));
-      int x2 = MAX(0, MIN(r->x + r->width, host->contents_width));
-      int y2 = MAX(0, MIN(r->y + r->height, host->contents_height));
-      int width = x2 - x1;
-      int height = y2 - y1;
-      int bytes = width * bpp;
-
-      dst += y1 * dst_stride + x1 * bpp;
-      src += y1 * src_stride + x1 * bpp;
-
-      while (height--) {
-        memcpy(dst, src, bytes);
-        dst += dst_stride;
-        src += src_stride;
-      }
-
-      wl_list_remove(&r->link);
-      free(r);
+    while (height--) {
+      memcpy(dst, src, bytes);
+      dst += dst_stride;
+      src += src_stride;
     }
 
     if (host->host_mmap->end_access)
       host->host_mmap->end_access(host->host_mmap->fd);
+
+    // Empty damage.
+    host->host_mmap->damage.x1 = host->host_mmap->damage.x2;
+    host->host_mmap->damage.y1 = host->host_mmap->damage.y2;
+
+    wl_list_remove(&host->host_mmap->damage.link);
+    wl_list_init(&host->host_mmap->damage.link);
+
+    // Limit damage tracking to 4 buffers.
+    if (wl_list_length(&host->damage_trackers) >= 4) {
+      struct wl_list *first = host->damage_trackers.next;
+
+      wl_list_remove(first);
+      wl_list_init(first);
+    }
+    wl_list_insert(host->damage_trackers.prev, &host->host_mmap->damage.link);
+  }
+
+  if (host->contents_width && host->contents_height) {
+    double scale = host->xwl->scale * host->contents_scale;
+
+    if (host->viewport) {
+      wp_viewport_set_destination(host->viewport,
+                                  ceil(host->contents_width / scale),
+                                  ceil(host->contents_height / scale));
+    } else {
+      wl_surface_set_buffer_scale(host->proxy, scale);
+    }
   }
 
   // No need to defer cursor or non-xwayland client commits.
@@ -1358,8 +1385,6 @@ static void xwl_host_surface_set_buffer_scale(struct wl_client *client,
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
 
   host->contents_scale = scale;
-
-  xwl_set_host_surface_scale(host);
 }
 
 static void xwl_host_surface_damage_buffer(struct wl_client *client,
@@ -1384,7 +1409,6 @@ static const struct wl_surface_interface xwl_surface_implementation = {
 static void xwl_destroy_host_surface(struct wl_resource *resource) {
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   struct xwl_window *window, *surface_window = NULL;
-  struct xwl_damage_rect *r, *next;
 
   wl_list_for_each(window, &host->xwl->windows, link) {
     if (window->host_surface_id == wl_resource_get_id(resource)) {
@@ -1403,9 +1427,11 @@ static void xwl_destroy_host_surface(struct wl_resource *resource) {
   if (host->host_mmap)
     xwl_mmap_unref(host->host_mmap);
 
-  wl_list_for_each_safe(r, next, &host->damage_rects, link) {
-    wl_list_remove(&r->link);
-    free(r);
+  while (!wl_list_empty(&host->damage_trackers)) {
+    struct wl_list *first = host->damage_trackers.next;
+
+    wl_list_remove(first);
+    wl_list_init(first);
   }
 
   if (host->viewport)
@@ -1479,7 +1505,7 @@ static void xwl_compositor_create_host_surface(struct wl_client *client,
   host_surface->last_event_serial = 0;
   host_surface->client_mmap = NULL;
   host_surface->host_mmap = NULL;
-  wl_list_init(&host_surface->damage_rects);
+  wl_list_init(&host_surface->damage_trackers);
   host_surface->resource = wl_resource_create(
       client, &wl_surface_interface, wl_resource_get_version(resource), id);
   wl_resource_set_implementation(host_surface->resource,
@@ -1487,6 +1513,7 @@ static void xwl_compositor_create_host_surface(struct wl_client *client,
                                  xwl_destroy_host_surface);
   host_surface->proxy = wl_compositor_create_surface(host->proxy);
   wl_surface_set_user_data(host_surface->proxy, host_surface);
+  host_surface->viewport = NULL;
   if (host_surface->xwl->viewporter) {
     host_surface->viewport = wp_viewporter_get_viewport(
         host_surface->xwl->viewporter->internal, host_surface->proxy);
