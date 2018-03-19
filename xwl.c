@@ -5512,23 +5512,25 @@ xwl_set_display_implementation(struct wl_resource *resource, void *user_data) {
   return WL_ITERATOR_CONTINUE;
 }
 
-static void xwl_usage() {
-  printf("xwl-run "
-         "[-X] "
-         "[--master] "
-         "[--socket=SOCKET] "
-         "[--display=DISPLAY] "
-         "[--shm-driver=noop|dmabuf|virtwl] "
-         "[--scale=SCALE] "
-         "[--app-id=ID] "
-         "[--x-display=DISPLAY] "
-         "[--no-exit-with-child] "
-         "[--no-clipboard-manager] "
-         "[--frame-color=COLOR] "
-         "[--virtwl-device=DEVICE] "
-         "[--drm-device=DEVICE] "
-         "[--glamor] "
-         "[PROGRAM] [ARGS...]\n");
+static void xwl_print_usage(int retval) {
+  printf("usage: xwl-run [options] [program] [args...]\n\n"
+         "options:\n"
+         "  -h, --help\t\t\tPrint this help\n"
+         "  -X\t\t\t\tEnable X11 forwarding\n"
+         "  --master\t\t\tRun as master and spawn child processes\n"
+         "  --socket=SOCKET\t\tName of socket to listen on\n"
+         "  --display=DISPLAY\t\tWayland display to connect to\n"
+         "  --shm-driver=DRIVER\t\tSHM driver to use (noop, dmabuf, virtwl)\n"
+         "  --scale=SCALE\t\t\tScale factor for contents\n"
+         "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
+         "  --x-display=DISPLAY\t\tX11 display to listen on\n"
+         "  --no-exit-with-child\t\tKeep process alive after child exists\n"
+         "  --no-clipboard-manager\tDisable X11 clipboard manager\n"
+         "  --frame-color=COLOR\t\tWindow frame color for X11 clients\n"
+         "  --virtwl-device=DEVICE\tVirtWL device to use\n"
+         "  --drm-device=DEVICE\t\tDRM device to use\n"
+         "  --glamor\t\t\tUse glamor to accelerate X11 clients\n");
+  exit(retval);
 }
 
 int main(int argc, char **argv) {
@@ -5644,8 +5646,7 @@ int main(int argc, char **argv) {
     const char *arg = argv[i];
     if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0 ||
         strcmp(arg, "-?") == 0) {
-      xwl_usage();
-      return 0;
+      xwl_print_usage(0);
     }
     if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
       printf("Version: %s\n", VERSION);
@@ -5837,7 +5838,7 @@ int main(int argc, char **argv) {
 
   if (client_fd == -1) {
     if (!xwl.runprog || !xwl.runprog[0]) {
-      xwl_usage();
+      xwl_print_usage(1);
       return 1;
     }
   }
