@@ -468,6 +468,7 @@ struct xwl {
   struct wl_list windows, unpaired_windows;
   struct xwl_window *host_focus_window;
   int needs_set_input_focus;
+  double desired_scale;
   double scale;
   const char *app_id;
   int exit_with_child;
@@ -3880,6 +3881,8 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
         wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
     assert(!xwl->viewporter);
     xwl->viewporter = viewporter;
+    // Allow non-integer scale.
+    xwl->scale = MIN(MAX_SCALE, MAX(MIN_SCALE, xwl->desired_scale));
   } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
     struct xwl_linux_dmabuf *linux_dmabuf =
         malloc(sizeof(struct xwl_linux_dmabuf));
@@ -5695,6 +5698,7 @@ int main(int argc, char **argv) {
       .window = 0,
       .host_focus_window = NULL,
       .needs_set_input_focus = 0,
+      .desired_scale = 1.0,
       .scale = 1.0,
       .app_id = NULL,
       .exit_with_child = 1,
@@ -5979,8 +5983,11 @@ int main(int argc, char **argv) {
       xwl.clipboard_manager = !!strcmp(clipboard_manager, "0");
   }
 
-  if (scale)
-    xwl.scale = MIN(MAX_SCALE, MAX(MIN_SCALE, atof(scale)));
+  if (scale) {
+    xwl.desired_scale = atof(scale);
+    // Round to integer scale until we detect wp_viewporter support.
+    xwl.scale = MIN(MAX_SCALE, MAX(MIN_SCALE, round(xwl.desired_scale)));
+  }
 
   if (frame_color) {
     int r, g, b;
@@ -6113,9 +6120,6 @@ int main(int argc, char **argv) {
 
   wl_registry_add_listener(wl_display_get_registry(xwl.display),
                            &xwl_registry_listener, &xwl);
-
-  if (!xwl.viewporter)
-    xwl.scale = ceil(xwl.scale);
 
   xwl.client = wl_client_create(xwl.host_display, client_fd);
 
