@@ -447,6 +447,10 @@ struct xwl {
   int shm_driver;
   int wm_fd;
   int virtwl_fd;
+  int virtwl_ctx_fd;
+  int virtwl_socket_fd;
+  struct wl_event_source *virtwl_ctx_event_source;
+  struct wl_event_source *virtwl_socket_event_source;
   const char *drm_device;
   struct gbm_device *gbm;
   int xwayland;
@@ -1728,7 +1732,7 @@ static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
     gbm_bo_destroy(bo);
   } break;
   case SHM_DRIVER_VIRTWL: {
-    struct virtwl_ioctl_new virtwl_ioctl_new = {
+    struct virtwl_ioctl_new new_alloc = {
         .type = VIRTWL_IOCTL_NEW_ALLOC, .fd = -1, .flags = 0, .size = size};
     struct wl_shm_pool *pool;
     int rv;
@@ -1736,15 +1740,15 @@ static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
     host_buffer->client_mmap =
         xwl_mmap_create(host->fd, size, offset, stride, bpp);
 
-    rv = ioctl(host->shm->xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &virtwl_ioctl_new);
+    rv = ioctl(host->shm->xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &new_alloc);
     assert(rv == 0);
 
-    pool = wl_shm_create_pool(host->shm->internal, virtwl_ioctl_new.fd, size);
+    pool = wl_shm_create_pool(host->shm->internal, new_alloc.fd, size);
     host_buffer->proxy =
         wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
 
     host_buffer->host_mmap =
-        xwl_mmap_create(virtwl_ioctl_new.fd, size, 0, stride, bpp);
+        xwl_mmap_create(new_alloc.fd, size, 0, stride, bpp);
 
     wl_shm_pool_destroy(pool);
   } break;
@@ -3996,8 +4000,10 @@ static int xwl_handle_event(int fd, uint32_t mask, void *data) {
   struct xwl *xwl = (struct xwl *)data;
   int count = 0;
 
-  if ((mask & WL_EVENT_HANGUP) || (mask & WL_EVENT_ERROR))
-    return 0;
+  if ((mask & WL_EVENT_HANGUP) || (mask & WL_EVENT_ERROR)) {
+    wl_client_flush(xwl->client);
+    exit(0);
+  }
 
   if (mask & WL_EVENT_READABLE)
     count = wl_display_dispatch(xwl->display);
@@ -5512,6 +5518,123 @@ xwl_set_display_implementation(struct wl_resource *resource, void *user_data) {
   return WL_ITERATOR_CONTINUE;
 }
 
+static int xwl_handle_virtwl_ctx_event(int fd, uint32_t mask, void *data) {
+  struct xwl *xwl = (struct xwl *)data;
+  uint8_t ioctl_buffer[4096];
+  struct virtwl_ioctl_txn *ioctl_recv = (struct virtwl_ioctl_txn *)ioctl_buffer;
+  void *recv_data = ioctl_buffer + sizeof(struct virtwl_ioctl_txn);
+  size_t max_recv_size = sizeof(ioctl_buffer) - sizeof(struct virtwl_ioctl_txn);
+  char fd_buffer[CMSG_LEN(sizeof(int) * VIRTWL_SEND_MAX_ALLOCS)];
+  struct msghdr msg = {0};
+  struct iovec buffer_iov;
+  ssize_t bytes;
+  int fd_count;
+  int rv;
+
+  ioctl_recv->len = max_recv_size;
+  rv = ioctl(fd, VIRTWL_IOCTL_RECV, ioctl_recv);
+  if (rv) {
+    close(xwl->virtwl_socket_fd);
+    xwl->virtwl_socket_fd = -1;
+    return 0;
+  }
+
+  buffer_iov.iov_base = recv_data;
+  buffer_iov.iov_len = ioctl_recv->len;
+
+  msg.msg_iov = &buffer_iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = fd_buffer;
+
+  // Count how many FDs the kernel gave us.
+  for (fd_count = 0; fd_count < VIRTWL_SEND_MAX_ALLOCS; fd_count++) {
+    if (ioctl_recv->fds[fd_count] < 0)
+      break;
+  }
+  if (fd_count) {
+    struct cmsghdr *cmsg;
+
+    // Need to set msg_controllen so CMSG_FIRSTHDR will return the first
+    // cmsghdr. We copy every fd we just received from the ioctl into this
+    // cmsghdr.
+    msg.msg_controllen = sizeof(fd_buffer);
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(fd_count * sizeof(int));
+    memcpy(CMSG_DATA(cmsg), ioctl_recv->fds, fd_count * sizeof(int));
+    msg.msg_controllen = cmsg->cmsg_len;
+  }
+
+  bytes = sendmsg(xwl->virtwl_socket_fd, &msg, MSG_NOSIGNAL);
+  assert(bytes == ioctl_recv->len);
+
+  while (fd_count--)
+    close(ioctl_recv->fds[fd_count]);
+
+  return 1;
+}
+
+static int xwl_handle_virtwl_socket_event(int fd, uint32_t mask, void *data) {
+  struct xwl *xwl = (struct xwl *)data;
+  uint8_t ioctl_buffer[4096];
+  struct virtwl_ioctl_txn *ioctl_send = (struct virtwl_ioctl_txn *)ioctl_buffer;
+  void *send_data = ioctl_buffer + sizeof(struct virtwl_ioctl_txn);
+  size_t max_send_size = sizeof(ioctl_buffer) - sizeof(struct virtwl_ioctl_txn);
+  char fd_buffer[CMSG_LEN(sizeof(int) * VIRTWL_SEND_MAX_ALLOCS)];
+  struct iovec buffer_iov;
+  struct msghdr msg = {0};
+  struct cmsghdr *cmsg;
+  ssize_t bytes;
+  int fd_count = 0;
+  int rv;
+  int i;
+
+  buffer_iov.iov_base = send_data;
+  buffer_iov.iov_len = max_send_size;
+
+  msg.msg_iov = &buffer_iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = fd_buffer;
+  msg.msg_controllen = sizeof(fd_buffer);
+
+  bytes = recvmsg(xwl->virtwl_socket_fd, &msg, 0);
+  assert(bytes > 0);
+
+  // If there were any FDs recv'd by recvmsg, there will be some data in the
+  // msg_control buffer. To get the FDs out we iterate all cmsghdr's within and
+  // unpack the FDs if the cmsghdr type is SCM_RIGHTS.
+  for (cmsg = msg.msg_controllen != 0 ? CMSG_FIRSTHDR(&msg) : NULL; cmsg;
+       cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+    size_t cmsg_fd_count;
+
+    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
+      continue;
+
+    cmsg_fd_count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+
+    // fd_count will never exceed VIRTWL_SEND_MAX_ALLOCS because the
+    // control message buffer only allocates enough space for that many FDs.
+    memcpy(&ioctl_send->fds[fd_count], CMSG_DATA(cmsg),
+           cmsg_fd_count * sizeof(int));
+    fd_count += cmsg_fd_count;
+  }
+
+  for (i = fd_count; i < VIRTWL_SEND_MAX_ALLOCS; ++i)
+    ioctl_send->fds[i] = -1;
+
+  // The FDs and data were extracted from the recvmsg call into the ioctl_send
+  // structure which we now pass along to the kernel.
+  ioctl_send->len = bytes;
+  rv = ioctl(xwl->virtwl_ctx_fd, VIRTWL_IOCTL_SEND, ioctl_send);
+  assert(!rv);
+
+  while (fd_count--)
+    close(ioctl_send->fds[fd_count]);
+
+  return 1;
+}
+
 static void xwl_print_usage(int retval) {
   printf("usage: sommelier [options] [program] [args...]\n\n"
          "options:\n"
@@ -5554,6 +5677,10 @@ int main(int argc, char **argv) {
       .shm_driver = SHM_DRIVER_NOOP,
       .wm_fd = -1,
       .virtwl_fd = -1,
+      .virtwl_ctx_fd = -1,
+      .virtwl_socket_fd = -1,
+      .virtwl_ctx_event_source = NULL,
+      .virtwl_socket_event_source = NULL,
       .drm_device = NULL,
       .gbm = NULL,
       .xwayland = 0,
@@ -5636,6 +5763,7 @@ int main(int argc, char **argv) {
                                                     xwl_client_destroy_notify};
   int sv[2];
   pid_t pid;
+  int virtwl_display_fd = -1;
   int xdisplay = -1;
   int master = 0;
   int client_fd = -1;
@@ -5865,12 +5993,48 @@ int main(int argc, char **argv) {
   if (show_window_title)
     xwl.show_window_title = !!strcmp(show_window_title, "0");
 
+  xwl.host_display = wl_display_create();
+  assert(xwl.host_display);
+
+  event_loop = wl_display_get_event_loop(xwl.host_display);
+
   if (virtwl_device) {
+    struct virtwl_ioctl_new new_ctx = {
+        .type = VIRTWL_IOCTL_NEW_CTX, .fd = -1, .flags = 0, .size = 0,
+    };
+
     xwl.virtwl_fd = open(virtwl_device, O_RDWR);
     if (xwl.virtwl_fd == -1) {
       fprintf(stderr, "error: could not open %s (%s)\n", virtwl_device,
               strerror(errno));
       exit(1);
+    }
+
+    // We use a virtwl context unless display was explicitly specified.
+    // WARNING: It's critical that we never call wl_display_roundtrip
+    // as we're not spawning a new thread to handle forwarding. Calling
+    // wl_display_roundtrip will cause a deadlock.
+    if (!display) {
+      int vws[2];
+
+      // Connection to virtwl channel.
+      rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, vws);
+      assert(!rv);
+
+      xwl.virtwl_socket_fd = vws[0];
+      virtwl_display_fd = vws[1];
+
+      rv = ioctl(xwl.virtwl_fd, VIRTWL_IOCTL_NEW, &new_ctx);
+      assert(!rv);
+
+      xwl.virtwl_ctx_fd = new_ctx.fd;
+
+      xwl.virtwl_socket_event_source = wl_event_loop_add_fd(
+          event_loop, xwl.virtwl_socket_fd, WL_EVENT_READABLE,
+          xwl_handle_virtwl_socket_event, &xwl);
+      xwl.virtwl_ctx_event_source =
+          wl_event_loop_add_fd(event_loop, xwl.virtwl_ctx_fd, WL_EVENT_READABLE,
+                               xwl_handle_virtwl_ctx_event, &xwl);
     }
   }
 
@@ -5920,22 +6084,14 @@ int main(int argc, char **argv) {
     client_fd = sv[0];
   }
 
-  if (display == NULL)
-    display = getenv("WAYLAND_DISPLAY");
-  if (display == NULL)
-    display = "wayland-0";
-
-  if (display[0] == '/') {
-    char *saved_runtime_dir = strdup(runtime_dir);
-    char *dir_display = strdup(display);
-    char *base_display = strdup(display);
-
-    setenv("XDG_RUNTIME_DIR", dirname(dir_display), 1);
-    xwl.display = wl_display_connect(basename(base_display));
-    setenv("XDG_RUNTIME_DIR", saved_runtime_dir, 1);
-    free(dir_display);
-    free(base_display);
+  if (virtwl_display_fd != -1) {
+    xwl.display = wl_display_connect_to_fd(virtwl_display_fd);
   } else {
+    if (display == NULL)
+      display = getenv("WAYLAND_DISPLAY");
+    if (display == NULL)
+      display = "wayland-0";
+
     xwl.display = wl_display_connect(display);
   }
 
@@ -5951,19 +6107,12 @@ int main(int argc, char **argv) {
   wl_list_init(&xwl.windows);
   wl_list_init(&xwl.unpaired_windows);
 
-  xwl.host_display = wl_display_create();
-  assert(xwl.host_display);
-
-  event_loop = wl_display_get_event_loop(xwl.host_display);
-
   xwl.display_event_source =
       wl_event_loop_add_fd(event_loop, wl_display_get_fd(xwl.display),
                            WL_EVENT_READABLE, xwl_handle_event, &xwl);
 
   wl_registry_add_listener(wl_display_get_registry(xwl.display),
                            &xwl_registry_listener, &xwl);
-
-  wl_display_roundtrip(xwl.display);
 
   if (!xwl.viewporter)
     xwl.scale = ceil(xwl.scale);
