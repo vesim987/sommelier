@@ -18,6 +18,7 @@
 #include <gbm.h>
 #include <libgen.h>
 #include <math.h>
+#include <pixman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,18 +82,9 @@ struct xwl_compositor {
   struct wl_compositor *internal;
 };
 
-struct xwl_damage_tracker {
-  struct wl_list link;
-  int x1;
-  int y1;
-  int x2;
-  int y2;
-};
-
 typedef void (*xwl_begin_end_access_func_t)(int fd);
 
 struct xwl_mmap {
-  struct xwl_damage_tracker damage;
   int refcount;
   int fd;
   void *addr;
@@ -102,7 +94,10 @@ struct xwl_mmap {
   size_t bpp;
   xwl_begin_end_access_func_t begin_access;
   xwl_begin_end_access_func_t end_access;
+  struct wl_resource *buffer_resource;
 };
+
+struct xwl_output_buffer;
 
 struct xwl_host_surface {
   struct xwl *xwl;
@@ -112,11 +107,23 @@ struct xwl_host_surface {
   uint32_t contents_width;
   uint32_t contents_height;
   int32_t contents_scale;
+  struct xwl_mmap *contents_shm_mmap;
   int is_cursor;
   uint32_t last_event_serial;
-  struct xwl_mmap *client_mmap;
-  struct xwl_mmap *host_mmap;
-  struct wl_list damage_trackers;
+  struct xwl_output_buffer *current_buffer;
+  struct wl_list released_buffers;
+  struct wl_list busy_buffers;
+};
+
+struct xwl_output_buffer {
+  struct wl_list link;
+  uint32_t width;
+  uint32_t height;
+  uint32_t format;
+  struct wl_buffer *internal;
+  struct xwl_mmap *mmap;
+  struct pixman_region32 damage;
+  struct xwl_host_surface *surface;
 };
 
 struct xwl_host_region {
@@ -136,11 +143,8 @@ struct xwl_host_buffer {
   struct wl_buffer *proxy;
   uint32_t width;
   uint32_t height;
-  uint32_t stride;
-  uint32_t size;
-  int32_t offset;
-  struct xwl_mmap *client_mmap;
-  struct xwl_mmap *host_mmap;
+  struct xwl_mmap *shm_mmap;
+  uint32_t shm_format;
 };
 
 struct xwl_host_shm_pool {
@@ -569,6 +573,9 @@ enum {
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 
+#define MAX_BUFFER_WIDTH 32768
+#define MAX_BUFFER_HEIGHT 32768
+
 #ifndef UNIX_PATH_MAX
 #define UNIX_PATH_MAX 108
 #endif
@@ -612,7 +619,6 @@ static struct xwl_mmap *xwl_mmap_create(int fd, size_t size, size_t offset,
   struct xwl_mmap *map;
 
   map = malloc(sizeof(*map));
-  wl_list_init(&map->damage.link);
   map->refcount = 1;
   map->fd = fd;
   map->size = size;
@@ -621,6 +627,7 @@ static struct xwl_mmap *xwl_mmap_create(int fd, size_t size, size_t offset,
   map->bpp = bpp;
   map->begin_access = NULL;
   map->end_access = NULL;
+  map->buffer_resource = NULL;
   map->addr =
       mmap(NULL, size + offset, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   assert(map->addr != MAP_FAILED);
@@ -637,10 +644,34 @@ static void xwl_mmap_unref(struct xwl_mmap *map) {
   if (map->refcount-- == 1) {
     munmap(map->addr, map->size);
     close(map->fd);
-    wl_list_remove(&map->damage.link);
     free(map);
   }
 }
+
+static void xwl_output_buffer_destroy(struct xwl_output_buffer *buffer) {
+  wl_buffer_destroy(buffer->internal);
+  xwl_mmap_unref(buffer->mmap);
+  pixman_region32_fini(&buffer->damage);
+  wl_list_remove(&buffer->link);
+}
+
+static void xwl_output_buffer_release(void *data, struct wl_buffer *buffer) {
+  struct xwl_output_buffer *output_buffer = wl_buffer_get_user_data(buffer);
+  struct xwl_output_buffer *item, *next;
+  struct xwl_host_surface *host_surface = output_buffer->surface;
+
+  wl_list_remove(&output_buffer->link);
+  wl_list_insert(&host_surface->released_buffers, &output_buffer->link);
+
+  // Remove unused buffers.
+  wl_list_for_each_safe(item, next, &host_surface->released_buffers, link) {
+    if (item != output_buffer && item != host_surface->current_buffer)
+      xwl_output_buffer_destroy(item);
+  }
+}
+
+static const struct wl_buffer_listener xwl_output_buffer_listener = {
+    xwl_output_buffer_release};
 
 static void xwl_internal_xdg_shell_ping(void *data,
                                         struct zxdg_shell_v6 *xdg_shell,
@@ -1118,6 +1149,64 @@ static void xwl_window_update(struct xwl_window *window) {
     window->realized = 1;
 }
 
+static int xwl_supported_shm_format(uint32_t format) {
+  switch (format) {
+  case WL_SHM_FORMAT_RGB565:
+  case WL_SHM_FORMAT_ARGB8888:
+  case WL_SHM_FORMAT_XRGB8888:
+    return 1;
+  }
+  return 0;
+}
+
+static size_t xwl_bpp_for_shm_format(uint32_t format) {
+  switch (format) {
+  case WL_SHM_FORMAT_RGB565:
+    return 2;
+  case WL_SHM_FORMAT_ARGB8888:
+  case WL_SHM_FORMAT_ABGR8888:
+  case WL_SHM_FORMAT_XRGB8888:
+  case WL_SHM_FORMAT_XBGR8888:
+    return 4;
+  }
+  assert(0);
+  return 0;
+}
+
+static uint32_t xwl_gbm_format_for_shm_format(uint32_t format) {
+  switch (format) {
+  case WL_SHM_FORMAT_RGB565:
+    return GBM_FORMAT_RGB565;
+  case WL_SHM_FORMAT_ARGB8888:
+    return GBM_FORMAT_ARGB8888;
+  case WL_SHM_FORMAT_ABGR8888:
+    return GBM_FORMAT_ABGR8888;
+  case WL_SHM_FORMAT_XRGB8888:
+    return GBM_FORMAT_XRGB8888;
+  case WL_SHM_FORMAT_XBGR8888:
+    return GBM_FORMAT_XBGR8888;
+  }
+  assert(0);
+  return 0;
+}
+
+static uint32_t xwl_drm_format_for_shm_format(int format) {
+  switch (format) {
+  case WL_SHM_FORMAT_RGB565:
+    return WL_DRM_FORMAT_RGB565;
+  case WL_SHM_FORMAT_ARGB8888:
+    return WL_DRM_FORMAT_ARGB8888;
+  case WL_SHM_FORMAT_ABGR8888:
+    return WL_DRM_FORMAT_ABGR8888;
+  case WL_SHM_FORMAT_XRGB8888:
+    return WL_DRM_FORMAT_XRGB8888;
+  case WL_SHM_FORMAT_XBGR8888:
+    return WL_DRM_FORMAT_XBGR8888;
+  }
+  assert(0);
+  return 0;
+}
+
 static void xwl_host_surface_destroy(struct wl_client *client,
                                      struct wl_resource *resource) {
   wl_resource_destroy(resource);
@@ -1134,26 +1223,121 @@ static void xwl_host_surface_attach(struct wl_client *client,
   struct xwl_window *window;
   double scale = host->xwl->scale;
 
-  if (host->client_mmap) {
-    xwl_mmap_unref(host->client_mmap);
-    host->client_mmap = NULL;
-  }
-  if (host->host_mmap) {
-    xwl_mmap_unref(host->host_mmap);
-    host->host_mmap = NULL;
+  host->current_buffer = NULL;
+  if (host->contents_shm_mmap) {
+    xwl_mmap_unref(host->contents_shm_mmap);
+    host->contents_shm_mmap = NULL;
   }
 
   if (host_buffer) {
     host->contents_width = host_buffer->width;
     host->contents_height = host_buffer->height;
     buffer_proxy = host_buffer->proxy;
-    if (host_buffer->client_mmap)
-      host->client_mmap = xwl_mmap_ref(host_buffer->client_mmap);
-    if (host_buffer->host_mmap)
-      host->host_mmap = xwl_mmap_ref(host_buffer->host_mmap);
+    if (host_buffer->shm_mmap)
+      host->contents_shm_mmap = xwl_mmap_ref(host_buffer->shm_mmap);
   }
 
-  wl_surface_attach(host->proxy, buffer_proxy, x / scale, y / scale);
+  if (host->contents_shm_mmap) {
+    while (!wl_list_empty(&host->released_buffers)) {
+      host->current_buffer = wl_container_of(host->released_buffers.next,
+                                             host->current_buffer, link);
+
+      if (host->current_buffer->width == host_buffer->width &&
+          host->current_buffer->height == host_buffer->height &&
+          host->current_buffer->format == host_buffer->shm_format) {
+        break;
+      }
+
+      xwl_output_buffer_destroy(host->current_buffer);
+      host->current_buffer = NULL;
+    }
+
+    // Allocate new output buffer.
+    if (!host->current_buffer) {
+      size_t width = host_buffer->width;
+      size_t height = host_buffer->height;
+      size_t size = host_buffer->shm_mmap->size;
+      uint32_t shm_format = host_buffer->shm_format;
+      size_t bpp = xwl_bpp_for_shm_format(shm_format);
+
+      host->current_buffer = malloc(sizeof(struct xwl_output_buffer));
+      assert(host->current_buffer);
+      wl_list_insert(&host->released_buffers, &host->current_buffer->link);
+      host->current_buffer->width = width;
+      host->current_buffer->height = height;
+      host->current_buffer->format = shm_format;
+      host->current_buffer->surface = host;
+      pixman_region32_init_rect(&host->current_buffer->damage, 0, 0,
+                                MAX_BUFFER_WIDTH, MAX_BUFFER_HEIGHT);
+
+      switch (host->xwl->shm_driver) {
+      case SHM_DRIVER_DMABUF: {
+        struct zwp_linux_buffer_params_v1 *buffer_params;
+        struct gbm_bo *bo;
+        int stride0;
+        int fd;
+
+        bo = gbm_bo_create(host->xwl->gbm, width, height,
+                           xwl_gbm_format_for_shm_format(shm_format),
+                           GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
+        stride0 = gbm_bo_get_stride(bo);
+        fd = gbm_bo_get_fd(bo);
+
+        buffer_params = zwp_linux_dmabuf_v1_create_params(
+            host->xwl->linux_dmabuf->internal);
+        zwp_linux_buffer_params_v1_add(buffer_params, fd, 0, 0, stride0, 0, 0);
+        host->current_buffer->internal =
+            zwp_linux_buffer_params_v1_create_immed(
+                buffer_params, width, height,
+                xwl_drm_format_for_shm_format(shm_format), 0);
+        zwp_linux_buffer_params_v1_destroy(buffer_params);
+
+        host->current_buffer->mmap =
+            xwl_mmap_create(fd, height * stride0, 0, stride0, bpp);
+        host->current_buffer->mmap->begin_access = xwl_dmabuf_begin_access;
+        host->current_buffer->mmap->end_access = xwl_dmabuf_end_access;
+
+        gbm_bo_destroy(bo);
+      } break;
+      case SHM_DRIVER_VIRTWL: {
+        struct virtwl_ioctl_new new_alloc = {
+            .type = VIRTWL_IOCTL_NEW_ALLOC, .fd = -1, .flags = 0, .size = size};
+        struct wl_shm_pool *pool;
+        int rv;
+
+        rv = ioctl(host->xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &new_alloc);
+        assert(rv == 0);
+
+        pool = wl_shm_create_pool(host->xwl->shm->internal, new_alloc.fd, size);
+        host->current_buffer->internal = wl_shm_pool_create_buffer(
+            pool, 0, width, height, host_buffer->shm_mmap->stride, shm_format);
+
+        host->current_buffer->mmap = xwl_mmap_create(
+            new_alloc.fd, size, 0, host_buffer->shm_mmap->stride, bpp);
+
+        wl_shm_pool_destroy(pool);
+      } break;
+      }
+
+      assert(host->current_buffer->internal);
+      assert(host->current_buffer->mmap);
+
+      wl_buffer_set_user_data(host->current_buffer->internal,
+                              host->current_buffer);
+      wl_buffer_add_listener(host->current_buffer->internal,
+                             &xwl_output_buffer_listener, host->current_buffer);
+    }
+  }
+
+  x /= scale;
+  y /= scale;
+
+  if (host->current_buffer) {
+    assert(host->current_buffer->internal);
+    wl_surface_attach(host->proxy, host->current_buffer->internal, x, y);
+  } else {
+    wl_surface_attach(host->proxy, buffer_proxy, x, y);
+  }
 
   wl_list_for_each(window, &host->xwl->windows, link) {
     if (window->host_surface_id == wl_resource_get_id(resource)) {
@@ -1170,34 +1354,24 @@ static void xwl_host_surface_damage(struct wl_client *client,
                                     int32_t y, int32_t width, int32_t height) {
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   double scale = host->xwl->scale;
-  struct xwl_damage_tracker *t;
+  struct xwl_output_buffer *buffer;
   int32_t x1, y1, x2, y2;
 
-  x1 = x;
-  y1 = y;
-  x2 = x + width;
-  y2 = y + height;
-
-  wl_list_for_each(t, &host->damage_trackers, link) {
-    if (t->x1 < t->x2 && t->y1 < t->y2) {
-      t->x1 = MIN(x1, t->x1);
-      t->y1 = MIN(y1, t->y1);
-      t->x2 = MAX(x2, t->x2);
-      t->y2 = MAX(y2, t->y2);
-    } else {
-      t->x1 = x1;
-      t->y1 = y1;
-      t->x2 = x2;
-      t->y2 = y2;
-    }
+  wl_list_for_each(buffer, &host->busy_buffers, link) {
+    pixman_region32_union_rect(&buffer->damage, &buffer->damage, x, y, width,
+                               height);
+  }
+  wl_list_for_each(buffer, &host->released_buffers, link) {
+    pixman_region32_union_rect(&buffer->damage, &buffer->damage, x, y, width,
+                               height);
   }
 
   // Enclosing rect after scaling and outset by one pixel to account for
   // potential filtering.
-  x1 = (x1 - 1) / scale;
-  y1 = (y1 - 1) / scale;
-  x2 = ceil((x2 + 1) / scale);
-  y2 = ceil((y2 + 1) / scale);
+  x1 = (x - 1) / scale;
+  y1 = (y - 1) / scale;
+  x2 = ceil((x + width + 1) / scale);
+  y2 = ceil((y + height + 1) / scale);
 
   wl_surface_damage(host->proxy, x1, y1, x2 - x1, y2 - y1);
 }
@@ -1269,79 +1443,58 @@ static void xwl_host_surface_commit(struct wl_client *client,
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   struct xwl_window *window;
 
-  if (host->host_mmap && host->client_mmap) {
-    uint8_t *dst = host->host_mmap->addr + host->host_mmap->offset;
-    uint8_t *src = host->client_mmap->addr + host->client_mmap->offset;
-    size_t dst_stride = host->host_mmap->stride;
-    size_t src_stride = host->client_mmap->stride;
-    size_t bpp = host->host_mmap->bpp;
-    int x1 = 0;
-    int y1 = 0;
-    int x2 = host->contents_width / host->contents_scale;
-    int y2 = host->contents_height / host->contents_scale;
-    int width, height, bytes;
+  if (host->contents_shm_mmap) {
+    uint8_t *src_base =
+        host->contents_shm_mmap->addr + host->contents_shm_mmap->offset;
+    uint8_t *dst_base =
+        host->current_buffer->mmap->addr + host->current_buffer->mmap->offset;
+    size_t src_stride = host->contents_shm_mmap->stride;
+    size_t dst_stride = host->current_buffer->mmap->stride;
+    size_t bpp = host->contents_shm_mmap->bpp;
+    pixman_box32_t *rect;
+    int n;
 
-    if (!wl_list_empty(&host->host_mmap->damage.link)) {
-      struct xwl_damage_tracker *t;
+    if (host->current_buffer->mmap->begin_access)
+      host->current_buffer->mmap->begin_access(host->current_buffer->mmap->fd);
 
-      int x = 0;
-      wl_list_for_each(t, &host->damage_trackers, link) {
-        x++;
-        if (t == &host->host_mmap->damage) {
-          if (t->x1 > x1)
-            x1 = MIN(t->x1, x2);
-          if (t->y1 > y1)
-            y1 = MIN(t->y1, y2);
-          if (t->x2 < x2)
-            x2 = MAX(t->x2, x1);
-          if (t->y2 < y2)
-            y2 = MAX(t->y2, y1);
-          break;
+    rect = pixman_region32_rectangles(&host->current_buffer->damage, &n);
+    while (n--) {
+      int32_t x1, y1, x2, y2;
+
+      x1 = rect->x1 * host->contents_scale;
+      y1 = rect->y1 * host->contents_scale;
+      x2 = rect->x2 * host->contents_scale;
+      y2 = rect->y2 * host->contents_scale;
+
+      x1 = MAX(0, x1);
+      y1 = MAX(0, y1);
+      x2 = MIN(host->contents_width, x2);
+      y2 = MIN(host->contents_height, y2);
+
+      if (x1 < x2 && y1 < y2) {
+        uint8_t *src = src_base + y1 * src_stride + x1 * bpp;
+        uint8_t *dst = dst_base + y1 * dst_stride + x1 * bpp;
+        int32_t width = x2 - x1;
+        int32_t height = y2 - y1;
+        size_t bytes = width * bpp;
+
+        while (height--) {
+          memcpy(dst, src, bytes);
+          dst += dst_stride;
+          src += src_stride;
         }
       }
+
+      ++rect;
     }
 
-    x1 *= host->contents_scale;
-    y1 *= host->contents_scale;
-    x2 *= host->contents_scale;
-    y2 *= host->contents_scale;
+    if (host->current_buffer->mmap->end_access)
+      host->current_buffer->mmap->end_access(host->current_buffer->mmap->fd);
 
-    assert(host->client_mmap->bpp == host->host_mmap->bpp);
+    pixman_region32_clear(&host->current_buffer->damage);
 
-    width = x2 - x1;
-    height = y2 - y1;
-    bytes = width * bpp;
-
-    dst += y1 * dst_stride + x1 * bpp;
-    src += y1 * src_stride + x1 * bpp;
-
-    if (host->host_mmap->begin_access)
-      host->host_mmap->begin_access(host->host_mmap->fd);
-
-    while (height--) {
-      memcpy(dst, src, bytes);
-      dst += dst_stride;
-      src += src_stride;
-    }
-
-    if (host->host_mmap->end_access)
-      host->host_mmap->end_access(host->host_mmap->fd);
-
-    // Empty damage.
-    host->host_mmap->damage.x1 = host->host_mmap->damage.x2;
-    host->host_mmap->damage.y1 = host->host_mmap->damage.y2;
-
-    wl_list_remove(&host->host_mmap->damage.link);
-    wl_list_init(&host->host_mmap->damage.link);
-
-    // Limit damage tracking to 4 buffers.
-    if (wl_list_length(&host->damage_trackers) >= 4) {
-      struct wl_list *first = host->damage_trackers.next;
-
-      wl_list_remove(first);
-      wl_list_init(first);
-    }
-    wl_list_insert(host->damage_trackers.prev, &host->host_mmap->damage.link);
+    wl_list_remove(&host->current_buffer->link);
+    wl_list_insert(&host->busy_buffers, &host->current_buffer->link);
   }
 
   if (host->contents_width && host->contents_height) {
@@ -1359,20 +1512,26 @@ static void xwl_host_surface_commit(struct wl_client *client,
   // No need to defer cursor or non-xwayland client commits.
   if (host->is_cursor || !host->xwl->xwayland) {
     wl_surface_commit(host->proxy);
-    return;
+  } else {
+    // Commit if surface is associated with a window. Otherwise, defer
+    // commit until window is created.
+    wl_list_for_each(window, &host->xwl->windows, link) {
+      if (window->host_surface_id == wl_resource_get_id(resource)) {
+        if (window->xdg_surface) {
+          wl_surface_commit(host->proxy);
+          if (host->contents_width && host->contents_height)
+            window->realized = 1;
+        }
+        break;
+      }
+    }
   }
 
-  // Commit if surface is associated with a window. Otherwise, defer
-  // commit until window is created.
-  wl_list_for_each(window, &host->xwl->windows, link) {
-    if (window->host_surface_id == wl_resource_get_id(resource)) {
-      if (window->xdg_surface) {
-        wl_surface_commit(host->proxy);
-        if (host->contents_width && host->contents_height)
-          window->realized = 1;
-      }
-      break;
-    }
+  if (host->contents_shm_mmap) {
+    if (host->contents_shm_mmap->buffer_resource)
+      wl_buffer_send_release(host->contents_shm_mmap->buffer_resource);
+    xwl_mmap_unref(host->contents_shm_mmap);
+    host->contents_shm_mmap = NULL;
   }
 }
 
@@ -1414,6 +1573,7 @@ static const struct wl_surface_interface xwl_surface_implementation = {
 static void xwl_destroy_host_surface(struct wl_resource *resource) {
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   struct xwl_window *window, *surface_window = NULL;
+  struct xwl_output_buffer *buffer;
 
   wl_list_for_each(window, &host->xwl->windows, link) {
     if (window->host_surface_id == wl_resource_get_id(resource)) {
@@ -1427,16 +1587,16 @@ static void xwl_destroy_host_surface(struct wl_resource *resource) {
     xwl_window_update(surface_window);
   }
 
-  if (host->client_mmap)
-    xwl_mmap_unref(host->client_mmap);
-  if (host->host_mmap)
-    xwl_mmap_unref(host->host_mmap);
+  if (host->contents_shm_mmap)
+    xwl_mmap_unref(host->contents_shm_mmap);
 
-  while (!wl_list_empty(&host->damage_trackers)) {
-    struct wl_list *first = host->damage_trackers.next;
-
-    wl_list_remove(first);
-    wl_list_init(first);
+  while (!wl_list_empty(&host->released_buffers)) {
+    buffer = wl_container_of(host->released_buffers.next, buffer, link);
+    xwl_output_buffer_destroy(buffer);
+  }
+  while (!wl_list_empty(&host->busy_buffers)) {
+    buffer = wl_container_of(host->busy_buffers.next, buffer, link);
+    xwl_output_buffer_destroy(buffer);
   }
 
   if (host->viewport)
@@ -1506,11 +1666,12 @@ static void xwl_compositor_create_host_surface(struct wl_client *client,
   host_surface->contents_width = 0;
   host_surface->contents_height = 0;
   host_surface->contents_scale = 1;
+  host_surface->contents_shm_mmap = NULL;
   host_surface->is_cursor = 0;
   host_surface->last_event_serial = 0;
-  host_surface->client_mmap = NULL;
-  host_surface->host_mmap = NULL;
-  wl_list_init(&host_surface->damage_trackers);
+  host_surface->current_buffer = NULL;
+  wl_list_init(&host_surface->released_buffers);
+  wl_list_init(&host_surface->busy_buffers);
   host_surface->resource = wl_resource_create(
       client, &wl_surface_interface, wl_resource_get_version(resource), id);
   wl_resource_set_implementation(host_surface->resource,
@@ -1603,71 +1764,14 @@ static const struct wl_buffer_listener xwl_buffer_listener = {
 static void xwl_destroy_host_buffer(struct wl_resource *resource) {
   struct xwl_host_buffer *host = wl_resource_get_user_data(resource);
 
-  wl_buffer_destroy(host->proxy);
-  if (host->client_mmap)
-    xwl_mmap_unref(host->client_mmap);
-  if (host->host_mmap)
-    xwl_mmap_unref(host->host_mmap);
+  if (host->proxy)
+    wl_buffer_destroy(host->proxy);
+  if (host->shm_mmap) {
+    host->shm_mmap->buffer_resource = NULL;
+    xwl_mmap_unref(host->shm_mmap);
+  }
   wl_resource_set_user_data(resource, NULL);
   free(host);
-}
-
-static int xwl_supported_shm_format(uint32_t format) {
-  switch (format) {
-  case WL_SHM_FORMAT_RGB565:
-  case WL_SHM_FORMAT_ARGB8888:
-  case WL_SHM_FORMAT_XRGB8888:
-    return 1;
-  }
-  return 0;
-}
-
-static size_t xwl_bpp_for_shm_format(uint32_t format) {
-  switch (format) {
-  case WL_SHM_FORMAT_RGB565:
-    return 2;
-  case WL_SHM_FORMAT_ARGB8888:
-  case WL_SHM_FORMAT_ABGR8888:
-  case WL_SHM_FORMAT_XRGB8888:
-  case WL_SHM_FORMAT_XBGR8888:
-    return 4;
-  }
-  assert(0);
-  return 0;
-}
-
-static uint32_t xwl_gbm_format_for_shm_format(uint32_t format) {
-  switch (format) {
-  case WL_SHM_FORMAT_RGB565:
-    return GBM_FORMAT_RGB565;
-  case WL_SHM_FORMAT_ARGB8888:
-    return GBM_FORMAT_ARGB8888;
-  case WL_SHM_FORMAT_ABGR8888:
-    return GBM_FORMAT_ABGR8888;
-  case WL_SHM_FORMAT_XRGB8888:
-    return GBM_FORMAT_XRGB8888;
-  case WL_SHM_FORMAT_XBGR8888:
-    return GBM_FORMAT_XBGR8888;
-  }
-  assert(0);
-  return 0;
-}
-
-static uint32_t xwl_drm_format_for_shm_format(int format) {
-  switch (format) {
-  case WL_SHM_FORMAT_RGB565:
-    return WL_DRM_FORMAT_RGB565;
-  case WL_SHM_FORMAT_ARGB8888:
-    return WL_DRM_FORMAT_ARGB8888;
-  case WL_SHM_FORMAT_ABGR8888:
-    return WL_DRM_FORMAT_ABGR8888;
-  case WL_SHM_FORMAT_XRGB8888:
-    return WL_DRM_FORMAT_XRGB8888;
-  case WL_SHM_FORMAT_XBGR8888:
-    return WL_DRM_FORMAT_XBGR8888;
-  }
-  assert(0);
-  return 0;
 }
 
 static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
@@ -1678,85 +1782,35 @@ static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
                                                  uint32_t format) {
   struct xwl_host_shm_pool *host = wl_resource_get_user_data(resource);
   struct xwl_host_buffer *host_buffer;
-  size_t size = height * stride;
-  size_t bpp = xwl_bpp_for_shm_format(format);
 
   host_buffer = malloc(sizeof(*host_buffer));
   assert(host_buffer);
 
   host_buffer->width = width;
   host_buffer->height = height;
-  host_buffer->stride = stride;
-  host_buffer->size = size;
-  host_buffer->offset = offset;
-  host_buffer->client_mmap = NULL;
-  host_buffer->host_mmap = NULL;
   host_buffer->resource =
       wl_resource_create(client, &wl_buffer_interface, 1, id);
   wl_resource_set_implementation(host_buffer->resource,
                                  &xwl_buffer_implementation, host_buffer,
                                  xwl_destroy_host_buffer);
 
-  switch (host->shm->xwl->shm_driver) {
-  case SHM_DRIVER_NOOP:
+  if (host->shm->xwl->shm_driver == SHM_DRIVER_NOOP) {
     assert(host->proxy);
+    host_buffer->shm_mmap = NULL;
+    host_buffer->shm_format = 0;
     host_buffer->proxy = wl_shm_pool_create_buffer(host->proxy, offset, width,
                                                    height, stride, format);
-    break;
-  case SHM_DRIVER_DMABUF: {
-    struct zwp_linux_buffer_params_v1 *buffer_params;
-    struct gbm_bo *bo;
-    int stride0;
-    int fd;
-
-    host_buffer->client_mmap =
-        xwl_mmap_create(host->fd, size, offset, stride, bpp);
-
-    bo = gbm_bo_create(host->shm->xwl->gbm, width, height,
-                       xwl_gbm_format_for_shm_format(format),
-                       GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
-    stride0 = gbm_bo_get_stride(bo);
-    fd = gbm_bo_get_fd(bo);
-
-    buffer_params = zwp_linux_dmabuf_v1_create_params(
-        host->shm->xwl->linux_dmabuf->internal);
-    zwp_linux_buffer_params_v1_add(buffer_params, fd, 0, 0, stride0, 0, 0);
-    host_buffer->proxy = zwp_linux_buffer_params_v1_create_immed(
-        buffer_params, width, height, xwl_drm_format_for_shm_format(format), 0);
-    zwp_linux_buffer_params_v1_destroy(buffer_params);
-
-    host_buffer->host_mmap =
-        xwl_mmap_create(fd, height * stride0, 0, stride0, bpp);
-    host_buffer->host_mmap->begin_access = xwl_dmabuf_begin_access;
-    host_buffer->host_mmap->end_access = xwl_dmabuf_end_access;
-
-    gbm_bo_destroy(bo);
-  } break;
-  case SHM_DRIVER_VIRTWL: {
-    struct virtwl_ioctl_new new_alloc = {
-        .type = VIRTWL_IOCTL_NEW_ALLOC, .fd = -1, .flags = 0, .size = size};
-    struct wl_shm_pool *pool;
-    int rv;
-
-    host_buffer->client_mmap =
-        xwl_mmap_create(host->fd, size, offset, stride, bpp);
-
-    rv = ioctl(host->shm->xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &new_alloc);
-    assert(rv == 0);
-
-    pool = wl_shm_create_pool(host->shm->internal, new_alloc.fd, size);
-    host_buffer->proxy =
-        wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
-
-    host_buffer->host_mmap =
-        xwl_mmap_create(new_alloc.fd, size, 0, stride, bpp);
-
-    wl_shm_pool_destroy(pool);
-  } break;
+    wl_buffer_set_user_data(host_buffer->proxy, host_buffer);
+    wl_buffer_add_listener(host_buffer->proxy, &xwl_buffer_listener,
+                           host_buffer);
+  } else {
+    host_buffer->proxy = NULL;
+    host_buffer->shm_format = format;
+    host_buffer->shm_mmap =
+        xwl_mmap_create(host->fd, height * stride, offset, stride,
+                        xwl_bpp_for_shm_format(format));
+    host_buffer->shm_mmap->buffer_resource = host_buffer->resource;
   }
-
-  wl_buffer_set_user_data(host_buffer->proxy, host_buffer);
-  wl_buffer_add_listener(host_buffer->proxy, &xwl_buffer_listener, host_buffer);
 }
 
 static void xwl_host_shm_pool_destroy(struct wl_client *client,
@@ -2727,11 +2781,8 @@ static void xwl_drm_create_prime_buffer(
 
   host_buffer->width = width;
   host_buffer->height = height;
-  host_buffer->stride = stride0;
-  host_buffer->size = stride0 * height;
-  host_buffer->offset = offset0;
-  host_buffer->client_mmap = NULL;
-  host_buffer->host_mmap = NULL;
+  host_buffer->shm_mmap = NULL;
+  host_buffer->shm_format = 0;
   host_buffer->resource =
       wl_resource_create(client, &wl_buffer_interface, 1, id);
   wl_resource_set_implementation(host_buffer->resource,

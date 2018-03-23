@@ -11,6 +11,7 @@ RUN apt-get update && \
                        libwayland-bin \
                        libxcb-composite0-dev \
                        libgbm-dev \
+                       libpixman-1-dev \
                        pkg-config
 
 VOLUME /src
