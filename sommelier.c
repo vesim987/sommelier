@@ -41,6 +41,7 @@
 
 #include "aura-shell-client-protocol.h"
 #include "drm-server-protocol.h"
+#include "keyboard-extension-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "version.h"
 #include "viewporter-client-protocol.h"
@@ -224,6 +225,7 @@ struct xwl_host_keyboard {
   struct xwl_seat *seat;
   struct wl_resource *resource;
   struct wl_keyboard *proxy;
+  struct zcr_extended_keyboard_v1 *extended_keyboard_proxy;
   struct wl_resource *focus_resource;
   struct wl_listener focus_resource_listener;
   uint32_t focus_serial;
@@ -366,6 +368,12 @@ struct xwl_host_drm {
   struct wl_resource *resource;
 };
 
+struct xwl_keyboard_extension {
+  struct xwl *xwl;
+  uint32_t id;
+  struct zcr_keyboard_extension_v1 *internal;
+};
+
 struct xwl_config {
   uint32_t serial;
   uint32_t mask;
@@ -444,6 +452,7 @@ struct xwl {
   struct xwl_aura_shell *aura_shell;
   struct xwl_viewporter *viewporter;
   struct xwl_linux_dmabuf *linux_dmabuf;
+  struct xwl_keyboard_extension *keyboard_extension;
   struct wl_list outputs;
   struct wl_list seats;
   struct wl_event_source *display_event_source;
@@ -2425,6 +2434,9 @@ static void xwl_keyboard_key(void *data, struct wl_keyboard *keyboard,
   if (host->focus_resource)
     xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
+
+  if (host->extended_keyboard_proxy)
+    zcr_extended_keyboard_v1_ack_key(host->extended_keyboard_proxy, serial, 1);
 }
 
 static void xwl_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
@@ -2585,6 +2597,9 @@ static void xwl_host_seat_get_host_pointer(struct wl_client *client,
 static void xwl_destroy_host_keyboard(struct wl_resource *resource) {
   struct xwl_host_keyboard *host = wl_resource_get_user_data(resource);
 
+  if (host->extended_keyboard_proxy)
+    zcr_extended_keyboard_v1_destroy(host->extended_keyboard_proxy);
+
   if (wl_keyboard_get_version(host->proxy) >=
       WL_KEYBOARD_RELEASE_SINCE_VERSION) {
     wl_keyboard_release(host->proxy);
@@ -2628,6 +2643,15 @@ static void xwl_host_seat_get_host_keyboard(struct wl_client *client,
       xwl_keyboard_focus_resource_destroyed;
   host_keyboard->focus_resource = NULL;
   host_keyboard->focus_serial = 0;
+
+  if (host->seat->xwl->keyboard_extension) {
+    host_keyboard->extended_keyboard_proxy =
+        zcr_keyboard_extension_v1_get_extended_keyboard(
+            host->seat->xwl->keyboard_extension->internal,
+            host_keyboard->proxy);
+  } else {
+    host_keyboard->extended_keyboard_proxy = NULL;
+  }
 }
 
 static void xwl_destroy_host_touch(struct wl_resource *resource) {
@@ -3959,6 +3983,16 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
       linux_dmabuf->host_drm_global = xwl_global_create(
           xwl, &wl_drm_interface, 2, linux_dmabuf, xwl_bind_host_drm);
     }
+  } else if (strcmp(interface, "zcr_keyboard_extension_v1") == 0) {
+    struct xwl_keyboard_extension *keyboard_extension =
+        malloc(sizeof(struct xwl_keyboard_extension));
+    assert(keyboard_extension);
+    keyboard_extension->xwl = xwl;
+    keyboard_extension->id = id;
+    keyboard_extension->internal =
+        wl_registry_bind(registry, id, &zcr_keyboard_extension_v1_interface, 1);
+    assert(!xwl->keyboard_extension);
+    xwl->keyboard_extension = keyboard_extension;
   }
 }
 
@@ -4030,6 +4064,12 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
     zwp_linux_dmabuf_v1_destroy(xwl->linux_dmabuf->internal);
     free(xwl->linux_dmabuf);
     xwl->linux_dmabuf = NULL;
+    return;
+  }
+  if (xwl->keyboard_extension && xwl->keyboard_extension->id == id) {
+    zcr_keyboard_extension_v1_destroy(xwl->keyboard_extension->internal);
+    free(xwl->keyboard_extension);
+    xwl->keyboard_extension = NULL;
     return;
   }
   wl_list_for_each(output, &xwl->outputs, link) {
@@ -5731,6 +5771,7 @@ int main(int argc, char **argv) {
       .aura_shell = NULL,
       .viewporter = NULL,
       .linux_dmabuf = NULL,
+      .keyboard_extension = NULL,
       .display_event_source = NULL,
       .display_ready_event_source = NULL,
       .sigchld_event_source = NULL,
