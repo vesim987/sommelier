@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <gbm.h>
 #include <libgen.h>
+#include <limits.h>
 #include <math.h>
 #include <pixman.h>
 #include <stdio.h>
@@ -569,12 +570,12 @@ enum {
 #define MIN_SCALE 0.1
 #define MAX_SCALE 10.0
 
+#define MIN_SIZE (INT_MIN / 10)
+#define MAX_SIZE (INT_MAX / 10)
+
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
-
-#define MAX_BUFFER_WIDTH 32768
-#define MAX_BUFFER_HEIGHT 32768
 
 #ifndef UNIX_PATH_MAX
 #define UNIX_PATH_MAX 108
@@ -1267,8 +1268,8 @@ static void xwl_host_surface_attach(struct wl_client *client,
       host->current_buffer->height = height;
       host->current_buffer->format = shm_format;
       host->current_buffer->surface = host;
-      pixman_region32_init_rect(&host->current_buffer->damage, 0, 0,
-                                MAX_BUFFER_WIDTH, MAX_BUFFER_HEIGHT);
+      pixman_region32_init_rect(&host->current_buffer->damage, 0, 0, MAX_SIZE,
+                                MAX_SIZE);
 
       switch (host->xwl->shm_driver) {
       case SHM_DRIVER_DMABUF: {
@@ -1355,7 +1356,7 @@ static void xwl_host_surface_damage(struct wl_client *client,
   struct xwl_host_surface *host = wl_resource_get_user_data(resource);
   double scale = host->xwl->scale;
   struct xwl_output_buffer *buffer;
-  int32_t x1, y1, x2, y2;
+  int64_t x1, y1, x2, y2;
 
   wl_list_for_each(buffer, &host->busy_buffers, link) {
     pixman_region32_union_rect(&buffer->damage, &buffer->damage, x, y, width,
@@ -1366,12 +1367,17 @@ static void xwl_host_surface_damage(struct wl_client *client,
                                height);
   }
 
+  x1 = x;
+  y1 = y;
+  x2 = x1 + width;
+  y2 = y1 + height;
+
   // Enclosing rect after scaling and outset by one pixel to account for
   // potential filtering.
-  x1 = (x - 1) / scale;
-  y1 = (y - 1) / scale;
-  x2 = ceil((x + width + 1) / scale);
-  y2 = ceil((y + height + 1) / scale);
+  x1 = MAX(MIN_SIZE, x1 - 1) / scale;
+  y1 = MAX(MIN_SIZE, y1 - 1) / scale;
+  x2 = ceil(MIN(x2 + 1, MAX_SIZE) / scale);
+  y2 = ceil(MIN(y2 + 1, MAX_SIZE) / scale);
 
   wl_surface_damage(host->proxy, x1, y1, x2 - x1, y2 - y1);
 }
