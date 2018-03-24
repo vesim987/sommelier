@@ -671,7 +671,7 @@ static struct xwl_mmap *xwl_mmap_ref(struct xwl_mmap *map) {
 
 static void xwl_mmap_unref(struct xwl_mmap *map) {
   if (map->refcount-- == 1) {
-    munmap(map->addr, map->size);
+    munmap(map->addr, map->size + map->offset);
     close(map->fd);
     free(map);
   }
@@ -1843,7 +1843,7 @@ static void xwl_host_shm_pool_create_host_buffer(struct wl_client *client,
     host_buffer->proxy = NULL;
     host_buffer->shm_format = format;
     host_buffer->shm_mmap =
-        xwl_mmap_create(host->fd, height * stride, offset, stride,
+        xwl_mmap_create(dup(host->fd), height * stride, offset, stride,
                         xwl_bpp_for_shm_format(format));
     host_buffer->shm_mmap->buffer_resource = host_buffer->resource;
   }
