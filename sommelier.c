@@ -38,6 +38,7 @@
 #include <xcb/composite.h>
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include "aura-shell-client-protocol.h"
 #include "drm-server-protocol.h"
@@ -229,6 +230,12 @@ struct xwl_host_keyboard {
   struct wl_resource *focus_resource;
   struct wl_listener focus_resource_listener;
   uint32_t focus_serial;
+  struct xkb_keymap *keymap;
+  struct xkb_state *state;
+  xkb_mod_mask_t control_mask;
+  xkb_mod_mask_t alt_mask;
+  xkb_mod_mask_t shift_mask;
+  uint32_t modifiers;
 };
 
 struct xwl_host_touch {
@@ -438,6 +445,12 @@ enum {
   ATOM_LAST = ATOM_WL_SELECTION,
 };
 
+struct xwl_accelerator {
+  struct wl_list link;
+  uint32_t modifiers;
+  xkb_keysym_t symbol;
+};
+
 struct xwl {
   char **runprog;
   struct wl_display *display;
@@ -471,6 +484,8 @@ struct xwl {
   pid_t xwayland_pid;
   pid_t child_pid;
   pid_t peer_pid;
+  struct xkb_context *xkb_context;
+  struct wl_list accelerators;
   struct wl_list registries;
   struct wl_list globals;
   int next_global_id;
@@ -592,6 +607,10 @@ enum {
 
 #define LOCK_SUFFIX ".lock"
 #define LOCK_SUFFIXLEN 5
+
+#define CONTROL_MASK (1 << 0)
+#define ALT_MASK (1 << 1)
+#define SHIFT_MASK (1 << 2)
 
 struct dma_buf_sync {
   __u64 flags;
@@ -2372,6 +2391,30 @@ static void xwl_keyboard_keymap(void *data, struct wl_keyboard *keyboard,
 
   wl_keyboard_send_keymap(host->resource, format, fd, size);
 
+  if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+    void *data = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+
+    assert(data != MAP_FAILED);
+
+    if (host->keymap)
+      xkb_keymap_unref(host->keymap);
+
+    host->keymap = xkb_keymap_new_from_string(
+        host->seat->xwl->xkb_context, data, XKB_KEYMAP_FORMAT_TEXT_V1, 0);
+    assert(host->keymap);
+
+    munmap(data, size);
+
+    if (host->state)
+      xkb_state_unref(host->state);
+    host->state = xkb_state_new(host->keymap);
+    assert(host->state);
+
+    host->control_mask = 1 << xkb_keymap_mod_get_index(host->keymap, "Control");
+    host->alt_mask = 1 << xkb_keymap_mod_get_index(host->keymap, "Mod1");
+    host->shift_mask = 1 << xkb_keymap_mod_get_index(host->keymap, "Shift");
+  }
+
   close(fd);
 }
 
@@ -2429,6 +2472,30 @@ static void xwl_keyboard_key(void *data, struct wl_keyboard *keyboard,
                              uint32_t state) {
   struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
 
+  if (host->state) {
+    const xkb_keysym_t *symbols;
+    uint32_t num_symbols;
+    xkb_keysym_t symbol = XKB_KEY_NoSymbol;
+    uint32_t code = key + 8;
+    struct xwl_accelerator *accelerator;
+
+    num_symbols = xkb_state_key_get_syms(host->state, code, &symbols);
+    if (num_symbols == 1)
+      symbol = symbols[0];
+
+    wl_list_for_each(accelerator, &host->seat->xwl->accelerators, link) {
+      if (host->modifiers != accelerator->modifiers)
+        continue;
+      if (symbol != accelerator->symbol)
+        continue;
+
+      assert(host->extended_keyboard_proxy);
+      zcr_extended_keyboard_v1_ack_key(host->extended_keyboard_proxy, serial,
+                                       0);
+      return;
+    }
+  }
+
   wl_keyboard_send_key(host->resource, serial, time, key, state);
 
   if (host->focus_resource)
@@ -2444,6 +2511,7 @@ static void xwl_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
                                    uint32_t mods_latched, uint32_t mods_locked,
                                    uint32_t group) {
   struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
+  xkb_mod_mask_t mask;
 
   wl_keyboard_send_modifiers(host->resource, serial, mods_depressed,
                              mods_latched, mods_locked, group);
@@ -2451,6 +2519,21 @@ static void xwl_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
   if (host->focus_resource)
     xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
+
+  if (!host->keymap)
+    return;
+
+  xkb_state_update_mask(host->state, mods_depressed, mods_latched, mods_locked,
+                        0, 0, group);
+  mask = xkb_state_serialize_mods(host->state, XKB_STATE_MODS_DEPRESSED |
+                                                   XKB_STATE_MODS_LATCHED);
+  host->modifiers = 0;
+  if (mask & host->control_mask)
+    host->modifiers |= CONTROL_MASK;
+  if (mask & host->alt_mask)
+    host->modifiers |= ALT_MASK;
+  if (mask & host->shift_mask)
+    host->modifiers |= SHIFT_MASK;
 }
 
 static void xwl_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
@@ -2600,6 +2683,11 @@ static void xwl_destroy_host_keyboard(struct wl_resource *resource) {
   if (host->extended_keyboard_proxy)
     zcr_extended_keyboard_v1_destroy(host->extended_keyboard_proxy);
 
+  if (host->keymap)
+    xkb_keymap_unref(host->keymap);
+  if (host->state)
+    xkb_state_unref(host->state);
+
   if (wl_keyboard_get_version(host->proxy) >=
       WL_KEYBOARD_RELEASE_SINCE_VERSION) {
     wl_keyboard_release(host->proxy);
@@ -2643,6 +2731,12 @@ static void xwl_host_seat_get_host_keyboard(struct wl_client *client,
       xwl_keyboard_focus_resource_destroyed;
   host_keyboard->focus_resource = NULL;
   host_keyboard->focus_serial = 0;
+  host_keyboard->keymap = NULL;
+  host_keyboard->state = NULL;
+  host_keyboard->control_mask = 0;
+  host_keyboard->alt_mask = 0;
+  host_keyboard->shift_mask = 0;
+  host_keyboard->modifiers = 0;
 
   if (host->seat->xwl->keyboard_extension) {
     host_keyboard->extended_keyboard_proxy =
@@ -5745,6 +5839,7 @@ static void xwl_print_usage(int retval) {
          "  --display=DISPLAY\t\tWayland display to connect to\n"
          "  --shm-driver=DRIVER\t\tSHM driver to use (noop, dmabuf, virtwl)\n"
          "  --scale=SCALE\t\t\tScale factor for contents\n"
+         "  --accelerators=ACCELERATORS\tList of keyboard accelerators\n"
          "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
          "  --x-display=DISPLAY\t\tX11 display to listen on\n"
          "  --no-exit-with-child\t\tKeep process alive after child exists\n"
@@ -5788,6 +5883,7 @@ int main(int argc, char **argv) {
       .xwayland_pid = -1,
       .child_pid = -1,
       .peer_pid = -1,
+      .xkb_context = NULL,
       .next_global_id = 1,
       .connection = NULL,
       .connection_event_source = NULL,
@@ -5858,6 +5954,7 @@ int main(int argc, char **argv) {
   const char *drm_device = getenv("SOMMELIER_DRM_DEVICE");
   const char *glamor = getenv("SOMMELIER_GLAMOR");
   const char *shm_driver = getenv("SOMMELIER_SHM_DRIVER");
+  const char *accelerators = getenv("SOMMELIER_ACCELERATORS");
   const char *socket_name = "wayland-0";
   const char *runtime_dir;
   struct wl_event_loop *event_loop;
@@ -5908,6 +6005,10 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       scale = s;
+    } else if (strstr(arg, "--accelerators") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      accelerators = s;
     } else if (strstr(arg, "--app-id") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -6048,6 +6149,7 @@ int main(int argc, char **argv) {
           char *arg = argv[j];
           if (strstr(arg, "--display") == arg ||
               strstr(arg, "--scale") == arg ||
+              strstr(arg, "--accelerators") == arg ||
               strstr(arg, "--virtwl-device") == arg ||
               strstr(arg, "--drm-device") == arg ||
               strstr(arg, "--shm-driver") == arg) {
@@ -6189,6 +6291,9 @@ int main(int argc, char **argv) {
     client_fd = sv[0];
   }
 
+  xwl.xkb_context = xkb_context_new(0);
+  assert(xwl.xkb_context);
+
   if (virtwl_display_fd != -1) {
     xwl.display = wl_display_connect_to_fd(virtwl_display_fd);
   } else {
@@ -6205,12 +6310,60 @@ int main(int argc, char **argv) {
     exit(1);
   }
 
+  wl_list_init(&xwl.accelerators);
   wl_list_init(&xwl.registries);
   wl_list_init(&xwl.globals);
   wl_list_init(&xwl.outputs);
   wl_list_init(&xwl.seats);
   wl_list_init(&xwl.windows);
   wl_list_init(&xwl.unpaired_windows);
+
+  // Parse the list of accelerators that should be reserved by the
+  // compositor. Format is "|MODIFIERS|KEYSYM", where MODIFIERS is a
+  // list of modifier names (E.g. <Control><Alt>) and KEYSYM is an
+  // XKB key symbol name (E.g Delete).
+  if (accelerators) {
+    uint32_t modifiers = 0;
+
+    while (*accelerators) {
+      if (*accelerators == ',') {
+        accelerators++;
+      } else if (*accelerators == '<') {
+        if (strncmp(accelerators, "<Control>", 9) == 0) {
+          modifiers |= CONTROL_MASK;
+          accelerators += 9;
+        } else if (strncmp(accelerators, "<Alt>", 5) == 0) {
+          modifiers |= ALT_MASK;
+          accelerators += 5;
+        } else if (strncmp(accelerators, "<Shift>", 7) == 0) {
+          modifiers |= SHIFT_MASK;
+          accelerators += 7;
+        } else {
+          fprintf(stderr, "error: invalid modifier\n");
+          exit(1);
+        }
+      } else {
+        struct xwl_accelerator *accelerator;
+        const char *end = strchrnul(accelerators, ',');
+        char *name = strndup(accelerators, end - accelerators);
+
+        accelerator = malloc(sizeof(*accelerator));
+        accelerator->modifiers = modifiers;
+        accelerator->symbol =
+            xkb_keysym_from_name(name, XKB_KEYSYM_CASE_INSENSITIVE);
+        if (accelerator->symbol == XKB_KEY_NoSymbol) {
+          fprintf(stderr, "error: invalid key symbol\n");
+          exit(1);
+        }
+
+        wl_list_insert(&xwl.accelerators, &accelerator->link);
+
+        modifiers = 0;
+        accelerators = end;
+        free(name);
+      }
+    }
+  }
 
   xwl.display_event_source =
       wl_event_loop_add_fd(event_loop, wl_display_get_fd(xwl.display),

@@ -12,6 +12,7 @@ RUN apt-get update && \
                        libxcb-composite0-dev \
                        libgbm-dev \
                        libpixman-1-dev \
+                       libxkbcommon-dev \
                        pkg-config
 
 VOLUME /src
