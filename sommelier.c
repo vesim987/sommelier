@@ -1182,7 +1182,9 @@ static int xwl_supported_shm_format(uint32_t format) {
   switch (format) {
   case WL_SHM_FORMAT_RGB565:
   case WL_SHM_FORMAT_ARGB8888:
+  case WL_SHM_FORMAT_ABGR8888:
   case WL_SHM_FORMAT_XRGB8888:
+  case WL_SHM_FORMAT_XBGR8888:
     return 1;
   }
   return 0;
