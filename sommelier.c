@@ -187,13 +187,21 @@ struct xwl_host_output {
   struct wl_resource *resource;
   struct wl_output *proxy;
   struct zaura_output *aura_output;
+  int x;
+  int y;
+  int physical_width;
+  int physical_height;
+  int subpixel;
+  char *make;
+  char *model;
+  int transform;
   uint32_t flags;
   int width;
   int height;
   int refresh;
-  int factor;
-  double scale;
-  double max_scale;
+  int scale_factor;
+  int current_scale;
+  int max_scale;
 };
 
 struct xwl_output {
@@ -1988,8 +1996,16 @@ static void xwl_output_geometry(void *data, struct wl_output *output, int x,
                                 const char *model, int transform) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
 
-  wl_output_send_geometry(host->resource, x, y, physical_width, physical_height,
-                          subpixel, make, model, transform);
+  host->x = x;
+  host->y = y;
+  host->physical_width = physical_width;
+  host->physical_height = physical_height;
+  host->subpixel = subpixel;
+  free(host->model);
+  host->model = strdup(model);
+  free(host->make);
+  host->make = strdup(make);
+  host->transform = transform;
 }
 
 static void xwl_output_mode(void *data, struct wl_output *output,
@@ -1997,7 +2013,6 @@ static void xwl_output_mode(void *data, struct wl_output *output,
                             int refresh) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
 
-  // Wait until scale is known before sending mode.
   host->flags = flags;
   host->width = width;
   host->height = height;
@@ -2006,44 +2021,49 @@ static void xwl_output_mode(void *data, struct wl_output *output,
 
 static void xwl_output_done(void *data, struct wl_output *output) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
-  double scale = host->output->xwl->scale;
-  int factor, width, height;
+  int scale_factor;
+  double scale;
 
-  // Early out if max scale is expected but not yet know.
-  if (host->max_scale == 0.0)
+  // Early out if current scale is expected but not yet know.
+  if (!host->current_scale)
     return;
 
-  // Always use 1 for scale factor and adjust mode based on max scale for
-  // Xwayland client. Otherwise, pick an optimal scale factor and adjust mode
-  // for it.
+  // Always use 1 for scale factor and adjust geometry and mode based on max
+  // scale factor for Xwayland client. Otherwise, pick an optimal scale factor
+  // and adjust geometry and mode for it.
   if (host->output->xwl->xwayland) {
-    factor = 1;
-    width = (host->width * scale * host->scale) / host->max_scale;
-    height = (host->height * scale * host->scale) / host->max_scale;
+    double current_scale = host->current_scale / 1000.0;
+    int max_scale_factor = host->max_scale / 1000.0;
+
+    scale_factor = 1;
+    scale = (host->output->xwl->scale * current_scale) / max_scale_factor;
   } else {
-    factor = ceil(host->factor / scale);
-    width = (host->width * scale * factor) / host->factor;
-    height = (host->height * scale * factor) / host->factor;
+    scale_factor = ceil(host->scale_factor / host->output->xwl->scale);
+    scale = (host->output->xwl->scale * scale_factor) / host->scale_factor;
   }
 
+  wl_output_send_geometry(host->resource, host->x, host->y,
+                          host->physical_width * scale,
+                          host->physical_height * scale, host->subpixel,
+                          host->make, host->model, host->transform);
   wl_output_send_mode(host->resource, host->flags | WL_OUTPUT_MODE_CURRENT,
-                      width, height, host->refresh);
-  wl_output_send_scale(host->resource, factor);
+                      host->width * scale, host->height * scale, host->refresh);
+  wl_output_send_scale(host->resource, scale_factor);
   wl_output_send_done(host->resource);
 
-  // Reset max scale.
-  host->max_scale = 1.0;
+  // Reset current scale.
+  host->current_scale = 1000;
 
-  // Expect max scale if aura output exists.
+  // Expect current scale if aura output exists.
   if (host->aura_output)
-    host->max_scale = 0.0;
+    host->current_scale = 0;
 }
 
 static void xwl_output_scale(void *data, struct wl_output *output,
-                             int32_t factor) {
+                             int32_t scale_factor) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
 
-  host->factor = factor;
+  host->scale_factor = scale_factor;
 }
 
 static const struct wl_output_listener xwl_output_listener = {
@@ -2072,10 +2092,10 @@ static void xwl_aura_output_scale(void *data, struct zaura_output *output,
     break;
   }
 
-  host->max_scale = MAX(host->max_scale, scale / 1000.0);
-
   if (flags & ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT)
-    host->scale = scale / 1000.0;
+    host->current_scale = scale;
+
+  host->max_scale = MAX(host->max_scale, scale);
 }
 
 static const struct zaura_output_listener xwl_aura_output_listener = {
@@ -2092,6 +2112,8 @@ static void xwl_destroy_host_output(struct wl_resource *resource) {
     wl_output_destroy(host->proxy);
   }
   wl_resource_set_user_data(resource, NULL);
+  free(host->make);
+  free(host->model);
   free(host);
 }
 
@@ -2114,16 +2136,24 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
   wl_output_set_user_data(host->proxy, host);
   wl_output_add_listener(host->proxy, &xwl_output_listener, host);
   host->aura_output = NULL;
+  host->x = 0;
+  host->y = 0;
+  host->physical_width = 0;
+  host->physical_height = 0;
+  host->subpixel = WL_OUTPUT_SUBPIXEL_UNKNOWN;
+  host->make = strdup("unknown");
+  host->model = strdup("unknown");
+  host->transform = WL_OUTPUT_TRANSFORM_NORMAL;
   host->flags = 0;
   host->width = 1024;
   host->height = 768;
   host->refresh = 60000;
-  host->factor = 1;
-  host->scale = 1.0;
-  host->max_scale = 1.0;
+  host->scale_factor = 1;
+  host->current_scale = 1000;
+  host->max_scale = 1000;
   if (xwl->aura_shell &&
       (xwl->aura_shell->version >= ZAURA_SHELL_GET_AURA_OUTPUT_SINCE_VERSION)) {
-    host->max_scale = 0.0;
+    host->current_scale = 0;
     host->aura_output =
         zaura_shell_get_aura_output(xwl->aura_shell->internal, host->proxy);
     zaura_output_set_user_data(host->aura_output, host);
