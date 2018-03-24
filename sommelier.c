@@ -2492,8 +2492,9 @@ static void xwl_keyboard_key(void *data, struct wl_keyboard *keyboard,
         continue;
 
       assert(host->extended_keyboard_proxy);
-      zcr_extended_keyboard_v1_ack_key(host->extended_keyboard_proxy, serial,
-                                       0);
+      zcr_extended_keyboard_v1_ack_key(
+          host->extended_keyboard_proxy, serial,
+          ZCR_EXTENDED_KEYBOARD_V1_HANDLED_STATE_NOT_HANDLED);
       return;
     }
   }
@@ -2504,8 +2505,11 @@ static void xwl_keyboard_key(void *data, struct wl_keyboard *keyboard,
     xwl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
 
-  if (host->extended_keyboard_proxy)
-    zcr_extended_keyboard_v1_ack_key(host->extended_keyboard_proxy, serial, 1);
+  if (host->extended_keyboard_proxy) {
+    zcr_extended_keyboard_v1_ack_key(
+        host->extended_keyboard_proxy, serial,
+        ZCR_EXTENDED_KEYBOARD_V1_HANDLED_STATE_HANDLED);
+  }
 }
 
 static void xwl_keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
