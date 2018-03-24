@@ -2007,19 +2007,34 @@ static void xwl_output_mode(void *data, struct wl_output *output,
 static void xwl_output_done(void *data, struct wl_output *output) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
   double scale = host->output->xwl->scale;
+  int factor, width, height;
 
-  if (!host->max_scale)
+  // Early out if max scale is expected but not yet know.
+  if (host->max_scale == 0.0)
     return;
 
-  // Send mode now that scale is known.
+  // Always use 1 for scale factor and adjust mode based on max scale for
+  // Xwayland client. Otherwise, pick an optimal scale factor and adjust mode
+  // for it.
+  if (host->output->xwl->xwayland) {
+    factor = 1;
+    width = (host->width * scale * host->scale) / host->max_scale;
+    height = (host->height * scale * host->scale) / host->max_scale;
+  } else {
+    factor = ceil(host->factor / scale);
+    width = (host->width * scale * factor) / host->factor;
+    height = (host->height * scale * factor) / host->factor;
+  }
+
   wl_output_send_mode(host->resource, host->flags | WL_OUTPUT_MODE_CURRENT,
-                      (scale * host->scale * host->width) / host->max_scale,
-                      (scale * host->scale * host->height) / host->max_scale,
-                      host->refresh);
-  wl_output_send_scale(host->resource, ceil(host->factor / scale));
+                      width, height, host->refresh);
+  wl_output_send_scale(host->resource, factor);
   wl_output_send_done(host->resource);
 
+  // Reset max scale.
   host->max_scale = 1.0;
+
+  // Expect max scale if aura output exists.
   if (host->aura_output)
     host->max_scale = 0.0;
 }
