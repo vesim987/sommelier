@@ -4247,7 +4247,7 @@ static int xwl_handle_event(int fd, uint32_t mask, void *data) {
 
   if ((mask & WL_EVENT_HANGUP) || (mask & WL_EVENT_ERROR)) {
     wl_client_flush(xwl->client);
-    exit(0);
+    exit(EXIT_SUCCESS);
   }
 
   if (mask & WL_EVENT_READABLE)
@@ -5880,7 +5880,7 @@ static int xwl_handle_virtwl_socket_event(int fd, uint32_t mask, void *data) {
   return 1;
 }
 
-static void xwl_print_usage(int retval) {
+static void xwl_print_usage() {
   printf("usage: sommelier [options] [program] [args...]\n\n"
          "options:\n"
          "  -h, --help\t\t\tPrint this help\n"
@@ -5899,7 +5899,6 @@ static void xwl_print_usage(int retval) {
          "  --virtwl-device=DEVICE\tVirtWL device to use\n"
          "  --drm-device=DEVICE\t\tDRM device to use\n"
          "  --glamor\t\t\tUse glamor to accelerate X11 clients\n");
-  exit(retval);
 }
 
 int main(int argc, char **argv) {
@@ -6024,11 +6023,12 @@ int main(int argc, char **argv) {
     const char *arg = argv[i];
     if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0 ||
         strcmp(arg, "-?") == 0) {
-      xwl_print_usage(0);
+      xwl_print_usage();
+      return EXIT_SUCCESS;
     }
     if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
       printf("Version: %s\n", VERSION);
-      return 0;
+      return EXIT_SUCCESS;
     }
     if (strstr(arg, "--master") == arg) {
       master = 1;
@@ -6095,7 +6095,7 @@ int main(int argc, char **argv) {
     } else if (arg[0] == '-') {
       if (strcmp(arg, "--") != 0) {
         fprintf(stderr, "Option `%s' is unknown.\n", arg);
-        return 1;
+        return EXIT_FAILURE;
       }
       xwl.runprog = &argv[i + 1];
       break;
@@ -6108,7 +6108,7 @@ int main(int argc, char **argv) {
   runtime_dir = getenv("XDG_RUNTIME_DIR");
   if (!runtime_dir) {
     fprintf(stderr, "error: XDG_RUNTIME_DIR not set in the environment\n");
-    exit(1);
+    return EXIT_FAILURE;
   }
 
   if (master) {
@@ -6134,7 +6134,7 @@ int main(int argc, char **argv) {
       fprintf(stderr,
               "error: unable to lock %s, is another compositor running?\n",
               lock_addr);
-      exit(1);
+      return EXIT_FAILURE;
     }
 
     rv = stat(addr.sun_path, &sock_stat);
@@ -6221,8 +6221,8 @@ int main(int argc, char **argv) {
 
   if (client_fd == -1) {
     if (!xwl.runprog || !xwl.runprog[0]) {
-      xwl_print_usage(1);
-      return 1;
+      xwl_print_usage();
+      return EXIT_FAILURE;
     }
   }
 
@@ -6265,7 +6265,7 @@ int main(int argc, char **argv) {
     if (xwl.virtwl_fd == -1) {
       fprintf(stderr, "error: could not open %s (%s)\n", virtwl_device,
               strerror(errno));
-      exit(1);
+      return EXIT_FAILURE;
     }
 
     // We use a virtwl context unless display was explicitly specified.
@@ -6301,13 +6301,13 @@ int main(int argc, char **argv) {
     if (drm_fd == -1) {
       fprintf(stderr, "error: could not open %s (%s)\n", drm_device,
               strerror(errno));
-      exit(1);
+      return EXIT_FAILURE;
     }
 
     xwl.gbm = gbm_create_device(drm_fd);
     if (!xwl.gbm) {
       fprintf(stderr, "error: couldn't get display device\n");
-      exit(1);
+      return EXIT_FAILURE;
     }
 
     xwl.drm_device = drm_device;
@@ -6322,13 +6322,13 @@ int main(int argc, char **argv) {
     if (strcmp(shm_driver, "dmabuf") == 0) {
       if (!xwl.drm_device) {
         fprintf(stderr, "error: need drm device for dmabuf driver\n");
-        exit(1);
+        return EXIT_FAILURE;
       }
       xwl.shm_driver = SHM_DRIVER_DMABUF;
     } else if (strcmp(shm_driver, "virtwl") == 0) {
       if (xwl.virtwl_fd == -1) {
         fprintf(stderr, "error: need device for virtwl driver\n");
-        exit(1);
+        return EXIT_FAILURE;
       }
       xwl.shm_driver = SHM_DRIVER_VIRTWL;
     }
@@ -6358,7 +6358,7 @@ int main(int argc, char **argv) {
 
   if (!xwl.display) {
     fprintf(stderr, "error: failed to connect to %s\n", display);
-    exit(1);
+    return EXIT_FAILURE;
   }
 
   wl_list_init(&xwl.accelerators);
@@ -6391,7 +6391,7 @@ int main(int argc, char **argv) {
           accelerators += 7;
         } else {
           fprintf(stderr, "error: invalid modifier\n");
-          exit(1);
+          return EXIT_FAILURE;
         }
       } else {
         struct xwl_accelerator *accelerator;
@@ -6404,7 +6404,7 @@ int main(int argc, char **argv) {
             xkb_keysym_from_name(name, XKB_KEYSYM_CASE_INSENSITIVE);
         if (accelerator->symbol == XKB_KEY_NoSymbol) {
           fprintf(stderr, "error: invalid key symbol\n");
-          exit(1);
+          return EXIT_FAILURE;
         }
 
         wl_list_insert(&xwl.accelerators, &accelerator->link);
@@ -6512,8 +6512,9 @@ int main(int argc, char **argv) {
       }
       xcb_flush(xwl.connection);
     }
-    wl_display_flush(xwl.display);
+    if (wl_display_flush(xwl.display) < 0)
+      return EXIT_FAILURE;
   } while (wl_event_loop_dispatch(event_loop, -1) != -1);
 
-  return 0;
+  return EXIT_SUCCESS;
 }
