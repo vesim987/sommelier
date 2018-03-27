@@ -412,6 +412,7 @@ struct xwl_window {
   int managed;
   int realized;
   int activated;
+  int allow_resize;
   xcb_window_t transient_for;
   int decorated;
   char *name;
@@ -940,12 +941,15 @@ static void xwl_internal_xdg_toplevel_configure(
     window->next_config.values[i++] = 0;
   }
 
+  window->allow_resize = 1;
   wl_array_for_each(state, states) {
     if (*state == ZXDG_TOPLEVEL_V6_STATE_FULLSCREEN) {
+      window->allow_resize = 0;
       window->next_config.states[i++] =
           window->xwl->atoms[ATOM_NET_WM_STATE_FULLSCREEN].value;
     }
     if (*state == ZXDG_TOPLEVEL_V6_STATE_MAXIMIZED) {
+      window->allow_resize = 0;
       window->next_config.states[i++] =
           window->xwl->atoms[ATOM_NET_WM_STATE_MAXIMIZED_VERT].value;
       window->next_config.states[i++] =
@@ -953,6 +957,8 @@ static void xwl_internal_xdg_toplevel_configure(
     }
     if (*state == ZXDG_TOPLEVEL_V6_STATE_ACTIVATED)
       activated = 1;
+    if (*state == ZXDG_TOPLEVEL_V6_STATE_RESIZING)
+      window->allow_resize = 0;
   }
 
   if (activated != window->activated) {
@@ -4282,6 +4288,7 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
   window->managed = 0;
   window->realized = 0;
   window->activated = 0;
+  window->allow_resize = 1;
   window->transient_for = XCB_WINDOW_NONE;
   window->decorated = 0;
   window->name = NULL;
@@ -4709,10 +4716,13 @@ static void xwl_handle_configure_request(struct xwl *xwl,
     window->x = event->x;
   if (event->value_mask & XCB_CONFIG_WINDOW_Y)
     window->y = event->y;
-  if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH)
-    window->width = event->width;
-  if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
-    window->height = event->height;
+
+  if (window->allow_resize) {
+    if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH)
+      window->width = event->width;
+    if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
+      window->height = event->height;
+  }
 
   xwl_adjust_window_size_for_screen_size(window);
   if (window->size_flags & (US_POSITION | P_POSITION))
