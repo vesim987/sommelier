@@ -3608,6 +3608,32 @@ static const struct wl_data_source_interface xwl_data_source_implementation = {
     xwl_data_source_offer, xwl_data_source_destroy,
     xwl_data_source_set_actions};
 
+static void xwl_data_source_target(void *data,
+                                   struct wl_data_source *data_source,
+                                   const char *mime_type) {
+  struct xwl_host_data_source *host = wl_data_source_get_user_data(data_source);
+
+  wl_data_source_send_target(host->resource, mime_type);
+}
+
+static void xwl_data_source_send(void *data, struct wl_data_source *data_source,
+                                 const char *mime_type, int32_t fd) {
+  struct xwl_host_data_source *host = wl_data_source_get_user_data(data_source);
+
+  wl_data_source_send_send(host->resource, mime_type, fd);
+  close(fd);
+}
+
+static void xwl_data_source_cancelled(void *data,
+                                      struct wl_data_source *data_source) {
+  struct xwl_host_data_source *host = wl_data_source_get_user_data(data_source);
+
+  wl_data_source_send_cancelled(host->resource);
+}
+
+static const struct wl_data_source_listener xwl_data_source_listener = {
+    xwl_data_source_target, xwl_data_source_send, xwl_data_source_cancelled};
+
 static void xwl_destroy_host_data_source(struct wl_resource *resource) {
   struct xwl_host_data_source *host = wl_resource_get_user_data(resource);
 
@@ -3767,6 +3793,8 @@ static void xwl_data_device_manager_create_data_source(
   host_data_source->proxy =
       wl_data_device_manager_create_data_source(host->proxy);
   wl_data_source_set_user_data(host_data_source->proxy, host_data_source);
+  wl_data_source_add_listener(host_data_source->proxy,
+                              &xwl_data_source_listener, host_data_source);
 }
 
 static void xwl_data_device_manager_get_data_device(
@@ -5141,12 +5169,13 @@ static void xwl_handle_property_notify(struct xwl *xwl,
   }
 }
 
-static void xwl_data_source_target(void *data,
-                                   struct wl_data_source *data_source,
-                                   const char *mime_type) {}
+static void xwl_internal_data_source_target(void *data,
+                                            struct wl_data_source *data_source,
+                                            const char *mime_type) {}
 
-static void xwl_data_source_send(void *data, struct wl_data_source *data_source,
-                                 const char *mime_type, int32_t fd) {
+static void xwl_internal_data_source_send(void *data,
+                                          struct wl_data_source *data_source,
+                                          const char *mime_type, int32_t fd) {
   struct xwl_data_source *host = data;
   struct xwl *xwl = host->xwl;
 
@@ -5162,8 +5191,9 @@ static void xwl_data_source_send(void *data, struct wl_data_source *data_source,
   }
 }
 
-static void xwl_data_source_cancelled(void *data,
-                                      struct wl_data_source *data_source) {
+static void
+xwl_internal_data_source_cancelled(void *data,
+                                   struct wl_data_source *data_source) {
   struct xwl_data_source *host = data;
 
   if (host->xwl->selection_data_source == host)
@@ -5172,8 +5202,9 @@ static void xwl_data_source_cancelled(void *data,
   wl_data_source_destroy(data_source);
 }
 
-static const struct wl_data_source_listener xwl_data_source_listener = {
-    xwl_data_source_target, xwl_data_source_send, xwl_data_source_cancelled};
+static const struct wl_data_source_listener xwl_internal_data_source_listener =
+    {xwl_internal_data_source_target, xwl_internal_data_source_send,
+     xwl_internal_data_source_cancelled};
 
 static void xwl_get_selection_targets(struct xwl *xwl) {
   struct xwl_data_source *data_source = NULL;
@@ -5202,8 +5233,8 @@ static void xwl_get_selection_targets(struct xwl *xwl) {
     data_source->xwl = xwl;
     data_source->internal = wl_data_device_manager_create_data_source(
         xwl->data_device_manager->internal);
-    wl_data_source_add_listener(data_source->internal,
-                                &xwl_data_source_listener, data_source);
+    wl_data_source_add_listener(
+        data_source->internal, &xwl_internal_data_source_listener, data_source);
 
     value = xcb_get_property_value(reply);
     for (i = 0; i < reply->value_len; i++) {
