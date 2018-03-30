@@ -286,6 +286,7 @@ struct xwl_host_data_source {
 };
 
 struct xwl_host_data_offer {
+  struct xwl *xwl;
   struct wl_resource *resource;
   struct wl_data_offer *proxy;
 };
@@ -460,6 +461,16 @@ struct xwl_accelerator {
   xkb_keysym_t symbol;
 };
 
+struct xwl_data_transfer {
+  int read_fd;
+  int write_fd;
+  size_t offset;
+  size_t bytes_left;
+  uint8_t data[4096];
+  struct wl_event_source *read_event_source;
+  struct wl_event_source *write_event_source;
+};
+
 struct xwl {
   char **runprog;
   struct wl_display *display;
@@ -481,6 +492,7 @@ struct xwl {
   struct wl_event_source *display_ready_event_source;
   struct wl_event_source *sigchld_event_source;
   int shm_driver;
+  int data_driver;
   int wm_fd;
   int virtwl_fd;
   int virtwl_ctx_fd;
@@ -552,6 +564,11 @@ enum {
   SHM_DRIVER_NOOP,
   SHM_DRIVER_DMABUF,
   SHM_DRIVER_VIRTWL,
+};
+
+enum {
+  DATA_DRIVER_NOOP,
+  DATA_DRIVER_VIRTWL,
 };
 
 #define US_POSITION (1L << 0)
@@ -1250,6 +1267,100 @@ static uint32_t xwl_drm_format_for_shm_format(int format) {
   }
   assert(0);
   return 0;
+}
+
+static void xwl_data_transfer_destroy(struct xwl_data_transfer *transfer) {
+  if (transfer->read_event_source)
+    wl_event_source_remove(transfer->read_event_source);
+  assert(transfer->write_event_source);
+  wl_event_source_remove(transfer->write_event_source);
+  close(transfer->read_fd);
+  close(transfer->write_fd);
+  free(transfer);
+}
+
+static int xwl_handle_data_transfer_read(int fd, uint32_t mask, void *data) {
+  struct xwl_data_transfer *transfer = (struct xwl_data_transfer *)data;
+
+  if ((mask & WL_EVENT_READABLE) == 0) {
+    assert(mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR));
+    wl_event_source_remove(transfer->read_event_source);
+    transfer->read_event_source = NULL;
+    return 0;
+  }
+
+  assert(!transfer->bytes_left);
+
+  transfer->bytes_left =
+      read(transfer->read_fd, transfer->data, sizeof(transfer->data));
+  if (transfer->bytes_left) {
+    transfer->offset = 0;
+    wl_event_source_fd_update(transfer->read_event_source, 0);
+    wl_event_source_fd_update(transfer->write_event_source, WL_EVENT_WRITABLE);
+  } else {
+    xwl_data_transfer_destroy(transfer);
+  }
+
+  return 0;
+}
+
+static int xwl_handle_data_transfer_write(int fd, uint32_t mask, void *data) {
+  struct xwl_data_transfer *transfer = (struct xwl_data_transfer *)data;
+  int rv;
+
+  if ((mask & WL_EVENT_WRITABLE) == 0) {
+    assert(mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR));
+    xwl_data_transfer_destroy(transfer);
+    return 0;
+  }
+
+  assert(transfer->bytes_left);
+
+  rv = write(transfer->write_fd, transfer->data + transfer->offset,
+             transfer->bytes_left);
+
+  if (rv < 0) {
+    assert(errno == EAGAIN || errno == EWOULDBLOCK || errno == EPIPE);
+  } else {
+    assert(rv <= transfer->bytes_left);
+    transfer->bytes_left -= rv;
+    transfer->offset += rv;
+  }
+
+  if (!transfer->bytes_left) {
+    wl_event_source_fd_update(transfer->write_event_source, 0);
+    if (transfer->read_event_source) {
+      wl_event_source_fd_update(transfer->read_event_source, WL_EVENT_READABLE);
+    } else {
+      xwl_data_transfer_destroy(transfer);
+    }
+    return 0;
+  }
+
+  return 1;
+}
+
+static void xwl_data_transfer_create(struct wl_event_loop *event_loop,
+                                     int read_fd, int write_fd) {
+  struct xwl_data_transfer *transfer;
+  int flags;
+  int rv;
+
+  flags = fcntl(write_fd, F_GETFL, 0);
+  rv = fcntl(write_fd, F_SETFL, flags | O_NONBLOCK);
+  assert(!rv);
+
+  transfer = malloc(sizeof(*transfer));
+  assert(transfer);
+  transfer->read_fd = read_fd;
+  transfer->write_fd = write_fd;
+  transfer->offset = 0;
+  transfer->bytes_left = 0;
+  transfer->read_event_source =
+      wl_event_loop_add_fd(event_loop, read_fd, WL_EVENT_READABLE,
+                           xwl_handle_data_transfer_read, transfer);
+  transfer->write_event_source = wl_event_loop_add_fd(
+      event_loop, write_fd, 0, xwl_handle_data_transfer_write, transfer);
 }
 
 static void xwl_host_surface_destroy(struct wl_client *client,
@@ -3520,9 +3631,26 @@ static void xwl_data_offer_receive(struct wl_client *client,
                                    const char *mime_type, int32_t fd) {
   struct xwl_host_data_offer *host = wl_resource_get_user_data(resource);
 
-  wl_data_offer_receive(host->proxy, mime_type, fd);
+  switch (host->xwl->data_driver) {
+  case DATA_DRIVER_VIRTWL: {
+    struct virtwl_ioctl_new new_pipe = {
+        .type = VIRTWL_IOCTL_NEW_PIPE_READ, .fd = -1, .flags = 0, .size = 0,
+    };
+    int rv;
 
-  close(fd);
+    rv = ioctl(host->xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &new_pipe);
+    assert(!rv);
+
+    xwl_data_transfer_create(wl_display_get_event_loop(host->xwl->host_display),
+                             new_pipe.fd, fd);
+
+    wl_data_offer_receive(host->proxy, mime_type, new_pipe.fd);
+  } break;
+  case DATA_DRIVER_NOOP:
+    wl_data_offer_receive(host->proxy, mime_type, fd);
+    close(fd);
+    break;
+  }
 }
 
 static void xwl_data_offer_destroy(struct wl_client *client,
@@ -3692,6 +3820,7 @@ static void xwl_data_device_data_offer(void *data,
   host_data_offer = malloc(sizeof(*host_data_offer));
   assert(host_data_offer);
 
+  host_data_offer->xwl = host->xwl;
   host_data_offer->resource = wl_resource_create(
       wl_resource_get_client(host->resource), &wl_data_offer_interface,
       wl_resource_get_version(host->resource), 0);
@@ -5180,11 +5309,18 @@ static void xwl_internal_data_source_send(void *data,
   struct xwl *xwl = host->xwl;
 
   if (strcmp(mime_type, xwl_utf8_mime_type) == 0) {
+    int flags;
+    int rv;
+
     xcb_convert_selection(
         xwl->connection, xwl->selection_window,
         xwl->atoms[ATOM_CLIPBOARD].value, xwl->atoms[ATOM_UTF8_STRING].value,
         xwl->atoms[ATOM_WL_SELECTION].value, XCB_CURRENT_TIME);
-    fcntl(fd, F_SETFL, O_WRONLY | O_NONBLOCK);
+
+    flags = fcntl(fd, F_GETFL, 0);
+    rv = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    assert(!rv);
+
     xwl->selection_data_source_send_fd = fd;
   } else {
     close(fd);
@@ -5239,7 +5375,7 @@ static void xwl_get_selection_targets(struct xwl *xwl) {
     value = xcb_get_property_value(reply);
     for (i = 0; i < reply->value_len; i++) {
       if (value[i] == xwl->atoms[ATOM_UTF8_STRING].value)
-        wl_data_source_offer(data_source->internal, "text/plain;charset=utf-8");
+        wl_data_source_offer(data_source->internal, xwl_utf8_mime_type);
     }
 
     if (xwl->selection_data_device && xwl->default_seat) {
@@ -5312,32 +5448,47 @@ static void xwl_send_timestamp(struct xwl *xwl) {
 }
 
 static void xwl_send_data(struct xwl *xwl) {
-  int p[2];
+  int rv;
 
   if (!xwl->selection_data_offer || !xwl->selection_data_offer->utf8_text) {
     xwl_send_selection_notify(xwl, XCB_ATOM_NONE);
     return;
   }
 
-  if (pipe2(p, O_CLOEXEC | O_NONBLOCK) == -1) {
-    fprintf(stderr, "pipe2 failed: %m\n");
-    xwl_send_selection_notify(xwl, XCB_ATOM_NONE);
-    return;
-  }
-
   wl_array_init(&xwl->selection_data);
-  xwl->selection_data_offer_receive_fd = p[0];
   xwl->selection_data_ack_pending = 0;
+
+  switch (xwl->data_driver) {
+  case DATA_DRIVER_VIRTWL: {
+    struct virtwl_ioctl_new new_pipe = {
+        .type = VIRTWL_IOCTL_NEW_PIPE_READ, .fd = -1, .flags = 0, .size = 0,
+    };
+
+    rv = ioctl(xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &new_pipe);
+    assert(!rv);
+
+    xwl->selection_data_offer_receive_fd = new_pipe.fd;
+    wl_data_offer_receive(xwl->selection_data_offer->internal,
+                          xwl_utf8_mime_type, new_pipe.fd);
+  } break;
+  case DATA_DRIVER_NOOP: {
+    int p[2];
+
+    rv = pipe2(p, O_CLOEXEC | O_NONBLOCK);
+    assert(!rv);
+
+    xwl->selection_data_offer_receive_fd = p[0];
+    wl_data_offer_receive(xwl->selection_data_offer->internal,
+                          xwl_utf8_mime_type, p[1]);
+    close(p[1]);
+  } break;
+  }
 
   assert(!xwl->selection_event_source);
   xwl->selection_event_source = wl_event_loop_add_fd(
       wl_display_get_event_loop(xwl->host_display),
       xwl->selection_data_offer_receive_fd, WL_EVENT_READABLE,
       xwl_handle_selection_fd_readable, xwl);
-
-  wl_data_offer_receive(xwl->selection_data_offer->internal,
-                        "text/plain;charset=utf-8", p[1]);
-  close(p[1]);
 }
 
 static void xwl_handle_selection_request(struct xwl *xwl,
@@ -5930,6 +6081,7 @@ static void xwl_print_usage() {
          "  --socket=SOCKET\t\tName of socket to listen on\n"
          "  --display=DISPLAY\t\tWayland display to connect to\n"
          "  --shm-driver=DRIVER\t\tSHM driver to use (noop, dmabuf, virtwl)\n"
+         "  --data-driver=DRIVER\t\tData driver to use (noop, virtwl)\n"
          "  --scale=SCALE\t\t\tScale factor for contents\n"
          "  --accelerators=ACCELERATORS\tList of keyboard accelerators\n"
          "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
@@ -5962,6 +6114,7 @@ int main(int argc, char **argv) {
       .display_ready_event_source = NULL,
       .sigchld_event_source = NULL,
       .shm_driver = SHM_DRIVER_NOOP,
+      .data_driver = DATA_DRIVER_NOOP,
       .wm_fd = -1,
       .virtwl_fd = -1,
       .virtwl_ctx_fd = -1,
@@ -6045,6 +6198,7 @@ int main(int argc, char **argv) {
   const char *drm_device = getenv("SOMMELIER_DRM_DEVICE");
   const char *glamor = getenv("SOMMELIER_GLAMOR");
   const char *shm_driver = getenv("SOMMELIER_SHM_DRIVER");
+  const char *data_driver = getenv("SOMMELIER_DATA_DRIVER");
   const char *accelerators = getenv("SOMMELIER_ACCELERATORS");
   const char *socket_name = "wayland-0";
   const char *runtime_dir;
@@ -6085,6 +6239,10 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       shm_driver = s;
+    } else if (strstr(arg, "--data-driver") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      data_driver = s;
     } else if (strstr(arg, "--peer-pid") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -6292,6 +6450,9 @@ int main(int argc, char **argv) {
   if (show_window_title)
     xwl.show_window_title = !!strcmp(show_window_title, "0");
 
+  // Handle broken pipes without signals that kill the entire process.
+  signal(SIGPIPE, SIG_IGN);
+
   xwl.host_display = wl_display_create();
   assert(xwl.host_display);
 
@@ -6354,11 +6515,6 @@ int main(int argc, char **argv) {
     xwl.drm_device = drm_device;
   }
 
-  if (!shm_driver && xwl.drm_device)
-    shm_driver = "dmabuf";
-  if (!shm_driver && xwl.virtwl_fd != -1)
-    shm_driver = "virtwl";
-
   if (shm_driver) {
     if (strcmp(shm_driver, "dmabuf") == 0) {
       if (!xwl.drm_device) {
@@ -6373,6 +6529,22 @@ int main(int argc, char **argv) {
       }
       xwl.shm_driver = SHM_DRIVER_VIRTWL;
     }
+  } else if (xwl.drm_device) {
+    xwl.shm_driver = SHM_DRIVER_DMABUF;
+  } else if (xwl.virtwl_fd != -1) {
+    xwl.shm_driver = SHM_DRIVER_VIRTWL;
+  }
+
+  if (data_driver) {
+    if (strcmp(data_driver, "virtwl") == 0) {
+      if (xwl.virtwl_fd == -1) {
+        fprintf(stderr, "error: need device for virtwl driver\n");
+        return EXIT_FAILURE;
+      }
+      xwl.data_driver = DATA_DRIVER_VIRTWL;
+    }
+  } else if (xwl.virtwl_fd != -1) {
+    xwl.data_driver = DATA_DRIVER_VIRTWL;
   }
 
   if (xwl.runprog || xwl.xwayland) {

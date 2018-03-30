@@ -13,8 +13,12 @@
 #define VIRTWL_IOWR(nr, type) _IOWR(VIRTWL_IOCTL_BASE, nr, type)
 
 enum virtwl_ioctl_new_type {
-  VIRTWL_IOCTL_NEW_CTX,   /* open a new wayland connection context */
-  VIRTWL_IOCTL_NEW_ALLOC, /* create a new virtwl shm allocation */
+  VIRTWL_IOCTL_NEW_CTX,        /* open a new wayland connection context */
+  VIRTWL_IOCTL_NEW_ALLOC,      /* create a new virtwl shm allocation */
+  VIRTWL_IOCTL_NEW_PIPE_READ,  /* create a new virtwl pipe that is readable via
+                                  the returned fd */
+  VIRTWL_IOCTL_NEW_PIPE_WRITE, /* create a new virtwl pipe that is writable via
+                                  the returned fd */
 };
 
 struct virtwl_ioctl_new {
