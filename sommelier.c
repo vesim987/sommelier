@@ -170,6 +170,11 @@ struct xwl_shm {
   struct wl_shm *internal;
 };
 
+struct xwl_host_shell_surface {
+  struct wl_resource *resource;
+  struct wl_shell_surface *proxy;
+};
+
 struct xwl_host_shell {
   struct xwl_shell *shell;
   struct wl_resource *resource;
@@ -2072,15 +2077,181 @@ static void xwl_bind_host_shm(struct wl_client *client, void *data,
   wl_shm_add_listener(host->proxy, &xwl_shm_listener, host);
 }
 
+static void xwl_shell_surface_pong(struct wl_client *client,
+                                   struct wl_resource *resource,
+                                   uint32_t serial) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+
+  wl_shell_surface_pong(host->proxy, serial);
+}
+
+static void xwl_shell_surface_move(struct wl_client *client,
+                                   struct wl_resource *resource,
+                                   struct wl_resource *seat_resource,
+                                   uint32_t serial) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+  struct xwl_host_seat *host_seat = wl_resource_get_user_data(seat_resource);
+
+  wl_shell_surface_move(host->proxy, host_seat->proxy, serial);
+}
+
+static void xwl_shell_surface_resize(struct wl_client *client,
+                                     struct wl_resource *resource,
+                                     struct wl_resource *seat_resource,
+                                     uint32_t serial, uint32_t edges) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+  struct xwl_host_seat *host_seat = wl_resource_get_user_data(seat_resource);
+
+  wl_shell_surface_resize(host->proxy, host_seat->proxy, serial, edges);
+}
+
+static void xwl_shell_surface_set_toplevel(struct wl_client *client,
+                                           struct wl_resource *resource) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+
+  wl_shell_surface_set_toplevel(host->proxy);
+}
+
+static void xwl_shell_surface_set_transient(struct wl_client *client,
+                                            struct wl_resource *resource,
+                                            struct wl_resource *parent_resource,
+                                            int32_t x, int32_t y,
+                                            uint32_t flags) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+  struct xwl_host_surface *host_parent =
+      wl_resource_get_user_data(parent_resource);
+
+  wl_shell_surface_set_transient(host->proxy, host_parent->proxy, x, y, flags);
+}
+
+static void xwl_shell_surface_set_fullscreen(
+    struct wl_client *client, struct wl_resource *resource, uint32_t method,
+    uint32_t framerate, struct wl_resource *output_resource) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+  struct xwl_host_output *host_output =
+      output_resource ? wl_resource_get_user_data(output_resource) : NULL;
+
+  wl_shell_surface_set_fullscreen(host->proxy, method, framerate,
+                                  host_output ? host_output->proxy : NULL);
+}
+
+static void xwl_shell_surface_set_popup(struct wl_client *client,
+                                        struct wl_resource *resource,
+                                        struct wl_resource *seat_resource,
+                                        uint32_t serial,
+                                        struct wl_resource *parent_resource,
+                                        int32_t x, int32_t y, uint32_t flags) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+  struct xwl_host_seat *host_seat = wl_resource_get_user_data(seat_resource);
+  struct xwl_host_surface *host_parent =
+      wl_resource_get_user_data(parent_resource);
+
+  wl_shell_surface_set_popup(host->proxy, host_seat->proxy, serial,
+                             host_parent->proxy, x, y, flags);
+}
+
 static void
-xwl_host_shell_get_host_shell_surface(struct wl_client *client,
-                                      struct wl_resource *resource, uint32_t id,
-                                      struct wl_resource *surface_resource) {
-  assert(0);
+xwl_shell_surface_set_maximized(struct wl_client *client,
+                                struct wl_resource *resource,
+                                struct wl_resource *output_resource) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+  struct xwl_host_output *host_output =
+      output_resource ? wl_resource_get_user_data(output_resource) : NULL;
+
+  wl_shell_surface_set_maximized(host->proxy,
+                                 host_output ? host_output->proxy : NULL);
+}
+
+static void xwl_shell_surface_set_title(struct wl_client *client,
+                                        struct wl_resource *resource,
+                                        const char *title) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+
+  wl_shell_surface_set_title(host->proxy, title);
+}
+
+static void xwl_shell_surface_set_class(struct wl_client *client,
+                                        struct wl_resource *resource,
+                                        const char *clazz) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+
+  wl_shell_surface_set_class(host->proxy, clazz);
+}
+
+static const struct wl_shell_surface_interface
+    xwl_shell_surface_implementation = {
+        xwl_shell_surface_pong,          xwl_shell_surface_move,
+        xwl_shell_surface_resize,        xwl_shell_surface_set_toplevel,
+        xwl_shell_surface_set_transient, xwl_shell_surface_set_fullscreen,
+        xwl_shell_surface_set_popup,     xwl_shell_surface_set_maximized,
+        xwl_shell_surface_set_title,     xwl_shell_surface_set_class};
+
+static void xwl_shell_surface_ping(void *data,
+                                   struct wl_shell_surface *shell_surface,
+                                   uint32_t serial) {
+  struct xwl_host_shell_surface *host =
+      wl_shell_surface_get_user_data(shell_surface);
+
+  wl_shell_surface_send_ping(host->resource, serial);
+}
+
+static void xwl_shell_surface_configure(void *data,
+                                        struct wl_shell_surface *shell_surface,
+                                        uint32_t edges, int32_t width,
+                                        int32_t height) {
+  struct xwl_host_shell_surface *host =
+      wl_shell_surface_get_user_data(shell_surface);
+
+  wl_shell_surface_send_configure(host->resource, edges, width, height);
+}
+
+static void
+xwl_shell_surface_popup_done(void *data,
+                             struct wl_shell_surface *shell_surface) {
+  struct xwl_host_shell_surface *host =
+      wl_shell_surface_get_user_data(shell_surface);
+
+  wl_shell_surface_send_popup_done(host->resource);
+}
+
+static const struct wl_shell_surface_listener xwl_shell_surface_listener = {
+    xwl_shell_surface_ping, xwl_shell_surface_configure,
+    xwl_shell_surface_popup_done};
+
+static void xwl_destroy_host_shell_surface(struct wl_resource *resource) {
+  struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
+
+  wl_shell_surface_destroy(host->proxy);
+  wl_resource_set_user_data(resource, NULL);
+  free(host);
+}
+
+static void
+xwl_host_shell_get_shell_surface(struct wl_client *client,
+                                 struct wl_resource *resource, uint32_t id,
+                                 struct wl_resource *surface_resource) {
+  struct xwl_host_shell *host = wl_resource_get_user_data(resource);
+  struct xwl_host_surface *host_surface =
+      wl_resource_get_user_data(surface_resource);
+  struct xwl_host_shell_surface *host_shell_surface;
+
+  host_shell_surface = malloc(sizeof(*host_shell_surface));
+  assert(host_shell_surface);
+  host_shell_surface->resource =
+      wl_resource_create(client, &wl_shell_surface_interface, 1, id);
+  wl_resource_set_implementation(
+      host_shell_surface->resource, &xwl_shell_surface_implementation,
+      host_shell_surface, xwl_destroy_host_shell_surface);
+  host_shell_surface->proxy =
+      wl_shell_get_shell_surface(host->proxy, host_surface->proxy);
+  wl_shell_surface_set_user_data(host_shell_surface->proxy, host_shell_surface);
+  wl_shell_surface_add_listener(host_shell_surface->proxy,
+                                &xwl_shell_surface_listener,
+                                host_shell_surface);
 }
 
 static const struct wl_shell_interface xwl_shell_implementation = {
-    xwl_host_shell_get_host_shell_surface};
+    xwl_host_shell_get_shell_surface};
 
 static void xwl_destroy_host_shell(struct wl_resource *resource) {
   struct xwl_host_shell *host = wl_resource_get_user_data(resource);
