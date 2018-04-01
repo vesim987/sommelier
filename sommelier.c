@@ -3293,10 +3293,15 @@ static void xwl_xdg_toplevel_set_app_id(struct wl_client *client,
 
 static void xwl_xdg_toplevel_show_window_menu(struct wl_client *client,
                                               struct wl_resource *resource,
-                                              struct wl_resource *seat,
+                                              struct wl_resource *seat_resource,
                                               uint32_t serial, int32_t x,
                                               int32_t y) {
-  assert(0);
+  struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
+  struct xwl_host_seat *host_seat =
+      seat_resource ? wl_resource_get_user_data(seat_resource) : NULL;
+
+  zxdg_toplevel_v6_show_window_menu(
+      host->proxy, host_seat ? host_seat->proxy : NULL, serial, x, y);
 }
 
 static void xwl_xdg_toplevel_move(struct wl_client *client,
