@@ -42,6 +42,7 @@
 
 #include "aura-shell-client-protocol.h"
 #include "drm-server-protocol.h"
+#include "gtk-shell-server-protocol.h"
 #include "keyboard-extension-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "version.h"
@@ -366,7 +367,22 @@ struct xwl_aura_shell {
   struct xwl *xwl;
   uint32_t id;
   uint32_t version;
+  struct xwl_global *host_gtk_shell_global;
   struct zaura_shell *internal;
+};
+
+struct xwl_host_gtk_shell {
+  struct xwl_aura_shell *aura_shell;
+  struct wl_resource *resource;
+  struct zaura_shell *proxy;
+  char *startup_id;
+  struct wl_list surfaces;
+};
+
+struct xwl_host_gtk_surface {
+  struct wl_resource *resource;
+  struct zaura_surface *proxy;
+  struct wl_list link;
 };
 
 struct xwl_viewporter {
@@ -420,9 +436,11 @@ struct xwl_window {
   int activated;
   int allow_resize;
   xcb_window_t transient_for;
+  xcb_window_t client_leader;
   int decorated;
   char *name;
   char *clazz;
+  char *startup_id;
   uint32_t size_flags;
   struct xwl_config next_config;
   struct xwl_config pending_config;
@@ -439,10 +457,12 @@ enum {
   ATOM_WM_STATE,
   ATOM_WM_DELETE_WINDOW,
   ATOM_WM_TAKE_FOCUS,
+  ATOM_WM_CLIENT_LEADER,
   ATOM_WL_SURFACE_ID,
   ATOM_UTF8_STRING,
   ATOM_MOTIF_WM_HINTS,
   ATOM_NET_FRAME_EXTENTS,
+  ATOM_NET_STARTUP_ID,
   ATOM_NET_SUPPORTING_WM_CHECK,
   ATOM_NET_WM_NAME,
   ATOM_NET_WM_MOVERESIZE,
@@ -562,7 +582,9 @@ enum {
   PROPERTY_WM_CLASS,
   PROPERTY_WM_TRANSIENT_FOR,
   PROPERTY_WM_NORMAL_HINTS,
+  PROPERTY_WM_CLIENT_LEADER,
   PROPERTY_MOTIF_WM_HINTS,
+  PROPERTY_NET_STARTUP_ID,
 };
 
 enum {
@@ -1162,6 +1184,9 @@ static void xwl_window_update(struct xwl_window *window) {
       zaura_surface_set_frame_colors(window->aura_surface, xwl->frame_color,
                                      xwl->frame_color);
     }
+
+    if (xwl->aura_shell->version >= ZAURA_SURFACE_SET_STARTUP_ID_SINCE_VERSION)
+      zaura_surface_set_startup_id(window->aura_surface, window->startup_id);
   }
 
   if (window->managed || !parent) {
@@ -4284,6 +4309,114 @@ static void xwl_bind_host_subcompositor(struct wl_client *client, void *data,
   wl_subcompositor_set_user_data(host->proxy, host);
 }
 
+static void xwl_gtk_surface_set_dbus_properties(
+    struct wl_client *client, struct wl_resource *resource,
+    const char *application_id, const char *app_menu_path,
+    const char *menubar_path, const char *window_object_path,
+    const char *application_object_path, const char *unique_bus_name) {}
+
+static void xwl_gtk_surface_set_modal(struct wl_client *client,
+                                      struct wl_resource *resource) {}
+
+static void xwl_gtk_surface_unset_modal(struct wl_client *client,
+                                        struct wl_resource *resource) {}
+
+static void xwl_gtk_surface_present(struct wl_client *client,
+                                    struct wl_resource *resource,
+                                    uint32_t time) {}
+
+static const struct gtk_surface1_interface xwl_gtk_surface_implementation = {
+    xwl_gtk_surface_set_dbus_properties, xwl_gtk_surface_set_modal,
+    xwl_gtk_surface_unset_modal, xwl_gtk_surface_present};
+
+static void xwl_destroy_host_gtk_surface(struct wl_resource *resource) {
+  struct xwl_host_gtk_surface *host = wl_resource_get_user_data(resource);
+
+  zaura_surface_destroy(host->proxy);
+  wl_list_remove(&host->link);
+  wl_resource_set_user_data(resource, NULL);
+  free(host);
+}
+
+static void
+xwl_gtk_shell_get_gtk_surface(struct wl_client *client,
+                              struct wl_resource *resource, uint32_t id,
+                              struct wl_resource *surface_resource) {
+  struct xwl_host_gtk_shell *host = wl_resource_get_user_data(resource);
+  struct xwl_host_surface *host_surface =
+      wl_resource_get_user_data(surface_resource);
+  struct xwl_host_gtk_surface *host_gtk_surface;
+
+  host_gtk_surface = malloc(sizeof(*host_gtk_surface));
+  assert(host_gtk_surface);
+
+  wl_list_insert(&host->surfaces, &host_gtk_surface->link);
+  host_gtk_surface->resource =
+      wl_resource_create(client, &gtk_surface1_interface, 1, id);
+  wl_resource_set_implementation(
+      host_gtk_surface->resource, &xwl_gtk_surface_implementation,
+      host_gtk_surface, xwl_destroy_host_gtk_surface);
+  host_gtk_surface->proxy =
+      zaura_shell_get_aura_surface(host->proxy, host_surface->proxy);
+
+  if (host->aura_shell->version >= ZAURA_SURFACE_SET_STARTUP_ID_SINCE_VERSION)
+    zaura_surface_set_startup_id(host_gtk_surface->proxy, host->startup_id);
+}
+
+static void xwl_gtk_shell_set_startup_id(struct wl_client *client,
+                                         struct wl_resource *resource,
+                                         const char *startup_id) {
+  struct xwl_host_gtk_shell *host = wl_resource_get_user_data(resource);
+
+  free(host->startup_id);
+  host->startup_id = startup_id ? strdup(startup_id) : NULL;
+
+  if (host->aura_shell->version >= ZAURA_SURFACE_SET_STARTUP_ID_SINCE_VERSION) {
+    struct xwl_host_gtk_surface *surface;
+
+    wl_list_for_each(surface, &host->surfaces, link)
+        zaura_surface_set_startup_id(surface->proxy, host->startup_id);
+  }
+}
+
+static void xwl_gtk_shell_system_bell(struct wl_client *client,
+                                      struct wl_resource *resource,
+                                      struct wl_resource *surface_resource) {}
+
+static const struct gtk_shell1_interface xwl_gtk_shell_implementation = {
+    xwl_gtk_shell_get_gtk_surface, xwl_gtk_shell_set_startup_id,
+    xwl_gtk_shell_system_bell};
+
+static void xwl_destroy_host_gtk_shell(struct wl_resource *resource) {
+  struct xwl_host_gtk_shell *host = wl_resource_get_user_data(resource);
+
+  free(host->startup_id);
+  zaura_shell_destroy(host->proxy);
+  wl_resource_set_user_data(resource, NULL);
+  free(host);
+}
+
+static void xwl_bind_host_gtk_shell(struct wl_client *client, void *data,
+                                    uint32_t version, uint32_t id) {
+  struct xwl_aura_shell *aura_shell = (struct xwl_aura_shell *)data;
+  struct xwl_host_gtk_shell *host;
+
+  host = malloc(sizeof(*host));
+  assert(host);
+  host->aura_shell = aura_shell;
+  host->startup_id = NULL;
+  wl_list_init(&host->surfaces);
+  host->resource = wl_resource_create(client, &gtk_shell1_interface, 1, id);
+  wl_resource_set_implementation(host->resource, &xwl_gtk_shell_implementation,
+                                 host, xwl_destroy_host_gtk_shell);
+  host->proxy = wl_registry_bind(
+      wl_display_get_registry(aura_shell->xwl->display), aura_shell->id,
+      &zaura_shell_interface, aura_shell->version);
+  zaura_shell_set_user_data(host->proxy, host);
+
+  gtk_shell1_send_capabilities(host->resource, 0);
+}
+
 static struct xwl_global *
 xwl_global_create(struct xwl *xwl, const struct wl_interface *interface,
                   int version, void *data, wl_global_bind_func_t bind) {
@@ -4432,11 +4565,14 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
     assert(aura_shell);
     aura_shell->xwl = xwl;
     aura_shell->id = id;
-    aura_shell->version = MIN(3, version);
+    aura_shell->version = MIN(4, version);
+    aura_shell->host_gtk_shell_global = NULL;
     aura_shell->internal = wl_registry_bind(
         registry, id, &zaura_shell_interface, aura_shell->version);
     assert(!xwl->aura_shell);
     xwl->aura_shell = aura_shell;
+    aura_shell->host_gtk_shell_global = xwl_global_create(
+        xwl, &gtk_shell1_interface, 1, aura_shell, xwl_bind_host_gtk_shell);
   } else if (strcmp(interface, "wp_viewporter") == 0) {
     struct xwl_viewporter *viewporter = malloc(sizeof(struct xwl_viewporter));
     assert(viewporter);
@@ -4531,6 +4667,8 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
     return;
   }
   if (xwl->aura_shell && xwl->aura_shell->id == id) {
+    if (xwl->aura_shell->host_gtk_shell_global)
+      xwl_global_destroy(xwl->aura_shell->host_gtk_shell_global);
     zaura_shell_destroy(xwl->aura_shell->internal);
     free(xwl->aura_shell);
     xwl->aura_shell = NULL;
@@ -4623,9 +4761,11 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
   window->activated = 0;
   window->allow_resize = 1;
   window->transient_for = XCB_WINDOW_NONE;
+  window->client_leader = XCB_WINDOW_NONE;
   window->decorated = 0;
   window->name = NULL;
   window->clazz = NULL;
+  window->startup_id = NULL;
   window->size_flags = P_POSITION;
   window->xdg_surface = NULL;
   window->xdg_toplevel = NULL;
@@ -4665,6 +4805,8 @@ static void xwl_destroy_window(struct xwl_window *window) {
     free(window->name);
   if (window->clazz)
     free(window->clazz);
+  if (window->startup_id)
+    free(window->startup_id);
 
   wl_list_remove(&window->link);
   free(window);
@@ -4769,7 +4911,9 @@ static void xwl_handle_map_request(struct xwl *xwl,
       {PROPERTY_WM_CLASS, XCB_ATOM_WM_CLASS},
       {PROPERTY_WM_TRANSIENT_FOR, XCB_ATOM_WM_TRANSIENT_FOR},
       {PROPERTY_WM_NORMAL_HINTS, XCB_ATOM_WM_NORMAL_HINTS},
+      {PROPERTY_WM_CLIENT_LEADER, xwl->atoms[ATOM_WM_CLIENT_LEADER].value},
       {PROPERTY_MOTIF_WM_HINTS, xwl->atoms[ATOM_MOTIF_WM_HINTS].value},
+      {PROPERTY_NET_STARTUP_ID, xwl->atoms[ATOM_NET_STARTUP_ID].value},
   };
   xcb_get_geometry_cookie_t geometry_cookie;
   xcb_get_property_cookie_t property_cookies[ARRAY_SIZE(properties)];
@@ -4833,7 +4977,12 @@ static void xwl_handle_map_request(struct xwl *xwl,
     free(window->clazz);
     window->clazz = NULL;
   }
+  if (window->startup_id) {
+    free(window->startup_id);
+    window->startup_id = NULL;
+  }
   window->transient_for = XCB_WINDOW_NONE;
+  window->client_leader = XCB_WINDOW_NONE;
   window->decorated = 1;
   window->size_flags = 0;
 
@@ -4874,9 +5023,17 @@ static void xwl_handle_map_request(struct xwl *xwl,
       if (xcb_get_property_value_length(reply) >= sizeof(size_hints))
         memcpy(&size_hints, xcb_get_property_value(reply), sizeof(size_hints));
       break;
+    case PROPERTY_WM_CLIENT_LEADER:
+      if (xcb_get_property_value_length(reply) >= 4)
+        window->client_leader = *((uint32_t *)xcb_get_property_value(reply));
+      break;
     case PROPERTY_MOTIF_WM_HINTS:
       if (xcb_get_property_value_length(reply) >= sizeof(mwm_hints))
         memcpy(&mwm_hints, xcb_get_property_value(reply), sizeof(mwm_hints));
+      break;
+    case PROPERTY_NET_STARTUP_ID:
+      window->startup_id = strndup(xcb_get_property_value(reply),
+                                   xcb_get_property_value_length(reply));
       break;
     default:
       break;
@@ -4894,6 +5051,23 @@ static void xwl_handle_map_request(struct xwl *xwl,
   // Allow user/program controlled position for transients.
   if (window->transient_for)
     window->size_flags |= size_hints.flags & (US_POSITION | P_POSITION);
+
+  // If startup ID is not set, then try the client leader window.
+  if (!window->startup_id && window->client_leader) {
+    xcb_get_property_reply_t *reply = xcb_get_property_reply(
+        xwl->connection,
+        xcb_get_property(xwl->connection, 0, window->client_leader,
+                         xwl->atoms[ATOM_NET_STARTUP_ID].value, XCB_ATOM_ANY, 0,
+                         2048),
+        NULL);
+    if (reply) {
+      if (reply->type != XCB_ATOM_NONE) {
+        window->startup_id = strndup(xcb_get_property_value(reply),
+                                     xcb_get_property_value_length(reply));
+      }
+      free(reply);
+    }
+  }
 
   window->border_width = 0;
   xwl_adjust_window_size_for_screen_size(window);
@@ -6343,10 +6517,12 @@ int main(int argc, char **argv) {
                   [ATOM_WM_STATE] = {"WM_STATE"},
                   [ATOM_WM_DELETE_WINDOW] = {"WM_DELETE_WINDOW"},
                   [ATOM_WM_TAKE_FOCUS] = {"WM_TAKE_FOCUS"},
+                  [ATOM_WM_CLIENT_LEADER] = {"WM_CLIENT_LEADER"},
                   [ATOM_WL_SURFACE_ID] = {"WL_SURFACE_ID"},
                   [ATOM_UTF8_STRING] = {"UTF8_STRING"},
                   [ATOM_MOTIF_WM_HINTS] = {"_MOTIF_WM_HINTS"},
                   [ATOM_NET_FRAME_EXTENTS] = {"_NET_FRAME_EXTENTS"},
+                  [ATOM_NET_STARTUP_ID] = {"_NET_STARTUP_ID"},
                   [ATOM_NET_SUPPORTING_WM_CHECK] = {"_NET_SUPPORTING_WM_CHECK"},
                   [ATOM_NET_WM_NAME] = {"_NET_WM_NAME"},
                   [ATOM_NET_WM_MOVERESIZE] = {"_NET_WM_MOVERESIZE"},

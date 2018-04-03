@@ -6,7 +6,7 @@ PREFIX = /usr
 SYSCONFDIR = /etc
 BINDIR = $(PREFIX)/bin
 SRCFILES := sommelier.c virtwl.h
-XMLFILES := aura-shell.xml viewporter.xml xdg-shell-unstable-v6.xml linux-dmabuf-unstable-v1.xml drm.xml keyboard-extension-unstable-v1.xml
+XMLFILES := aura-shell.xml viewporter.xml xdg-shell-unstable-v6.xml linux-dmabuf-unstable-v1.xml drm.xml keyboard-extension-unstable-v1.xml gtk-shell.xml
 AUXFILES := Makefile README LICENSE AUTHORS sommelier@.service.in sommelier-x@.service.in version.h.in sommelierrc sommelier.sh
 ALLFILES := $(SRCFILES) $(XMLFILES) $(AUXFILES)
 GIT_VERSION := $(shell git describe --abbrev=4 --dirty --always --tags)
@@ -17,8 +17,8 @@ DIST_VERSION_MINOR := $(word 2,$(DIST_VERSION_BITS))
 DIST_VERSION_MINOR_NEXT := $(shell expr $(DIST_VERSION_MINOR) + 1)
 CFLAGS=-g -Wall `pkg-config --cflags xcb xcb-composite xcb-xfixes wayland-server wayland-client libsystemd gbm pixman-1` -I. -DXWAYLAND_PATH=\"$(PREFIX)/bin\"
 LDFLAGS=-lpthread -lm `pkg-config --libs xcb xcb-composite xcb-xfixes wayland-server wayland-client libsystemd gbm pixman-1 xkbcommon`
-DEPS = xdg-shell-unstable-v6-client-protocol.h xdg-shell-unstable-v6-server-protocol.h aura-shell-client-protocol.h viewporter-client-protocol.h linux-dmabuf-unstable-v1-client-protocol.h drm-server-protocol.h keyboard-extension-unstable-v1-client-protocol.h version.h
-OBJECTS = sommelier.o xdg-shell-unstable-v6-protocol.o aura-shell-protocol.o viewporter-protocol.o linux-dmabuf-unstable-v1-protocol.o drm-protocol.o keyboard-extension-unstable-v1-protocol.o
+DEPS = xdg-shell-unstable-v6-client-protocol.h xdg-shell-unstable-v6-server-protocol.h aura-shell-client-protocol.h viewporter-client-protocol.h linux-dmabuf-unstable-v1-client-protocol.h drm-server-protocol.h keyboard-extension-unstable-v1-client-protocol.h gtk-shell-server-protocol.h version.h
+OBJECTS = sommelier.o xdg-shell-unstable-v6-protocol.o aura-shell-protocol.o viewporter-protocol.o linux-dmabuf-unstable-v1-protocol.o drm-protocol.o keyboard-extension-unstable-v1-protocol.o gtk-shell-protocol.o
 
 all: sommelier sommelier@.service sommelier-x@.service
 
