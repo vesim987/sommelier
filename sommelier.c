@@ -6754,7 +6754,8 @@ int main(int argc, char **argv) {
               strstr(arg, "--accelerators") == arg ||
               strstr(arg, "--virtwl-device") == arg ||
               strstr(arg, "--drm-device") == arg ||
-              strstr(arg, "--shm-driver") == arg) {
+              strstr(arg, "--shm-driver") == arg ||
+              strstr(arg, "--data-driver") == arg) {
             args[i++] = arg;
           }
         }
