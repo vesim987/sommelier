@@ -52,7 +52,7 @@
 #include "xdg-shell-unstable-v6-server-protocol.h"
 
 #ifndef XWAYLAND_PATH
-#define XWAYLAND_PATH "/usr/bin"
+#define XWAYLAND_PATH "/usr/bin/Xwayland"
 #endif
 
 struct xwl;
@@ -6466,6 +6466,7 @@ static void xwl_print_usage() {
          "  --accelerators=ACCELERATORS\tList of keyboard accelerators\n"
          "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
          "  --x-display=DISPLAY\t\tX11 display to listen on\n"
+         "  --xwayland-path=PATH\t\tPath to Xwayland executable\n"
          "  --no-exit-with-child\t\tKeep process alive after child exists\n"
          "  --no-clipboard-manager\tDisable X11 clipboard manager\n"
          "  --frame-color=COLOR\t\tWindow frame color for X11 clients\n"
@@ -6582,6 +6583,7 @@ int main(int argc, char **argv) {
   const char *shm_driver = getenv("SOMMELIER_SHM_DRIVER");
   const char *data_driver = getenv("SOMMELIER_DATA_DRIVER");
   const char *accelerators = getenv("SOMMELIER_ACCELERATORS");
+  const char *xwayland_path = getenv("SOMMELIER_XWAYLAND_PATH");
   const char *socket_name = "wayland-0";
   const char *runtime_dir;
   struct wl_event_loop *event_loop;
@@ -6653,6 +6655,10 @@ int main(int argc, char **argv) {
       xdisplay = atoi(s);
       // Automatically enable X forwarding if X display is specified.
       xwl.xwayland = 1;
+    } else if (strstr(arg, "--xwayland-path") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      xwayland_path = s;
     } else if (strstr(arg, "--no-exit-with-child") == arg) {
       xwl.exit_with_child = 0;
     } else if (strstr(arg, "--no-clipboard-manager") == arg) {
@@ -7050,16 +7056,20 @@ int main(int argc, char **argv) {
       assert(pid != -1);
       if (pid == 0) {
         char display_str[8], display_fd_str[8], wm_fd_str[8];
+        char xwayland_path_str[1024];
         char *args[32];
         int i = 0;
         int fd;
+
+        snprintf(xwayland_path_str, sizeof(xwayland_path_str), "%s",
+                 xwayland_path ? xwayland_path : XWAYLAND_PATH);
+        args[i++] = xwayland_path_str;
 
         fd = dup(ds[1]);
         snprintf(display_fd_str, sizeof(display_fd_str), "%d", fd);
         fd = dup(wm[1]);
         snprintf(wm_fd_str, sizeof(wm_fd_str), "%d", fd);
 
-        args[i++] = XWAYLAND_PATH "/Xwayland";
         if (xdisplay > 0) {
           snprintf(display_str, sizeof(display_str), ":%d", xdisplay);
           args[i++] = display_str;
@@ -7080,7 +7090,7 @@ int main(int argc, char **argv) {
         args[i++] = wm_fd_str;
         args[i++] = NULL;
 
-        xwl_execvp(XWAYLAND_PATH "/Xwayland", args, sv[1]);
+        xwl_execvp(args[0], args, sv[1]);
         _exit(EXIT_FAILURE);
       }
       close(wm[1]);
