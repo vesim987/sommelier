@@ -6,7 +6,6 @@ RUN apt-get update && \
                        debhelper \
                        devscripts \
                        git \
-                       libsystemd-dev \
                        libwayland-dev \
                        libwayland-bin \
                        libxcb-composite0-dev \

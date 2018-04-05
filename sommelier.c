@@ -30,7 +30,6 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <systemd/sd-daemon.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-server.h>
@@ -549,6 +548,7 @@ struct xwl {
   double scale;
   const char *app_id;
   int exit_with_child;
+  const char *sd_notify;
   int clipboard_manager;
   uint32_t frame_color;
   int has_frame_color;
@@ -6179,6 +6179,39 @@ static void xwl_execvp(const char *file, char *const argv[],
   perror(file);
 }
 
+static void xwl_sd_notify(const char *state) {
+  const char *socket_name;
+  struct msghdr msghdr;
+  struct iovec iovec;
+  struct sockaddr_un addr;
+  int fd;
+  int rv;
+
+  socket_name = getenv("NOTIFY_SOCKET");
+  assert(socket_name);
+
+  fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  assert(fd >= 0);
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, socket_name, sizeof(addr.sun_path));
+
+  memset(&iovec, 0, sizeof(iovec));
+  iovec.iov_base = (char *)state;
+  iovec.iov_len = strlen(state);
+
+  memset(&msghdr, 0, sizeof(msghdr));
+  msghdr.msg_name = &addr;
+  msghdr.msg_namelen =
+      offsetof(struct sockaddr_un, sun_path) + strlen(socket_name);
+  msghdr.msg_iov = &iovec;
+  msghdr.msg_iovlen = 1;
+
+  rv = sendmsg(fd, &msghdr, MSG_NOSIGNAL);
+  assert(rv != -1);
+}
+
 static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   struct xwl *xwl = (struct xwl *)data;
   char display_name[9];
@@ -6212,7 +6245,8 @@ static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   xwl->display_ready_event_source = NULL;
   close(fd);
 
-  sd_notify(0, "READY=1");
+  if (xwl->sd_notify)
+    xwl_sd_notify(xwl->sd_notify);
 
   pid = fork();
   assert(pid >= 0);
@@ -6563,6 +6597,7 @@ int main(int argc, char **argv) {
       .scale = 1.0,
       .app_id = NULL,
       .exit_with_child = 1,
+      .sd_notify = NULL,
       .clipboard_manager = 0,
       .frame_color = 0,
       .has_frame_color = 0,
@@ -6713,6 +6748,10 @@ int main(int argc, char **argv) {
       xwayland_path = s;
     } else if (strstr(arg, "--no-exit-with-child") == arg) {
       xwl.exit_with_child = 0;
+    } else if (strstr(arg, "--sd-notify") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      xwl.sd_notify = s;
     } else if (strstr(arg, "--no-clipboard-manager") == arg) {
       clipboard_manager = "0";
     } else if (strstr(arg, "--frame-color") == arg) {
@@ -6800,7 +6839,8 @@ int main(int argc, char **argv) {
     rv = sigaction(SIGCHLD, &sa, NULL);
     assert(rv >= 0);
 
-    sd_notify(0, "READY=1");
+    if (xwl.sd_notify)
+      xwl_sd_notify(xwl.sd_notify);
 
     do {
       struct ucred ucred;
