@@ -375,6 +375,7 @@ struct xwl_host_gtk_shell {
   struct xwl_aura_shell *aura_shell;
   struct wl_resource *resource;
   struct zaura_shell *proxy;
+  struct wl_callback *callback;
   char *startup_id;
   struct wl_list surfaces;
 };
@@ -403,6 +404,7 @@ struct xwl_host_drm {
   struct xwl_linux_dmabuf *linux_dmabuf;
   uint32_t version;
   struct wl_resource *resource;
+  struct wl_callback *callback;
 };
 
 struct xwl_keyboard_extension {
@@ -3295,9 +3297,25 @@ static const struct wl_drm_interface xwl_drm_implementation = {
 static void xwl_destroy_host_drm(struct wl_resource *resource) {
   struct xwl_host_drm *host = wl_resource_get_user_data(resource);
 
+  wl_callback_destroy(host->callback);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
+
+static void xwl_drm_callback_done(void *data, struct wl_callback *callback,
+                                  uint32_t serial) {
+  struct xwl_host_drm *host = wl_callback_get_user_data(callback);
+
+  wl_drm_send_device(host->resource, host->linux_dmabuf->xwl->drm_device);
+  wl_drm_send_format(host->resource, WL_DRM_FORMAT_ARGB8888);
+  wl_drm_send_format(host->resource, WL_DRM_FORMAT_XRGB8888);
+  wl_drm_send_format(host->resource, WL_DRM_FORMAT_RGB565);
+  if (host->version >= WL_DRM_CREATE_PRIME_BUFFER_SINCE_VERSION)
+    wl_drm_send_capabilities(host->resource, WL_DRM_CAPABILITY_PRIME);
+}
+
+static const struct wl_callback_listener xwl_drm_callback_listener = {
+    xwl_drm_callback_done};
 
 static void xwl_bind_host_drm(struct wl_client *client, void *data,
                               uint32_t version, uint32_t id) {
@@ -3313,12 +3331,9 @@ static void xwl_bind_host_drm(struct wl_client *client, void *data,
   wl_resource_set_implementation(host->resource, &xwl_drm_implementation, host,
                                  xwl_destroy_host_drm);
 
-  wl_drm_send_device(host->resource, linux_dmabuf->xwl->drm_device);
-  wl_drm_send_format(host->resource, WL_DRM_FORMAT_ARGB8888);
-  wl_drm_send_format(host->resource, WL_DRM_FORMAT_XRGB8888);
-  wl_drm_send_format(host->resource, WL_DRM_FORMAT_RGB565);
-  if (host->version >= WL_DRM_CREATE_PRIME_BUFFER_SINCE_VERSION)
-    wl_drm_send_capabilities(host->resource, WL_DRM_CAPABILITY_PRIME);
+  host->callback = wl_display_sync(linux_dmabuf->xwl->display);
+  wl_callback_set_user_data(host->callback, host);
+  wl_callback_add_listener(host->callback, &xwl_drm_callback_listener, host);
 }
 
 static void xwl_xdg_positioner_destroy(struct wl_client *client,
@@ -4391,10 +4406,22 @@ static void xwl_destroy_host_gtk_shell(struct wl_resource *resource) {
   struct xwl_host_gtk_shell *host = wl_resource_get_user_data(resource);
 
   free(host->startup_id);
+  wl_callback_destroy(host->callback);
   zaura_shell_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
+
+static void xwl_gtk_shell_callback_done(void *data,
+                                        struct wl_callback *callback,
+                                        uint32_t serial) {
+  struct xwl_host_gtk_shell *host = wl_callback_get_user_data(callback);
+
+  gtk_shell1_send_capabilities(host->resource, 0);
+}
+
+static const struct wl_callback_listener xwl_gtk_shell_callback_listener = {
+    xwl_gtk_shell_callback_done};
 
 static void xwl_bind_host_gtk_shell(struct wl_client *client, void *data,
                                     uint32_t version, uint32_t id) {
@@ -4414,7 +4441,10 @@ static void xwl_bind_host_gtk_shell(struct wl_client *client, void *data,
       &zaura_shell_interface, aura_shell->version);
   zaura_shell_set_user_data(host->proxy, host);
 
-  gtk_shell1_send_capabilities(host->resource, 0);
+  host->callback = wl_display_sync(aura_shell->xwl->display);
+  wl_callback_set_user_data(host->callback, host);
+  wl_callback_add_listener(host->callback, &xwl_gtk_shell_callback_listener,
+                           host);
 }
 
 static struct xwl_global *
