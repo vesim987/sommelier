@@ -2,16 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Needed to include both wayland-client.h and wayland-server.h.
-#ifndef WL_HIDE_DEPRECATED
-#define WL_HIDE_DEPRECATED
-#endif
-
-// Needed for pipe2.
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -49,10 +39,6 @@
 #include "virtwl.h"
 #include "xdg-shell-unstable-v6-client-protocol.h"
 #include "xdg-shell-unstable-v6-server-protocol.h"
-
-#ifndef XWAYLAND_PATH
-#define XWAYLAND_PATH "/usr/bin/Xwayland"
-#endif
 
 struct xwl;
 
