@@ -8,6 +8,7 @@
 #include <gbm.h>
 #include <libgen.h>
 #include <limits.h>
+#include <linux/virtwl.h>
 #include <math.h>
 #include <pixman.h>
 #include <stdio.h>
@@ -36,7 +37,6 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "version.h"
 #include "viewporter-client-protocol.h"
-#include "virtwl.h"
 #include "xdg-shell-unstable-v6-client-protocol.h"
 #include "xdg-shell-unstable-v6-server-protocol.h"
 
