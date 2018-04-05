@@ -6452,6 +6452,46 @@ static int xwl_handle_virtwl_socket_event(int fd, uint32_t mask, void *data) {
   return 1;
 }
 
+// Break |str| into a sequence of zero or more nonempty arguments. No more
+// than |argc| arguments will be added to |argv|. Returns the total number of
+// argments found in |str|.
+static int xwl_parse_cmd_prefix(char *str, int argc, char **argv) {
+  char *s = str;
+  int n = 0;
+  int delim = 0;
+
+  do {
+    // Look for ending delimiter if |delim| is set.
+    if (delim) {
+      if (*s == delim) {
+        delim = 0;
+        *s = '\0';
+      }
+      ++s;
+    } else {
+      // Skip forward to first non-space character.
+      while (*s == ' ' && *s != '\0')
+        ++s;
+
+      // Check for quote delimiter.
+      if (*s == '"') {
+        delim = '"';
+        ++s;
+      } else {
+        delim = ' ';
+      }
+
+      // Add string to arguments if there's room.
+      if (n < argc)
+        argv[n] = s;
+
+      ++n;
+    }
+  } while (*s != '\0');
+
+  return n;
+}
+
 static void xwl_print_usage() {
   printf("usage: sommelier [options] [program] [args...]\n\n"
          "options:\n"
@@ -6463,10 +6503,12 @@ static void xwl_print_usage() {
          "  --shm-driver=DRIVER\t\tSHM driver to use (noop, dmabuf, virtwl)\n"
          "  --data-driver=DRIVER\t\tData driver to use (noop, virtwl)\n"
          "  --scale=SCALE\t\t\tScale factor for contents\n"
+         "  --peer-cmd-prefix=PREFIX\tPeer process command line prefix\n"
          "  --accelerators=ACCELERATORS\tList of keyboard accelerators\n"
          "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
          "  --x-display=DISPLAY\t\tX11 display to listen on\n"
          "  --xwayland-path=PATH\t\tPath to Xwayland executable\n"
+         "  --xwayland-cmd-prefix=PREFIX\tXwayland command line prefix\n"
          "  --no-exit-with-child\t\tKeep process alive after child exists\n"
          "  --no-clipboard-manager\tDisable X11 clipboard manager\n"
          "  --frame-color=COLOR\t\tWindow frame color for X11 clients\n"
@@ -6582,6 +6624,8 @@ int main(int argc, char **argv) {
   const char *glamor = getenv("SOMMELIER_GLAMOR");
   const char *shm_driver = getenv("SOMMELIER_SHM_DRIVER");
   const char *data_driver = getenv("SOMMELIER_DATA_DRIVER");
+  const char *peer_cmd_prefix = getenv("SOMMELIER_PEER_CMD_PREFIX");
+  const char *xwayland_cmd_prefix = getenv("SOMMELIER_XWAYLAND_CMD_PREFIX");
   const char *accelerators = getenv("SOMMELIER_ACCELERATORS");
   const char *xwayland_path = getenv("SOMMELIER_XWAYLAND_PATH");
   const char *socket_name = "wayland-0";
@@ -6631,6 +6675,14 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       xwl.peer_pid = atoi(s);
+    } else if (strstr(arg, "--peer-cmd-prefix") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      peer_cmd_prefix = s;
+    } else if (strstr(arg, "--xwayland-cmd-prefix") == arg) {
+      const char *s = strchr(arg, '=');
+      ++s;
+      xwayland_cmd_prefix = s;
     } else if (strstr(arg, "--client-fd") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -6768,11 +6820,23 @@ int main(int argc, char **argv) {
       assert(pid != -1);
       if (pid == 0) {
         char client_fd_str[64], peer_pid_str[64];
-        char *args[32];
+        char peer_cmd_prefix_str[1024];
+        char *args[64];
         int i = 0, j;
 
         close(sock_fd);
         close(lock_fd);
+
+        if (peer_cmd_prefix) {
+          snprintf(peer_cmd_prefix_str, sizeof(peer_cmd_prefix_str), "%s",
+                   peer_cmd_prefix);
+
+          i = xwl_parse_cmd_prefix(peer_cmd_prefix_str, 32, args);
+          if (i > 32) {
+            fprintf(stderr, "error: too many arguments in cmd prefix: %d\n", i);
+            i = 0;
+          }
+        }
 
         args[i++] = argv[0];
         snprintf(peer_pid_str, sizeof(peer_pid_str), "--peer-pid=%d",
@@ -6798,7 +6862,7 @@ int main(int argc, char **argv) {
 
         args[i++] = NULL;
 
-        execvp(argv[0], args);
+        execvp(args[0], args);
         _exit(EXIT_FAILURE);
       }
       close(client_fd);
@@ -7057,9 +7121,21 @@ int main(int argc, char **argv) {
       if (pid == 0) {
         char display_str[8], display_fd_str[8], wm_fd_str[8];
         char xwayland_path_str[1024];
-        char *args[32];
+        char xwayland_cmd_prefix_str[1024];
+        char *args[64];
         int i = 0;
         int fd;
+
+        if (xwayland_cmd_prefix) {
+          snprintf(xwayland_cmd_prefix_str, sizeof(xwayland_cmd_prefix_str),
+                   "%s", xwayland_cmd_prefix);
+
+          i = xwl_parse_cmd_prefix(xwayland_cmd_prefix_str, 32, args);
+          if (i > 32) {
+            fprintf(stderr, "error: too many arguments in cmd prefix: %d\n", i);
+            i = 0;
+          }
+        }
 
         snprintf(xwayland_path_str, sizeof(xwayland_path_str), "%s",
                  xwayland_path ? xwayland_path : XWAYLAND_PATH);
