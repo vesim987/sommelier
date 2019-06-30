@@ -8,7 +8,6 @@
 #include <gbm.h>
 #include <libgen.h>
 #include <limits.h>
-#include <linux/virtwl.h>
 #include <math.h>
 #include <pixman.h>
 #include <stdio.h>
@@ -29,6 +28,7 @@
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
 #include <xkbcommon/xkbcommon.h>
+#include "virtwl.h"
 
 #include "aura-shell-client-protocol.h"
 #include "drm-server-protocol.h"
@@ -39,6 +39,9 @@
 #include "viewporter-client-protocol.h"
 #include "xdg-shell-unstable-v6-client-protocol.h"
 #include "xdg-shell-unstable-v6-server-protocol.h"
+
+#define DEBUG_PRINT \
+  fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, __PRETTY_FUNCTION__)
 
 struct xwl;
 
@@ -1030,10 +1033,18 @@ static const struct zxdg_toplevel_v6_listener
 static void xwl_internal_xdg_popup_configure(void *data,
                                              struct zxdg_popup_v6 *xdg_popup,
                                              int32_t x, int32_t y,
-                                             int32_t width, int32_t height) {}
+                                             int32_t width, int32_t height) {
+  DEBUG_PRINT;
+
+  struct xwl_window *window = data;
+
+  // zxdg_popup_v6_send_configure(xdg_popup, x, y, x + width, y + height);
+}
 
 static void xwl_internal_xdg_popup_done(void *data,
-                                        struct zxdg_popup_v6 *zxdg_popup_v6) {}
+                                        struct zxdg_popup_v6 *zxdg_popup_v6) {
+  DEBUG_PRINT;
+}
 
 static const struct zxdg_popup_v6_listener xwl_internal_xdg_popup_listener = {
     xwl_internal_xdg_popup_configure, xwl_internal_xdg_popup_done};
@@ -1057,6 +1068,7 @@ static void xwl_window_update(struct xwl_window *window) {
   struct xwl_window *parent = NULL;
   const char *app_id = NULL;
 
+  DEBUG_PRINT;
   if (window->host_surface_id) {
     host_resource = wl_client_get_object(xwl->client, window->host_surface_id);
     if (host_resource && window->unpaired) {
@@ -1080,6 +1092,7 @@ static void xwl_window_update(struct xwl_window *window) {
       window->xdg_toplevel = NULL;
     }
     if (window->xdg_popup) {
+      DEBUG_PRINT;
       zxdg_popup_v6_destroy(window->xdg_popup);
       window->xdg_popup = NULL;
     }
@@ -1192,6 +1205,7 @@ static void xwl_window_update(struct xwl_window *window) {
       zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
   } else if (!window->xdg_popup) {
     struct zxdg_positioner_v6 *positioner;
+    DEBUG_PRINT;
 
     positioner = zxdg_shell_v6_create_positioner(xwl->xdg_shell->internal);
     assert(positioner);
@@ -1204,6 +1218,8 @@ static void xwl_window_update(struct xwl_window *window) {
     zxdg_positioner_v6_set_anchor_rect(
         positioner, (window->x - parent->x) / xwl->scale,
         (window->y - parent->y) / xwl->scale, 1, 1);
+
+    zxdg_positioner_v6_set_size(positioner, 1, 1);
 
     window->xdg_popup = zxdg_surface_v6_get_popup(
         window->xdg_surface, parent->xdg_surface, positioner);
@@ -2154,6 +2170,7 @@ static void xwl_shell_surface_set_popup(struct wl_client *client,
                                         uint32_t serial,
                                         struct wl_resource *parent_resource,
                                         int32_t x, int32_t y, uint32_t flags) {
+  DEBUG_PRINT;
   struct xwl_host_shell_surface *host = wl_resource_get_user_data(resource);
   struct xwl_host_seat *host_seat = wl_resource_get_user_data(seat_resource);
   struct xwl_host_surface *host_parent =
@@ -2161,6 +2178,7 @@ static void xwl_shell_surface_set_popup(struct wl_client *client,
 
   wl_shell_surface_set_popup(host->proxy, host_seat->proxy, serial,
                              host_parent->proxy, x, y, flags);
+  DEBUG_PRINT;
 }
 
 static void
@@ -2221,10 +2239,12 @@ static void xwl_shell_surface_configure(void *data,
 static void
 xwl_shell_surface_popup_done(void *data,
                              struct wl_shell_surface *shell_surface) {
+  DEBUG_PRINT;
   struct xwl_host_shell_surface *host =
       wl_shell_surface_get_user_data(shell_surface);
 
   wl_shell_surface_send_popup_done(host->resource);
+  DEBUG_PRINT;
 }
 
 static const struct wl_shell_surface_listener xwl_shell_surface_listener = {
@@ -3399,7 +3419,7 @@ static const struct zxdg_positioner_v6_interface
 
 static void xwl_destroy_host_xdg_positioner(struct wl_resource *resource) {
   struct xwl_host_xdg_positioner *host = wl_resource_get_user_data(resource);
-
+  puts(__PRETTY_FUNCTION__);
   zxdg_positioner_v6_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
@@ -3407,17 +3427,21 @@ static void xwl_destroy_host_xdg_positioner(struct wl_resource *resource) {
 
 static void xwl_xdg_popup_destroy(struct wl_client *client,
                                   struct wl_resource *resource) {
+  DEBUG_PRINT;
   wl_resource_destroy(resource);
+  DEBUG_PRINT;
 }
 
 static void xwl_xdg_popup_grab(struct wl_client *client,
                                struct wl_resource *resource,
                                struct wl_resource *seat_resource,
                                uint32_t serial) {
+  DEBUG_PRINT;
   struct xwl_host_xdg_popup *host = wl_resource_get_user_data(resource);
   struct xwl_host_seat *host_seat = wl_resource_get_user_data(seat_resource);
 
   zxdg_popup_v6_grab(host->proxy, host_seat->proxy, serial);
+  DEBUG_PRINT;
 }
 
 static const struct zxdg_popup_v6_interface xwl_xdg_popup_implementation = {
@@ -3426,6 +3450,7 @@ static const struct zxdg_popup_v6_interface xwl_xdg_popup_implementation = {
 static void xwl_xdg_popup_configure(void *data, struct zxdg_popup_v6 *xdg_popup,
                                     int32_t x, int32_t y, int32_t width,
                                     int32_t height) {
+  DEBUG_PRINT;
   struct xwl_host_xdg_popup *host = zxdg_popup_v6_get_user_data(xdg_popup);
   double scale = host->xwl->scale;
   int32_t x1, y1, x2, y2;
@@ -3436,24 +3461,29 @@ static void xwl_xdg_popup_configure(void *data, struct zxdg_popup_v6 *xdg_popup,
   y2 = (y + height) * scale;
 
   zxdg_popup_v6_send_configure(host->resource, x1, y1, x2 - x1, y2 - y1);
+  DEBUG_PRINT;
 }
 
 static void xwl_xdg_popup_popup_done(void *data,
                                      struct zxdg_popup_v6 *xdg_popup) {
+  DEBUG_PRINT;
   struct xwl_host_xdg_popup *host = zxdg_popup_v6_get_user_data(xdg_popup);
 
   zxdg_popup_v6_send_popup_done(host->resource);
+  DEBUG_PRINT;
 }
 
 static const struct zxdg_popup_v6_listener xwl_xdg_popup_listener = {
     xwl_xdg_popup_configure, xwl_xdg_popup_popup_done};
 
 static void xwl_destroy_host_xdg_popup(struct wl_resource *resource) {
+  DEBUG_PRINT;
   struct xwl_host_xdg_popup *host = wl_resource_get_user_data(resource);
 
   zxdg_popup_v6_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
+  DEBUG_PRINT;
 }
 
 static void xwl_xdg_toplevel_destroy(struct wl_client *client,
@@ -3651,6 +3681,7 @@ static void xwl_xdg_surface_get_popup(struct wl_client *client,
                                       struct wl_resource *resource, uint32_t id,
                                       struct wl_resource *parent_resource,
                                       struct wl_resource *positioner_resource) {
+  DEBUG_PRINT;
   struct xwl_host_xdg_surface *host = wl_resource_get_user_data(resource);
   struct xwl_host_xdg_surface *host_parent =
       wl_resource_get_user_data(parent_resource);
@@ -3672,6 +3703,7 @@ static void xwl_xdg_surface_get_popup(struct wl_client *client,
   zxdg_popup_v6_set_user_data(host_xdg_popup->proxy, host_xdg_popup);
   zxdg_popup_v6_add_listener(host_xdg_popup->proxy, &xwl_xdg_popup_listener,
                              host_xdg_popup);
+  DEBUG_PRINT;
 }
 
 static void xwl_xdg_surface_set_window_geometry(struct wl_client *client,
@@ -3733,6 +3765,7 @@ static void xwl_xdg_shell_create_positioner(struct wl_client *client,
                                             uint32_t id) {
   struct xwl_host_xdg_shell *host = wl_resource_get_user_data(resource);
   struct xwl_host_xdg_positioner *host_xdg_positioner;
+  puts(__PRETTY_FUNCTION__);
 
   host_xdg_positioner = malloc(sizeof(*host_xdg_positioner));
   assert(host_xdg_positioner);
@@ -4805,6 +4838,7 @@ static void xwl_create_window(struct xwl *xwl, xcb_window_t id, int x, int y,
 }
 
 static void xwl_destroy_window(struct xwl_window *window) {
+  DEBUG_PRINT;
   if (window->frame_id != XCB_WINDOW_NONE)
     xcb_destroy_window(window->xwl->connection, window->frame_id);
 
