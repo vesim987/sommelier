@@ -37,8 +37,8 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "version.h"
 #include "viewporter-client-protocol.h"
-#include "xdg-shell-unstable-v6-client-protocol.h"
-#include "xdg-shell-unstable-v6-server-protocol.h"
+#include "xdg-shell-client-protocol.h"
+#include "xdg-shell-server-protocol.h"
 
 #define DEBUG_PRINT \
   fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, __PRETTY_FUNCTION__)
@@ -296,41 +296,41 @@ struct xwl_data_source {
   struct wl_data_source *internal;
 };
 
-struct xwl_xdg_shell {
+struct xwl_xdg_wm_base {
   struct xwl *xwl;
   uint32_t id;
   struct xwl_global *host_global;
-  struct zxdg_shell_v6 *internal;
+  struct xdg_wm_base *internal;
 };
 
-struct xwl_host_xdg_shell {
-  struct xwl_xdg_shell *xdg_shell;
+struct xwl_host_xdg_wm_base {
+  struct xwl_xdg_wm_base *xdg_wm_base;
   struct wl_resource *resource;
-  struct zxdg_shell_v6 *proxy;
+  struct xdg_wm_base *proxy;
 };
 
 struct xwl_host_xdg_surface {
   struct xwl *xwl;
   struct wl_resource *resource;
-  struct zxdg_surface_v6 *proxy;
+  struct xdg_surface *proxy;
 };
 
 struct xwl_host_xdg_toplevel {
   struct xwl *xwl;
   struct wl_resource *resource;
-  struct zxdg_toplevel_v6 *proxy;
+  struct xdg_toplevel *proxy;
 };
 
 struct xwl_host_xdg_popup {
   struct xwl *xwl;
   struct wl_resource *resource;
-  struct zxdg_popup_v6 *proxy;
+  struct xdg_popup *proxy;
 };
 
 struct xwl_host_xdg_positioner {
   struct xwl *xwl;
   struct wl_resource *resource;
-  struct zxdg_positioner_v6 *proxy;
+  struct xdg_positioner *proxy;
 };
 
 struct xwl_subcompositor {
@@ -434,9 +434,9 @@ struct xwl_window {
   uint32_t size_flags;
   struct xwl_config next_config;
   struct xwl_config pending_config;
-  struct zxdg_surface_v6 *xdg_surface;
-  struct zxdg_toplevel_v6 *xdg_toplevel;
-  struct zxdg_popup_v6 *xdg_popup;
+  struct xdg_surface *xdg_surface;
+  struct xdg_toplevel *xdg_toplevel;
+  struct xdg_popup *xdg_popup;
   struct zaura_surface *aura_surface;
   struct wl_list link;
 };
@@ -496,7 +496,7 @@ struct xwl {
   struct xwl_shm *shm;
   struct xwl_shell *shell;
   struct xwl_data_device_manager *data_device_manager;
-  struct xwl_xdg_shell *xdg_shell;
+  struct xwl_xdg_wm_base *xdg_wm_base;
   struct xwl_aura_shell *aura_shell;
   struct xwl_viewporter *viewporter;
   struct xwl_linux_dmabuf *linux_dmabuf;
@@ -746,14 +746,14 @@ static void xwl_output_buffer_release(void *data, struct wl_buffer *buffer) {
 static const struct wl_buffer_listener xwl_output_buffer_listener = {
     xwl_output_buffer_release};
 
-static void xwl_internal_xdg_shell_ping(void *data,
-                                        struct zxdg_shell_v6 *xdg_shell,
+static void xwl_internal_xdg_wm_base_ping(void *data,
+                                        struct xdg_wm_base *xdg_wm_base,
                                         uint32_t serial) {
-  zxdg_shell_v6_pong(xdg_shell, serial);
+  xdg_wm_base_pong(xdg_wm_base, serial);
 }
 
-static const struct zxdg_shell_v6_listener xwl_internal_xdg_shell_listener = {
-    xwl_internal_xdg_shell_ping};
+static const struct xdg_wm_base_listener xwl_internal_xdg_wm_base_listener = {
+    xwl_internal_xdg_wm_base_ping};
 
 static void xwl_send_configure_notify(struct xwl_window *window) {
   xcb_configure_notify_event_t event = {
@@ -908,7 +908,7 @@ xwl_process_pending_configure_acks(struct xwl_window *window,
   }
 
   if (window->xdg_surface) {
-    zxdg_surface_v6_ack_configure(window->xdg_surface,
+    xdg_surface_ack_configure(window->xdg_surface,
                                   window->pending_config.serial);
   }
   window->pending_config.serial = 0;
@@ -920,8 +920,8 @@ xwl_process_pending_configure_acks(struct xwl_window *window,
 }
 
 static void xwl_internal_xdg_surface_configure(
-    void *data, struct zxdg_surface_v6 *xdg_surface, uint32_t serial) {
-  struct xwl_window *window = zxdg_surface_v6_get_user_data(xdg_surface);
+    void *data, struct xdg_surface *xdg_surface, uint32_t serial) {
+  struct xwl_window *window = xdg_surface_get_user_data(xdg_surface);
 
   window->next_config.serial = serial;
   if (!window->pending_config.serial) {
@@ -942,13 +942,13 @@ static void xwl_internal_xdg_surface_configure(
   }
 }
 
-static const struct zxdg_surface_v6_listener xwl_internal_xdg_surface_listener =
+static const struct xdg_surface_listener xwl_internal_xdg_surface_listener =
     {xwl_internal_xdg_surface_configure};
 
 static void xwl_internal_xdg_toplevel_configure(
-    void *data, struct zxdg_toplevel_v6 *xdg_toplevel, int32_t width,
+    void *data, struct xdg_toplevel *xdg_toplevel, int32_t width,
     int32_t height, struct wl_array *states) {
-  struct xwl_window *window = zxdg_toplevel_v6_get_user_data(xdg_toplevel);
+  struct xwl_window *window = xdg_toplevel_get_user_data(xdg_toplevel);
   int activated = 0;
   uint32_t *state;
   int i = 0;
@@ -978,21 +978,21 @@ static void xwl_internal_xdg_toplevel_configure(
 
   window->allow_resize = 1;
   wl_array_for_each(state, states) {
-    if (*state == ZXDG_TOPLEVEL_V6_STATE_FULLSCREEN) {
+    if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN) {
       window->allow_resize = 0;
       window->next_config.states[i++] =
           window->xwl->atoms[ATOM_NET_WM_STATE_FULLSCREEN].value;
     }
-    if (*state == ZXDG_TOPLEVEL_V6_STATE_MAXIMIZED) {
+    if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED) {
       window->allow_resize = 0;
       window->next_config.states[i++] =
           window->xwl->atoms[ATOM_NET_WM_STATE_MAXIMIZED_VERT].value;
       window->next_config.states[i++] =
           window->xwl->atoms[ATOM_NET_WM_STATE_MAXIMIZED_HORZ].value;
     }
-    if (*state == ZXDG_TOPLEVEL_V6_STATE_ACTIVATED)
+    if (*state == XDG_TOPLEVEL_STATE_ACTIVATED)
       activated = 1;
-    if (*state == ZXDG_TOPLEVEL_V6_STATE_RESIZING)
+    if (*state == XDG_TOPLEVEL_STATE_RESIZING)
       window->allow_resize = 0;
   }
 
@@ -1009,8 +1009,8 @@ static void xwl_internal_xdg_toplevel_configure(
 
 static void
 xwl_internal_xdg_toplevel_close(void *data,
-                                struct zxdg_toplevel_v6 *xdg_toplevel) {
-  struct xwl_window *window = zxdg_toplevel_v6_get_user_data(xdg_toplevel);
+                                struct xdg_toplevel *xdg_toplevel) {
+  struct xwl_window *window = xdg_toplevel_get_user_data(xdg_toplevel);
   xcb_client_message_event_t event = {
       .response_type = XCB_CLIENT_MESSAGE,
       .format = 32,
@@ -1026,27 +1026,27 @@ xwl_internal_xdg_toplevel_close(void *data,
                  XCB_EVENT_MASK_NO_EVENT, (const char *)&event);
 }
 
-static const struct zxdg_toplevel_v6_listener
+static const struct xdg_toplevel_listener
     xwl_internal_xdg_toplevel_listener = {xwl_internal_xdg_toplevel_configure,
                                           xwl_internal_xdg_toplevel_close};
 
 static void xwl_internal_xdg_popup_configure(void *data,
-                                             struct zxdg_popup_v6 *xdg_popup,
+                                             struct xdg_popup *xdg_popup,
                                              int32_t x, int32_t y,
                                              int32_t width, int32_t height) {
   DEBUG_PRINT;
 
   struct xwl_window *window = data;
 
-  // zxdg_popup_v6_send_configure(xdg_popup, x, y, x + width, y + height);
+  // xdg_popup_send_configure(xdg_popup, x, y, x + width, y + height);
 }
 
 static void xwl_internal_xdg_popup_done(void *data,
-                                        struct zxdg_popup_v6 *zxdg_popup_v6) {
+                                        struct xdg_popup *xdg_popup) {
   DEBUG_PRINT;
 }
 
-static const struct zxdg_popup_v6_listener xwl_internal_xdg_popup_listener = {
+static const struct xdg_popup_listener xwl_internal_xdg_popup_listener = {
     xwl_internal_xdg_popup_configure, xwl_internal_xdg_popup_done};
 
 static void xwl_window_set_wm_state(struct xwl_window *window, int state) {
@@ -1088,16 +1088,16 @@ static void xwl_window_update(struct xwl_window *window) {
       window->aura_surface = NULL;
     }
     if (window->xdg_toplevel) {
-      zxdg_toplevel_v6_destroy(window->xdg_toplevel);
+      xdg_toplevel_destroy(window->xdg_toplevel);
       window->xdg_toplevel = NULL;
     }
     if (window->xdg_popup) {
       DEBUG_PRINT;
-      zxdg_popup_v6_destroy(window->xdg_popup);
+      xdg_popup_destroy(window->xdg_popup);
       window->xdg_popup = NULL;
     }
     if (window->xdg_surface) {
-      zxdg_surface_v6_destroy(window->xdg_surface);
+      xdg_surface_destroy(window->xdg_surface);
       window->xdg_surface = NULL;
     }
     return;
@@ -1107,8 +1107,8 @@ static void xwl_window_update(struct xwl_window *window) {
   assert(host_surface);
   assert(!host_surface->is_cursor);
 
-  assert(xwl->xdg_shell);
-  assert(xwl->xdg_shell->internal);
+  assert(xwl->xdg_wm_base);
+  assert(xwl->xdg_wm_base->internal);
 
   if (window->managed) {
     app_id = xwl->app_id ? xwl->app_id : window->clazz;
@@ -1160,10 +1160,10 @@ static void xwl_window_update(struct xwl_window *window) {
   }
 
   if (!window->xdg_surface) {
-    window->xdg_surface = zxdg_shell_v6_get_xdg_surface(
-        xwl->xdg_shell->internal, host_surface->proxy);
-    zxdg_surface_v6_set_user_data(window->xdg_surface, window);
-    zxdg_surface_v6_add_listener(window->xdg_surface,
+    window->xdg_surface = xdg_wm_base_get_xdg_surface(
+        xwl->xdg_wm_base->internal, host_surface->proxy);
+    xdg_surface_set_user_data(window->xdg_surface, window);
+    xdg_surface_add_listener(window->xdg_surface,
                                  &xwl_internal_xdg_surface_listener, window);
   }
 
@@ -1192,42 +1192,42 @@ static void xwl_window_update(struct xwl_window *window) {
 
   if (window->managed || !parent) {
     if (!window->xdg_toplevel) {
-      window->xdg_toplevel = zxdg_surface_v6_get_toplevel(window->xdg_surface);
-      zxdg_toplevel_v6_set_user_data(window->xdg_toplevel, window);
-      zxdg_toplevel_v6_add_listener(
+      window->xdg_toplevel = xdg_surface_get_toplevel(window->xdg_surface);
+      xdg_toplevel_set_user_data(window->xdg_toplevel, window);
+      xdg_toplevel_add_listener(
           window->xdg_toplevel, &xwl_internal_xdg_toplevel_listener, window);
     }
     if (parent)
-      zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
+      xdg_toplevel_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
     if (window->name && xwl->show_window_title)
-      zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
+      xdg_toplevel_set_title(window->xdg_toplevel, window->name);
     if (app_id)
-      zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
+      xdg_toplevel_set_app_id(window->xdg_toplevel, app_id);
   } else if (!window->xdg_popup) {
-    struct zxdg_positioner_v6 *positioner;
+    struct xdg_positioner *positioner;
     DEBUG_PRINT;
 
-    positioner = zxdg_shell_v6_create_positioner(xwl->xdg_shell->internal);
+    positioner = xdg_wm_base_create_positioner(xwl->xdg_wm_base->internal);
     assert(positioner);
-    zxdg_positioner_v6_set_anchor(positioner,
-                                  ZXDG_POSITIONER_V6_ANCHOR_TOP |
-                                      ZXDG_POSITIONER_V6_ANCHOR_LEFT);
-    zxdg_positioner_v6_set_gravity(positioner,
-                                   ZXDG_POSITIONER_V6_GRAVITY_BOTTOM |
-                                       ZXDG_POSITIONER_V6_GRAVITY_RIGHT);
-    zxdg_positioner_v6_set_anchor_rect(
+    xdg_positioner_set_anchor(positioner,
+                                  XDG_POSITIONER_ANCHOR_TOP |
+                                      XDG_POSITIONER_ANCHOR_LEFT);
+    xdg_positioner_set_gravity(positioner,
+                                   XDG_POSITIONER_GRAVITY_BOTTOM |
+                                       XDG_POSITIONER_GRAVITY_RIGHT);
+    xdg_positioner_set_anchor_rect(
         positioner, (window->x - parent->x) / xwl->scale,
         (window->y - parent->y) / xwl->scale, 1, 1);
 
-    zxdg_positioner_v6_set_size(positioner, 1, 1);
+    xdg_positioner_set_size(positioner, 1, 1);
 
-    window->xdg_popup = zxdg_surface_v6_get_popup(
+    window->xdg_popup = xdg_surface_get_popup(
         window->xdg_surface, parent->xdg_surface, positioner);
-    zxdg_popup_v6_set_user_data(window->xdg_popup, window);
-    zxdg_popup_v6_add_listener(window->xdg_popup,
+    xdg_popup_set_user_data(window->xdg_popup, window);
+    xdg_popup_add_listener(window->xdg_popup,
                                &xwl_internal_xdg_popup_listener, window);
 
-    zxdg_positioner_v6_destroy(positioner);
+    xdg_positioner_destroy(positioner);
   }
 
   if ((window->size_flags & (US_POSITION | P_POSITION)) && parent &&
@@ -3353,7 +3353,7 @@ static void xwl_xdg_positioner_set_size(struct wl_client *client,
   struct xwl_host_xdg_positioner *host = wl_resource_get_user_data(resource);
   double scale = host->xwl->scale;
 
-  zxdg_positioner_v6_set_size(host->proxy, width / scale, height / scale);
+  xdg_positioner_set_size(host->proxy, width / scale, height / scale);
 }
 
 static void xwl_xdg_positioner_set_anchor_rect(struct wl_client *client,
@@ -3369,7 +3369,7 @@ static void xwl_xdg_positioner_set_anchor_rect(struct wl_client *client,
   x2 = (x + width) / scale;
   y2 = (y + height) / scale;
 
-  zxdg_positioner_v6_set_anchor_rect(host->proxy, x1, y1, x2 - x1, y2 - y1);
+  xdg_positioner_set_anchor_rect(host->proxy, x1, y1, x2 - x1, y2 - y1);
 }
 
 static void xwl_xdg_positioner_set_anchor(struct wl_client *client,
@@ -3377,7 +3377,7 @@ static void xwl_xdg_positioner_set_anchor(struct wl_client *client,
                                           uint32_t anchor) {
   struct xwl_host_xdg_positioner *host = wl_resource_get_user_data(resource);
 
-  zxdg_positioner_v6_set_anchor(host->proxy, anchor);
+  xdg_positioner_set_anchor(host->proxy, anchor);
 }
 
 static void xwl_xdg_positioner_set_gravity(struct wl_client *client,
@@ -3385,7 +3385,7 @@ static void xwl_xdg_positioner_set_gravity(struct wl_client *client,
                                            uint32_t gravity) {
   struct xwl_host_xdg_positioner *host = wl_resource_get_user_data(resource);
 
-  zxdg_positioner_v6_set_gravity(host->proxy, gravity);
+  xdg_positioner_set_gravity(host->proxy, gravity);
 }
 
 static void
@@ -3394,7 +3394,7 @@ xwl_xdg_positioner_set_constraint_adjustment(struct wl_client *client,
                                              uint32_t constraint_adjustment) {
   struct xwl_host_xdg_positioner *host = wl_resource_get_user_data(resource);
 
-  zxdg_positioner_v6_set_constraint_adjustment(host->proxy,
+  xdg_positioner_set_constraint_adjustment(host->proxy,
                                                constraint_adjustment);
 }
 
@@ -3404,10 +3404,10 @@ static void xwl_xdg_positioner_set_offset(struct wl_client *client,
   struct xwl_host_xdg_positioner *host = wl_resource_get_user_data(resource);
   double scale = host->xwl->scale;
 
-  zxdg_positioner_v6_set_offset(host->proxy, x / scale, y / scale);
+  xdg_positioner_set_offset(host->proxy, x / scale, y / scale);
 }
 
-static const struct zxdg_positioner_v6_interface
+static const struct xdg_positioner_interface
     xwl_xdg_positioner_implementation = {
         xwl_xdg_positioner_destroy,
         xwl_xdg_positioner_set_size,
@@ -3420,7 +3420,7 @@ static const struct zxdg_positioner_v6_interface
 static void xwl_destroy_host_xdg_positioner(struct wl_resource *resource) {
   struct xwl_host_xdg_positioner *host = wl_resource_get_user_data(resource);
   puts(__PRETTY_FUNCTION__);
-  zxdg_positioner_v6_destroy(host->proxy);
+  xdg_positioner_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
@@ -3440,18 +3440,18 @@ static void xwl_xdg_popup_grab(struct wl_client *client,
   struct xwl_host_xdg_popup *host = wl_resource_get_user_data(resource);
   struct xwl_host_seat *host_seat = wl_resource_get_user_data(seat_resource);
 
-  zxdg_popup_v6_grab(host->proxy, host_seat->proxy, serial);
+  xdg_popup_grab(host->proxy, host_seat->proxy, serial);
   DEBUG_PRINT;
 }
 
-static const struct zxdg_popup_v6_interface xwl_xdg_popup_implementation = {
+static const struct xdg_popup_interface xwl_xdg_popup_implementation = {
     xwl_xdg_popup_destroy, xwl_xdg_popup_grab};
 
-static void xwl_xdg_popup_configure(void *data, struct zxdg_popup_v6 *xdg_popup,
+static void xwl_xdg_popup_configure(void *data, struct xdg_popup *xdg_popup,
                                     int32_t x, int32_t y, int32_t width,
                                     int32_t height) {
   DEBUG_PRINT;
-  struct xwl_host_xdg_popup *host = zxdg_popup_v6_get_user_data(xdg_popup);
+  struct xwl_host_xdg_popup *host = xdg_popup_get_user_data(xdg_popup);
   double scale = host->xwl->scale;
   int32_t x1, y1, x2, y2;
 
@@ -3460,27 +3460,27 @@ static void xwl_xdg_popup_configure(void *data, struct zxdg_popup_v6 *xdg_popup,
   x2 = (x + width) * scale;
   y2 = (y + height) * scale;
 
-  zxdg_popup_v6_send_configure(host->resource, x1, y1, x2 - x1, y2 - y1);
+  xdg_popup_send_configure(host->resource, x1, y1, x2 - x1, y2 - y1);
   DEBUG_PRINT;
 }
 
 static void xwl_xdg_popup_popup_done(void *data,
-                                     struct zxdg_popup_v6 *xdg_popup) {
+                                     struct xdg_popup *xdg_popup) {
   DEBUG_PRINT;
-  struct xwl_host_xdg_popup *host = zxdg_popup_v6_get_user_data(xdg_popup);
+  struct xwl_host_xdg_popup *host = xdg_popup_get_user_data(xdg_popup);
 
-  zxdg_popup_v6_send_popup_done(host->resource);
+  xdg_popup_send_popup_done(host->resource);
   DEBUG_PRINT;
 }
 
-static const struct zxdg_popup_v6_listener xwl_xdg_popup_listener = {
+static const struct xdg_popup_listener xwl_xdg_popup_listener = {
     xwl_xdg_popup_configure, xwl_xdg_popup_popup_done};
 
 static void xwl_destroy_host_xdg_popup(struct wl_resource *resource) {
   DEBUG_PRINT;
   struct xwl_host_xdg_popup *host = wl_resource_get_user_data(resource);
 
-  zxdg_popup_v6_destroy(host->proxy);
+  xdg_popup_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
   DEBUG_PRINT;
@@ -3498,7 +3498,7 @@ static void xwl_xdg_toplevel_set_parent(struct wl_client *client,
   struct xwl_host_xdg_toplevel *host_parent =
       parent_resource ? wl_resource_get_user_data(parent_resource) : NULL;
 
-  zxdg_toplevel_v6_set_parent(host->proxy,
+  xdg_toplevel_set_parent(host->proxy,
                               host_parent ? host_parent->proxy : NULL);
 }
 
@@ -3507,7 +3507,7 @@ static void xwl_xdg_toplevel_set_title(struct wl_client *client,
                                        const char *title) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_set_title(host->proxy, title);
+  xdg_toplevel_set_title(host->proxy, title);
 }
 
 static void xwl_xdg_toplevel_set_app_id(struct wl_client *client,
@@ -3515,7 +3515,7 @@ static void xwl_xdg_toplevel_set_app_id(struct wl_client *client,
                                         const char *app_id) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_set_app_id(host->proxy, app_id);
+  xdg_toplevel_set_app_id(host->proxy, app_id);
 }
 
 static void xwl_xdg_toplevel_show_window_menu(struct wl_client *client,
@@ -3527,7 +3527,7 @@ static void xwl_xdg_toplevel_show_window_menu(struct wl_client *client,
   struct xwl_host_seat *host_seat =
       seat_resource ? wl_resource_get_user_data(seat_resource) : NULL;
 
-  zxdg_toplevel_v6_show_window_menu(
+  xdg_toplevel_show_window_menu(
       host->proxy, host_seat ? host_seat->proxy : NULL, serial, x, y);
 }
 
@@ -3539,7 +3539,7 @@ static void xwl_xdg_toplevel_move(struct wl_client *client,
   struct xwl_host_seat *host_seat =
       seat_resource ? wl_resource_get_user_data(seat_resource) : NULL;
 
-  zxdg_toplevel_v6_move(host->proxy, host_seat ? host_seat->proxy : NULL,
+  xdg_toplevel_move(host->proxy, host_seat ? host_seat->proxy : NULL,
                         serial);
 }
 
@@ -3551,7 +3551,7 @@ static void xwl_xdg_toplevel_resize(struct wl_client *client,
   struct xwl_host_seat *host_seat =
       seat_resource ? wl_resource_get_user_data(seat_resource) : NULL;
 
-  zxdg_toplevel_v6_resize(host->proxy, host_seat ? host_seat->proxy : NULL,
+  xdg_toplevel_resize(host->proxy, host_seat ? host_seat->proxy : NULL,
                           serial, edges);
 }
 
@@ -3560,7 +3560,7 @@ static void xwl_xdg_toplevel_set_max_size(struct wl_client *client,
                                           int32_t width, int32_t height) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_set_max_size(host->proxy, width, height);
+  xdg_toplevel_set_max_size(host->proxy, width, height);
 }
 
 static void xwl_xdg_toplevel_set_min_size(struct wl_client *client,
@@ -3568,21 +3568,21 @@ static void xwl_xdg_toplevel_set_min_size(struct wl_client *client,
                                           int32_t width, int32_t height) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_set_min_size(host->proxy, width, height);
+  xdg_toplevel_set_min_size(host->proxy, width, height);
 }
 
 static void xwl_xdg_toplevel_set_maximized(struct wl_client *client,
                                            struct wl_resource *resource) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_set_maximized(host->proxy);
+  xdg_toplevel_set_maximized(host->proxy);
 }
 
 static void xwl_xdg_toplevel_unset_maximized(struct wl_client *client,
                                              struct wl_resource *resource) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_unset_maximized(host->proxy);
+  xdg_toplevel_unset_maximized(host->proxy);
 }
 
 static void
@@ -3593,7 +3593,7 @@ xwl_xdg_toplevel_set_fullscreen(struct wl_client *client,
   struct xwl_host_output *host_output =
       output_resource ? wl_resource_get_user_data(resource) : NULL;
 
-  zxdg_toplevel_v6_set_fullscreen(host->proxy,
+  xdg_toplevel_set_fullscreen(host->proxy,
                                   host_output ? host_output->proxy : NULL);
 }
 
@@ -3601,17 +3601,17 @@ static void xwl_xdg_toplevel_unset_fullscreen(struct wl_client *client,
                                               struct wl_resource *resource) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_unset_fullscreen(host->proxy);
+  xdg_toplevel_unset_fullscreen(host->proxy);
 }
 
 static void xwl_xdg_toplevel_set_minimized(struct wl_client *client,
                                            struct wl_resource *resource) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_set_minimized(host->proxy);
+  xdg_toplevel_set_minimized(host->proxy);
 }
 
-static const struct zxdg_toplevel_v6_interface xwl_xdg_toplevel_implementation =
+static const struct xdg_toplevel_interface xwl_xdg_toplevel_implementation =
     {xwl_xdg_toplevel_destroy,          xwl_xdg_toplevel_set_parent,
      xwl_xdg_toplevel_set_title,        xwl_xdg_toplevel_set_app_id,
      xwl_xdg_toplevel_show_window_menu, xwl_xdg_toplevel_move,
@@ -3621,32 +3621,32 @@ static const struct zxdg_toplevel_v6_interface xwl_xdg_toplevel_implementation =
      xwl_xdg_toplevel_unset_fullscreen, xwl_xdg_toplevel_set_minimized};
 
 static void xwl_xdg_toplevel_configure(void *data,
-                                       struct zxdg_toplevel_v6 *xdg_toplevel,
+                                       struct xdg_toplevel *xdg_toplevel,
                                        int32_t width, int32_t height,
                                        struct wl_array *states) {
   struct xwl_host_xdg_toplevel *host =
-      zxdg_toplevel_v6_get_user_data(xdg_toplevel);
+      xdg_toplevel_get_user_data(xdg_toplevel);
   double scale = host->xwl->scale;
 
-  zxdg_toplevel_v6_send_configure(host->resource, width * scale, height * scale,
+  xdg_toplevel_send_configure(host->resource, width * scale, height * scale,
                                   states);
 }
 
 static void xwl_xdg_toplevel_close(void *data,
-                                   struct zxdg_toplevel_v6 *xdg_toplevel) {
+                                   struct xdg_toplevel *xdg_toplevel) {
   struct xwl_host_xdg_toplevel *host =
-      zxdg_toplevel_v6_get_user_data(xdg_toplevel);
+      xdg_toplevel_get_user_data(xdg_toplevel);
 
-  zxdg_toplevel_v6_send_close(host->resource);
+  xdg_toplevel_send_close(host->resource);
 }
 
-static const struct zxdg_toplevel_v6_listener xwl_xdg_toplevel_listener = {
+static const struct xdg_toplevel_listener xwl_xdg_toplevel_listener = {
     xwl_xdg_toplevel_configure, xwl_xdg_toplevel_close};
 
 static void xwl_destroy_host_xdg_toplevel(struct wl_resource *resource) {
   struct xwl_host_xdg_toplevel *host = wl_resource_get_user_data(resource);
 
-  zxdg_toplevel_v6_destroy(host->proxy);
+  xdg_toplevel_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
@@ -3667,13 +3667,13 @@ static void xwl_xdg_surface_get_toplevel(struct wl_client *client,
 
   host_xdg_toplevel->xwl = host->xwl;
   host_xdg_toplevel->resource =
-      wl_resource_create(client, &zxdg_toplevel_v6_interface, 1, id);
+      wl_resource_create(client, &xdg_toplevel_interface, 1, id);
   wl_resource_set_implementation(
       host_xdg_toplevel->resource, &xwl_xdg_toplevel_implementation,
       host_xdg_toplevel, xwl_destroy_host_xdg_toplevel);
-  host_xdg_toplevel->proxy = zxdg_surface_v6_get_toplevel(host->proxy);
-  zxdg_toplevel_v6_set_user_data(host_xdg_toplevel->proxy, host_xdg_toplevel);
-  zxdg_toplevel_v6_add_listener(host_xdg_toplevel->proxy,
+  host_xdg_toplevel->proxy = xdg_surface_get_toplevel(host->proxy);
+  xdg_toplevel_set_user_data(host_xdg_toplevel->proxy, host_xdg_toplevel);
+  xdg_toplevel_add_listener(host_xdg_toplevel->proxy,
                                 &xwl_xdg_toplevel_listener, host_xdg_toplevel);
 }
 
@@ -3694,14 +3694,14 @@ static void xwl_xdg_surface_get_popup(struct wl_client *client,
 
   host_xdg_popup->xwl = host->xwl;
   host_xdg_popup->resource =
-      wl_resource_create(client, &zxdg_popup_v6_interface, 1, id);
+      wl_resource_create(client, &xdg_popup_interface, 1, id);
   wl_resource_set_implementation(host_xdg_popup->resource,
                                  &xwl_xdg_popup_implementation, host_xdg_popup,
                                  xwl_destroy_host_xdg_popup);
-  host_xdg_popup->proxy = zxdg_surface_v6_get_popup(
+  host_xdg_popup->proxy = xdg_surface_get_popup(
       host->proxy, host_parent->proxy, host_positioner->proxy);
-  zxdg_popup_v6_set_user_data(host_xdg_popup->proxy, host_xdg_popup);
-  zxdg_popup_v6_add_listener(host_xdg_popup->proxy, &xwl_xdg_popup_listener,
+  xdg_popup_set_user_data(host_xdg_popup->proxy, host_xdg_popup);
+  xdg_popup_add_listener(host_xdg_popup->proxy, &xwl_xdg_popup_listener,
                              host_xdg_popup);
   DEBUG_PRINT;
 }
@@ -3719,7 +3719,7 @@ static void xwl_xdg_surface_set_window_geometry(struct wl_client *client,
   x2 = (x + width) / scale;
   y2 = (y + height) / scale;
 
-  zxdg_surface_v6_set_window_geometry(host->proxy, x1, y1, x2 - x1, y2 - y1);
+  xdg_surface_set_window_geometry(host->proxy, x1, y1, x2 - x1, y2 - y1);
 }
 
 static void xwl_xdg_surface_ack_configure(struct wl_client *client,
@@ -3727,65 +3727,65 @@ static void xwl_xdg_surface_ack_configure(struct wl_client *client,
                                           uint32_t serial) {
   struct xwl_host_xdg_surface *host = wl_resource_get_user_data(resource);
 
-  zxdg_surface_v6_ack_configure(host->proxy, serial);
+  xdg_surface_ack_configure(host->proxy, serial);
 }
 
-static const struct zxdg_surface_v6_interface xwl_xdg_surface_implementation = {
+static const struct xdg_surface_interface xwl_xdg_surface_implementation = {
     xwl_xdg_surface_destroy, xwl_xdg_surface_get_toplevel,
     xwl_xdg_surface_get_popup, xwl_xdg_surface_set_window_geometry,
     xwl_xdg_surface_ack_configure};
 
 static void xwl_xdg_surface_configure(void *data,
-                                      struct zxdg_surface_v6 *xdg_surface,
+                                      struct xdg_surface *xdg_surface,
                                       uint32_t serial) {
   struct xwl_host_xdg_surface *host =
-      zxdg_surface_v6_get_user_data(xdg_surface);
+      xdg_surface_get_user_data(xdg_surface);
 
-  zxdg_surface_v6_send_configure(host->resource, serial);
+  xdg_surface_send_configure(host->resource, serial);
 }
 
-static const struct zxdg_surface_v6_listener xwl_xdg_surface_listener = {
+static const struct xdg_surface_listener xwl_xdg_surface_listener = {
     xwl_xdg_surface_configure};
 
 static void xwl_destroy_host_xdg_surface(struct wl_resource *resource) {
   struct xwl_host_xdg_surface *host = wl_resource_get_user_data(resource);
 
-  zxdg_surface_v6_destroy(host->proxy);
+  xdg_surface_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
 
-static void xwl_xdg_shell_destroy(struct wl_client *client,
+static void xwl_xdg_wm_base_destroy(struct wl_client *client,
                                   struct wl_resource *resource) {
   wl_resource_destroy(resource);
 }
 
-static void xwl_xdg_shell_create_positioner(struct wl_client *client,
+static void xwl_xdg_wm_base_create_positioner(struct wl_client *client,
                                             struct wl_resource *resource,
                                             uint32_t id) {
-  struct xwl_host_xdg_shell *host = wl_resource_get_user_data(resource);
+  struct xwl_host_xdg_wm_base *host = wl_resource_get_user_data(resource);
   struct xwl_host_xdg_positioner *host_xdg_positioner;
   puts(__PRETTY_FUNCTION__);
 
   host_xdg_positioner = malloc(sizeof(*host_xdg_positioner));
   assert(host_xdg_positioner);
 
-  host_xdg_positioner->xwl = host->xdg_shell->xwl;
+  host_xdg_positioner->xwl = host->xdg_wm_base->xwl;
   host_xdg_positioner->resource =
-      wl_resource_create(client, &zxdg_positioner_v6_interface, 1, id);
+      wl_resource_create(client, &xdg_positioner_interface, 1, id);
   wl_resource_set_implementation(
       host_xdg_positioner->resource, &xwl_xdg_positioner_implementation,
       host_xdg_positioner, xwl_destroy_host_xdg_positioner);
-  host_xdg_positioner->proxy = zxdg_shell_v6_create_positioner(host->proxy);
-  zxdg_positioner_v6_set_user_data(host_xdg_positioner->proxy,
+  host_xdg_positioner->proxy = xdg_wm_base_create_positioner(host->proxy);
+  xdg_positioner_set_user_data(host_xdg_positioner->proxy,
                                    host_xdg_positioner);
 }
 
 static void
-xwl_xdg_shell_get_xdg_surface(struct wl_client *client,
+xwl_xdg_wm_base_get_xdg_surface(struct wl_client *client,
                               struct wl_resource *resource, uint32_t id,
                               struct wl_resource *surface_resource) {
-  struct xwl_host_xdg_shell *host = wl_resource_get_user_data(resource);
+  struct xwl_host_xdg_wm_base *host = wl_resource_get_user_data(resource);
   struct xwl_host_surface *host_surface =
       wl_resource_get_user_data(surface_resource);
   struct xwl_host_xdg_surface *host_xdg_surface;
@@ -3793,64 +3793,64 @@ xwl_xdg_shell_get_xdg_surface(struct wl_client *client,
   host_xdg_surface = malloc(sizeof(*host_xdg_surface));
   assert(host_xdg_surface);
 
-  host_xdg_surface->xwl = host->xdg_shell->xwl;
+  host_xdg_surface->xwl = host->xdg_wm_base->xwl;
   host_xdg_surface->resource =
-      wl_resource_create(client, &zxdg_surface_v6_interface, 1, id);
+      wl_resource_create(client, &xdg_surface_interface, 1, id);
   wl_resource_set_implementation(
       host_xdg_surface->resource, &xwl_xdg_surface_implementation,
       host_xdg_surface, xwl_destroy_host_xdg_surface);
   host_xdg_surface->proxy =
-      zxdg_shell_v6_get_xdg_surface(host->proxy, host_surface->proxy);
-  zxdg_surface_v6_set_user_data(host_xdg_surface->proxy, host_xdg_surface);
-  zxdg_surface_v6_add_listener(host_xdg_surface->proxy,
+      xdg_wm_base_get_xdg_surface(host->proxy, host_surface->proxy);
+  xdg_surface_set_user_data(host_xdg_surface->proxy, host_xdg_surface);
+  xdg_surface_add_listener(host_xdg_surface->proxy,
                                &xwl_xdg_surface_listener, host_xdg_surface);
 }
 
-static void xwl_xdg_shell_pong(struct wl_client *client,
+static void xwl_xdg_wm_base_pong(struct wl_client *client,
                                struct wl_resource *resource, uint32_t serial) {
-  struct xwl_host_xdg_shell *host = wl_resource_get_user_data(resource);
+  struct xwl_host_xdg_wm_base *host = wl_resource_get_user_data(resource);
 
-  zxdg_shell_v6_pong(host->proxy, serial);
+  xdg_wm_base_pong(host->proxy, serial);
 }
 
-static const struct zxdg_shell_v6_interface xwl_xdg_shell_implementation = {
-    xwl_xdg_shell_destroy, xwl_xdg_shell_create_positioner,
-    xwl_xdg_shell_get_xdg_surface, xwl_xdg_shell_pong};
+static const struct xdg_wm_base_interface xwl_xdg_wm_base_implementation = {
+    xwl_xdg_wm_base_destroy, xwl_xdg_wm_base_create_positioner,
+    xwl_xdg_wm_base_get_xdg_surface, xwl_xdg_wm_base_pong};
 
-static void xwl_xdg_shell_ping(void *data, struct zxdg_shell_v6 *xdg_shell,
+static void xwl_xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base,
                                uint32_t serial) {
-  struct xwl_host_xdg_shell *host = zxdg_shell_v6_get_user_data(xdg_shell);
+  struct xwl_host_xdg_wm_base *host = xdg_wm_base_get_user_data(xdg_wm_base);
 
-  zxdg_shell_v6_send_ping(host->resource, serial);
+  xdg_wm_base_send_ping(host->resource, serial);
 }
 
-static const struct zxdg_shell_v6_listener xwl_xdg_shell_listener = {
-    xwl_xdg_shell_ping};
+static const struct xdg_wm_base_listener xwl_xdg_wm_base_listener = {
+    xwl_xdg_wm_base_ping};
 
-static void xwl_destroy_host_xdg_shell(struct wl_resource *resource) {
-  struct xwl_host_xdg_shell *host = wl_resource_get_user_data(resource);
+static void xwl_destroy_host_xdg_wm_base(struct wl_resource *resource) {
+  struct xwl_host_xdg_wm_base *host = wl_resource_get_user_data(resource);
 
-  zxdg_shell_v6_destroy(host->proxy);
+  xdg_wm_base_destroy(host->proxy);
   wl_resource_set_user_data(resource, NULL);
   free(host);
 }
 
-static void xwl_bind_host_xdg_shell(struct wl_client *client, void *data,
+static void xwl_bind_host_xdg_wm_base(struct wl_client *client, void *data,
                                     uint32_t version, uint32_t id) {
-  struct xwl_xdg_shell *xdg_shell = (struct xwl_xdg_shell *)data;
-  struct xwl_host_xdg_shell *host;
+  struct xwl_xdg_wm_base *xdg_wm_base = (struct xwl_xdg_wm_base *)data;
+  struct xwl_host_xdg_wm_base *host;
 
   host = malloc(sizeof(*host));
   assert(host);
-  host->xdg_shell = xdg_shell;
-  host->resource = wl_resource_create(client, &zxdg_shell_v6_interface, 1, id);
-  wl_resource_set_implementation(host->resource, &xwl_xdg_shell_implementation,
-                                 host, xwl_destroy_host_xdg_shell);
+  host->xdg_wm_base = xdg_wm_base;
+  host->resource = wl_resource_create(client, &xdg_wm_base_interface, 1, id);
+  wl_resource_set_implementation(host->resource, &xwl_xdg_wm_base_implementation,
+                                 host, xwl_destroy_host_xdg_wm_base);
   host->proxy =
-      wl_registry_bind(wl_display_get_registry(xdg_shell->xwl->display),
-                       xdg_shell->id, &zxdg_shell_v6_interface, 1);
-  zxdg_shell_v6_set_user_data(host->proxy, host);
-  zxdg_shell_v6_add_listener(host->proxy, &xwl_xdg_shell_listener, host);
+      wl_registry_bind(wl_display_get_registry(xdg_wm_base->xwl->display),
+                       xdg_wm_base->id, &xdg_wm_base_interface, 1);
+  xdg_wm_base_set_user_data(host->proxy, host);
+  xdg_wm_base_add_listener(host->proxy, &xwl_xdg_wm_base_listener, host);
 }
 
 static void xwl_data_offer_accept(struct wl_client *client,
@@ -4596,24 +4596,24 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
           data_device_manager, xwl_bind_host_data_device_manager);
     }
     xwl->data_device_manager = data_device_manager;
-  } else if (strcmp(interface, "zxdg_shell_v6") == 0) {
-    struct xwl_xdg_shell *xdg_shell = malloc(sizeof(struct xwl_xdg_shell));
-    assert(xdg_shell);
-    xdg_shell->xwl = xwl;
-    xdg_shell->id = id;
+  } else if (strcmp(interface, "xdg_wm_base") == 0) {
+    struct xwl_xdg_wm_base *xdg_wm_base = malloc(sizeof(struct xwl_xdg_wm_base));
+    assert(xdg_wm_base);
+    xdg_wm_base->xwl = xwl;
+    xdg_wm_base->id = id;
     if (xwl->xwayland) {
-      xdg_shell->host_global = NULL;
-      xdg_shell->internal =
-          wl_registry_bind(registry, id, &zxdg_shell_v6_interface, 1);
-      zxdg_shell_v6_add_listener(xdg_shell->internal,
-                                 &xwl_internal_xdg_shell_listener, NULL);
+      xdg_wm_base->host_global = NULL;
+      xdg_wm_base->internal =
+          wl_registry_bind(registry, id, &xdg_wm_base_interface, version);
+      xdg_wm_base_add_listener(xdg_wm_base->internal,
+                                 &xwl_internal_xdg_wm_base_listener, NULL);
     } else {
-      xdg_shell->internal = NULL;
-      xdg_shell->host_global = xwl_global_create(
-          xwl, &zxdg_shell_v6_interface, 1, xdg_shell, xwl_bind_host_xdg_shell);
+      xdg_wm_base->internal = NULL;
+      xdg_wm_base->host_global = xwl_global_create(
+          xwl, &xdg_wm_base_interface, version, xdg_wm_base, xwl_bind_host_xdg_wm_base);
     }
-    assert(!xwl->xdg_shell);
-    xwl->xdg_shell = xdg_shell;
+    assert(!xwl->xdg_wm_base);
+    xwl->xdg_wm_base = xdg_wm_base;
   } else if (strcmp(interface, "zaura_shell") == 0) {
     struct xwl_aura_shell *aura_shell = malloc(sizeof(struct xwl_aura_shell));
     assert(aura_shell);
@@ -4711,13 +4711,13 @@ static void xwl_registry_remover(void *data, struct wl_registry *registry,
     xwl->data_device_manager = NULL;
     return;
   }
-  if (xwl->xdg_shell && xwl->xdg_shell->id == id) {
-    if (xwl->xdg_shell->host_global)
-      xwl_global_destroy(xwl->xdg_shell->host_global);
-    if (xwl->xdg_shell->internal)
-      zxdg_shell_v6_destroy(xwl->xdg_shell->internal);
-    free(xwl->xdg_shell);
-    xwl->xdg_shell = NULL;
+  if (xwl->xdg_wm_base && xwl->xdg_wm_base->id == id) {
+    if (xwl->xdg_wm_base->host_global)
+      xwl_global_destroy(xwl->xdg_wm_base->host_global);
+    if (xwl->xdg_wm_base->internal)
+      xdg_wm_base_destroy(xwl->xdg_wm_base->internal);
+    free(xwl->xdg_wm_base);
+    xwl->xdg_wm_base = NULL;
     return;
   }
   if (xwl->aura_shell && xwl->aura_shell->id == id) {
@@ -4848,11 +4848,11 @@ static void xwl_destroy_window(struct xwl_window *window) {
   }
 
   if (window->xdg_popup)
-    zxdg_popup_v6_destroy(window->xdg_popup);
+    xdg_popup_destroy(window->xdg_popup);
   if (window->xdg_toplevel)
-    zxdg_toplevel_v6_destroy(window->xdg_toplevel);
+    xdg_toplevel_destroy(window->xdg_toplevel);
   if (window->xdg_surface)
-    zxdg_surface_v6_destroy(window->xdg_surface);
+    xdg_surface_destroy(window->xdg_surface);
   if (window->aura_surface)
     zaura_surface_destroy(window->aura_surface);
 
@@ -5259,14 +5259,14 @@ static void xwl_handle_configure_request(struct xwl *xwl,
   // that matching contents will arrive.
   if (window->xdg_toplevel) {
     if (window->pending_config.serial) {
-      zxdg_surface_v6_ack_configure(window->xdg_surface,
+      xdg_surface_ack_configure(window->xdg_surface,
                                     window->pending_config.serial);
       window->pending_config.serial = 0;
       window->pending_config.mask = 0;
       window->pending_config.states_length = 0;
     }
     if (window->next_config.serial) {
-      zxdg_surface_v6_ack_configure(window->xdg_surface,
+      xdg_surface_ack_configure(window->xdg_surface,
                                     window->next_config.serial);
       window->next_config.serial = 0;
       window->next_config.mask = 0;
@@ -5388,23 +5388,23 @@ static void xwl_handle_configure_notify(struct xwl *xwl,
 static uint32_t xwl_resize_edge(int net_wm_moveresize_size) {
   switch (net_wm_moveresize_size) {
   case NET_WM_MOVERESIZE_SIZE_TOPLEFT:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_TOP_LEFT;
+    return XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT;
   case NET_WM_MOVERESIZE_SIZE_TOP:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_TOP;
+    return XDG_TOPLEVEL_RESIZE_EDGE_TOP;
   case NET_WM_MOVERESIZE_SIZE_TOPRIGHT:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_TOP_RIGHT;
+    return XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT;
   case NET_WM_MOVERESIZE_SIZE_RIGHT:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_RIGHT;
+    return XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
   case NET_WM_MOVERESIZE_SIZE_BOTTOMRIGHT:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_BOTTOM_RIGHT;
+    return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT;
   case NET_WM_MOVERESIZE_SIZE_BOTTOM:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_BOTTOM;
+    return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
   case NET_WM_MOVERESIZE_SIZE_BOTTOMLEFT:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_BOTTOM_LEFT;
+    return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT;
   case NET_WM_MOVERESIZE_SIZE_LEFT:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_LEFT;
+    return XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
   default:
-    return ZXDG_TOPLEVEL_V6_RESIZE_EDGE_NONE;
+    return XDG_TOPLEVEL_RESIZE_EDGE_NONE;
   }
 }
 
@@ -5434,15 +5434,15 @@ static void xwl_handle_client_message(struct xwl *xwl,
         return;
 
       if (event->data.data32[2] == NET_WM_MOVERESIZE_MOVE) {
-        zxdg_toplevel_v6_move(window->xdg_toplevel, seat->proxy,
+        xdg_toplevel_move(window->xdg_toplevel, seat->proxy,
                               seat->seat->last_serial);
       } else {
         uint32_t edge = xwl_resize_edge(event->data.data32[2]);
 
-        if (edge == ZXDG_TOPLEVEL_V6_RESIZE_EDGE_NONE)
+        if (edge == XDG_TOPLEVEL_RESIZE_EDGE_NONE)
           return;
 
-        zxdg_toplevel_v6_resize(window->xdg_toplevel, seat->proxy,
+        xdg_toplevel_resize(window->xdg_toplevel, seat->proxy,
                                 seat->seat->last_serial, edge);
       }
     }
@@ -5461,17 +5461,17 @@ static void xwl_handle_client_message(struct xwl *xwl,
 
       if (changed[ATOM_NET_WM_STATE_FULLSCREEN]) {
         if (action == NET_WM_STATE_ADD)
-          zxdg_toplevel_v6_set_fullscreen(window->xdg_toplevel, NULL);
+          xdg_toplevel_set_fullscreen(window->xdg_toplevel, NULL);
         else if (action == NET_WM_STATE_REMOVE)
-          zxdg_toplevel_v6_unset_fullscreen(window->xdg_toplevel);
+          xdg_toplevel_unset_fullscreen(window->xdg_toplevel);
       }
 
       if (changed[ATOM_NET_WM_STATE_MAXIMIZED_VERT] &&
           changed[ATOM_NET_WM_STATE_MAXIMIZED_HORZ]) {
         if (action == NET_WM_STATE_ADD)
-          zxdg_toplevel_v6_set_maximized(window->xdg_toplevel);
+          xdg_toplevel_set_maximized(window->xdg_toplevel);
         else if (action == NET_WM_STATE_REMOVE)
-          zxdg_toplevel_v6_unset_maximized(window->xdg_toplevel);
+          xdg_toplevel_unset_maximized(window->xdg_toplevel);
       }
     }
   }
@@ -5643,9 +5643,9 @@ static void xwl_handle_property_notify(struct xwl *xwl,
       return;
 
     if (window->name) {
-      zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
+      xdg_toplevel_set_title(window->xdg_toplevel, window->name);
     } else {
-      zxdg_toplevel_v6_set_title(window->xdg_toplevel, "");
+      xdg_toplevel_set_title(window->xdg_toplevel, "");
     }
   } else if (event->atom == xwl->atoms[ATOM_WL_SELECTION].value) {
     if (event->window == xwl->selection_window &&
@@ -6592,7 +6592,7 @@ int main(int argc, char **argv) {
       .shm = NULL,
       .shell = NULL,
       .data_device_manager = NULL,
-      .xdg_shell = NULL,
+      .xdg_wm_base = NULL,
       .aura_shell = NULL,
       .viewporter = NULL,
       .linux_dmabuf = NULL,

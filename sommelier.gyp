@@ -14,7 +14,7 @@
         'keyboard-extension-unstable-v1.xml',
         'linux-dmabuf-unstable-v1.xml',
         'viewporter.xml',
-        'xdg-shell-unstable-v6.xml',
+        'xdg-shell.xml',
       ],
       'includes': ['wayland-protocol.gypi'],
     },
