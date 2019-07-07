@@ -4602,7 +4602,7 @@ static void xwl_registry_handler(void *data, struct wl_registry *registry,
           data_device_manager, xwl_bind_host_data_device_manager);
     }
     xwl->data_device_manager = data_device_manager;
-  } else if (strcmp(interface, "xdg_shell") == 0) {
+  } else if (strcmp(interface, "xdg_wm_base") == 0) {
     struct xwl_xdg_shell *xdg_shell = malloc(sizeof(struct xwl_xdg_shell));
     assert(xdg_shell);
     xdg_shell->xwl = xwl;
