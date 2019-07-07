@@ -1165,7 +1165,8 @@ static void xwl_window_update(struct xwl_window *window) {
   }
 
   if (!window->xdg_surface) {
-    xdg_wm_base_get_xdg_surface(xwl->xdg_shell->internal, host_surface->proxy);
+    window->xdg_surface = xdg_wm_base_get_xdg_surface(xwl->xdg_shell->internal,
+                                                      host_surface->proxy);
     xdg_surface_set_user_data(window->xdg_surface, window);
     xdg_surface_add_listener(window->xdg_surface,
                                  &xwl_internal_xdg_surface_listener, window);
